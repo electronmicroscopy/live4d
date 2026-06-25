@@ -1,13 +1,12 @@
 # Real-Time STEM Virtual Bright-Field
 
 Live virtual bright-field (VBF) from 4D-STEM frames streamed off a DECTRIS detector. The detector
-sends compressed frames over ZMQ; the pipeline decompresses them on the GPU (nvCOMP + a custom CUDA
+sends compressed frames over ZMQ, the pipeline decompresses them on the GPU (nvCOMP + a custom CUDA
 kernel) and accumulates the VBF image on the GPU as frames arrive. Current rate ~22 kHz end-to-end at
 192² unbinned (targets: 30 kHz unbinned, 120 kHz binned). Next step: migrate to Holoscan / C++ to
 reach full detector rate.
 
-VBF is a proof-of-concept workload to exercise the streaming + GPU-decode path end-to-end, not the
-final method. The pipeline is built to carry heavier algorithms (parallax / tcBF) next.
+VBF is a proof-of-concept workload to exercise the streaming + GPU-decode path end-to-end. The pipeline is built to carry heavier algorithms (e.g. parallax, strain mapping, live drift correction) next.
 
 ## Approach
 
@@ -16,8 +15,8 @@ final method. The pipeline is built to carry heavier algorithms (parallax / tcBF
   envelope and ships the compressed bytes over.
 - **Threaded chunked pipeline.** Frames move in chunks through producer → decoder pool → consumer,
   keeping per-frame queue/GIL overhead off the hot path.
-- **GPU-side compute.** Integer frames upload as-is; the int→float cast and the mask·sum reduction
-  run on the GPU (the host-side float cast had been a major cost).
+- **GPU-side compute.** Integer frames upload as-is, the int→float cast and the mask·sum reduction
+  run on the GPU.
 - **Two decode backends**, chosen at runtime: `cpu` (threaded host bslz4) or `gpu`.
 
 ## Layout
@@ -38,30 +37,32 @@ DCU ─ZMQ PULL─▶ CBOR msg ─tag 56500─▶ bslz4 (bitshuffle+LZ4) ─deco
 ```
 
 CBOR over a ZMQ PULL socket; image payload under tag 56500, compressed with bslz4 (Masui bitshuffle,
-HDF5 filter 32008, per-block LZ4). VBF: `S = Σ frame·W`, where `W` = bright-field disk × dead-pixel
-mask × flatfield. Frames carry an image id giving the scan position. Format details in
+HDF5 filter 32008, per-block LZ4).
+VBF implementation goes as:
+`S = Σ frame·W`, where `W` = bright-field disk × dead-pixelmask × flatfield.
+Frames carry an image id giving the scan position. Format details in
 `pipeline/docs/stream_format.md`.
 
 ## From the simple listener
 
 The listener's CBOR decode (`tag_hook` + `tag_decoders`) is reused almost verbatim in
-`ingest/dectris_decode.py`. Added around it: the threaded chunked pipeline and the VBF compute.
-Key change: the listener decompresses on the CPU inside `cbor2.loads`; the GPU path
+`ingest/dectris_decode.py`. Added around it are the threaded chunked pipeline and the VBF compute.
+Key change is that the listener decompresses on the CPU inside `cbor2.loads`, the GPU path
 parses only the envelope on the CPU (`decode_envelope`) and decompresses on the GPU (`gpu_decode.py`).
-That split takes end-to-end from ~5 to ~22 kHz.
+That split takes end-to-end performance from ~5 to ~22 kHz.
 
 ## Components (`pipeline/`)
 
 | file | role |
 |---|---|
-| `ingest/dectris_decode.py` | CBOR decode: `decode_message` (parse + decompress, CPU); `decode_envelope` (envelope only, GPU path). |
-| `ingest/bslz4.py` | bslz4/lz4 container framing parser (header + per-block offsets). |
-| `ingest/gpu_decode.py` | GPU decoder: batched nvCOMP LZ4 + custom CUDA unshuffle kernel. Self-test: `python -m ingest.gpu_decode`. |
-| `ingest/pipeline.py` | threaded chunked pipeline (producer → decoder pool → consumer); cpu/gpu backends; stats. |
-| `virtual_detectors/vbf.py` | VBF engine; int→float cast + reduce on the GPU. |
-| `virtual_detectors/config.py` | detector/scan geometry, BF disk, pipeline knobs. |
-| `virtual_detectors/main.py` | entry point (live). |
-| `visualize/` | image display. |
+| `ingest/dectris_decode.py` | CBOR decode: `decode_message` (parse + decompress, CPU); `decode_envelope` (envelope only, GPU path) |
+| `ingest/bslz4.py` | bslz4/lz4 container framing parser (header + per-block offsets) |
+| `ingest/gpu_decode.py` | GPU decoder: batched nvCOMP LZ4 + custom CUDA unshuffle kernel. Self-test: `python -m ingest.gpu_decode` |
+| `ingest/pipeline.py` | threaded chunked pipeline (producer → decoder pool → consumer); cpu/gpu backends; stats |
+| `virtual_detectors/vbf.py` | VBF engine; int→float cast + reduce on the GPU |
+| `virtual_detectors/config.py` | detector/scan geometry, BF disk, pipeline knobs |
+| `virtual_detectors/main.py` | entry point (live) |
+| `visualize/` | image display |
 
 ## Performance
 
