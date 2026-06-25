@@ -1,0 +1,14 @@
+# Runtime dependencies for the real-time virtual bright-field pipeline.
+#
+# The GPU decode path additionally needs a system CUDA toolkit (nvcc) on PATH so that
+# torch's load_inline can compile the custom unshuffle CUDA kernel at runtime.
+
+numpy
+torch                 # CUDA build matching the system CUDA toolkit
+cbor2
+pyzmq
+dectris-compression   # CPU decode path / correctness reference
+nvidia-nvcomp-cu12    # GPU LZ4 for the GPU decode path
+matplotlib            # visualization
+ninja                 # builds the custom CUDA unshuffle kernel (torch load_inline)
+bitshuffle            # only for the GPU-decoder self-test (python -m ingest.gpu_decode)
