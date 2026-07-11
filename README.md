@@ -27,6 +27,8 @@ pipeline/                  streaming pipeline
   virtual_detectors/       VBF engine, config, main.py
   visualize/               image display
   docs/stream_format.md    DECTRIS transport + bslz4 reference
+holoscan_pipeline/         basic Holoscan ingest/decompress path
+docker/Dockerfile.holoscan Holoscan SDK container for native operator builds
 simple_listener/           ~100-line reference: connect, decode CBOR, count frames
 ```
 
@@ -88,3 +90,11 @@ python virtual_detectors/main.py                              # live view (DCU f
 GPU path needs system CUDA (`nvcc`) + `ninja` for the runtime kernel build
 (`CUDA_HOME=/usr/local/cuda`, `TORCH_CUDA_ARCH_LIST=8.9` for Ada). Dependencies in
 `pipeline/requirements.txt`.
+
+## Holoscan Basic Ingest
+
+`holoscan_pipeline/` is the successor ingest/decompress path under development. It wraps native
+C++ Holoscan operators for ZMQ receive/fast CBOR extraction and GPU bslz4 decompression, then
+composes them from Python with a Python stats sink that converts output frames to PyTorch.
+
+See `docs/holoscan_basic_ingest.md` for container, build, and validation commands.
