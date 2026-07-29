@@ -122,9 +122,20 @@ zmq_message_type_t fast_detect_message_type(
         return ZMQ_MSG_UNKNOWN;
     }
 
+    // Skip any leading CBOR tags before the map. Real DECTRIS Stream2 messages
+    // arrive wrapped in the self-describe tag 55799 (bytes d9 d9 f7); simulator
+    // messages may carry the bare map.
+    const uint8_t* head = msg_data;
+    const uint8_t* head_end = msg_data + msg_size;
+    while (head < head_end && (*head & CBOR_MAJOR_TYPE_MASK) == CBOR_MAJOR_TAG) {
+        uint64_t tag_value;
+        if (read_cbor_uint(&head, head_end, &tag_value) != 0) {
+            return ZMQ_MSG_UNKNOWN;
+        }
+    }
+
     // Quick CBOR map validation
-    uint8_t first_byte = msg_data[0];
-    if ((first_byte & 0xe0) != 0xa0) {
+    if (head >= head_end || ((*head & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_MAP)) {
         return ZMQ_MSG_UNKNOWN;
     }
 
