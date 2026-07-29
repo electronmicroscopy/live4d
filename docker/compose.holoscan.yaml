@@ -1,0 +1,21 @@
+services:
+  pipeline:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.holoscan
+      args:
+        CUDA_ARCHITECTURES: "86;89"
+    image: dectris-holoscan-basic:latest
+    network_mode: host
+    gpus:
+      - driver: nvidia
+        count: all
+        capabilities:
+          - gpu
+    ulimits:
+      stack:
+        soft: 33554432
+        hard: 33554432
+    command:
+      - --config
+      - /opt/dectris/stanford-dectris-nvidia-4d-stem/holoscan_pipeline/config/basic_ingest.yaml
