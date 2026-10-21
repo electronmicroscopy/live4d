@@ -1,0 +1,12 @@
+include "tensor.fbs";
+namespace dectris.schema.compressed;
+table CompressedBatch {
+  batch_id: ulong (id: 0);
+  image_ids: [ulong] (id: 1);
+  sizes: [ulong] (id: 2);
+  offsets: [ulong] (id: 3);
+  payload: holoscan.schema.Tensor (id: 4);
+  end_of_stream: bool (id: 5);
+}
+root_type CompressedBatch;
+file_identifier "DCBZ";

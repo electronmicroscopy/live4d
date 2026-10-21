@@ -1,143 +1,142 @@
 from __future__ import annotations
 
 import argparse
+import signal
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-import torch
+import holoscan as hs
 import yaml
-from holoscan.core import Application, Operator, OperatorSpec
 
-from dectris_holoscan_ops import DecompressGpuOp, ZmqRxOp
+from .operators import DecompressGpuOp, ZmqRxOp
+from .schemas.decoded_batch import DecodedBatch
 
 
 @dataclass(frozen=True)
 class BasicIngestConfig:
     endpoint: str = "tcp://127.0.0.1:5555"
     batch_size: int = 1000
-    scheduler_threads: int = 4
+    device: int = 0
+    queue_depth: int = 4
+
+    def __post_init__(self):
+        if not 1 <= self.batch_size <= 1000:
+            raise ValueError("batch_size must be between 1 and 1000")
+        if self.device < 0 or self.queue_depth < 2:
+            raise ValueError("device must be nonnegative and queue_depth must be at least 2")
+        if not self.endpoint:
+            raise ValueError("endpoint must not be empty")
 
 
-def _tensor_from_dlpack(tensor):
-    """Convert a Holoscan Tensor-like object to torch.Tensor without a copy."""
-    if hasattr(tensor, "__dlpack__"):
-        return torch.from_dlpack(tensor)
-    if hasattr(tensor, "to_dlpack"):
-        return torch.from_dlpack(tensor.to_dlpack())
-    raise TypeError(f"Object does not expose DLPack: {type(tensor)!r}")
+class StatsSinkOp(hs.Operator):
+    """Report device Tensor metadata without copying image pixels to the CPU."""
+    inp = hs.Input("input", DecodedBatch)
 
-
-def _get_tensor(message, name: str):
-    if isinstance(message, dict):
-        return message[name]
-    if hasattr(message, "get"):
-        value = message.get(name)
-        if value is not None:
-            return value
-    return message[name]
-
-
-class StatsSinkOp(Operator):
-    """Python-only sink that converts decompressor output to PyTorch and prints throughput."""
-
-    def __init__(self, fragment, *args, name: str = "stats_sink"):
-        super().__init__(fragment, *args, name=name)
+    def setup(self, spec):
+        spec.input(self.inp)
         self._start = None
         self._batches = 0
         self._frames = 0
+        self._first_batch_frames = 0
 
-    def setup(self, spec: OperatorSpec) -> None:
-        spec.input("input")
+    def contract(self):
+        return hs.Contract().trigger(hs.OnEach(self.inp))
 
-    def compute(self, op_input, op_output, context) -> None:
-        message = op_input.receive("input")
-        frames = _tensor_from_dlpack(_get_tensor(message, "frames"))
-        image_ids = _tensor_from_dlpack(_get_tensor(message, "image_ids")).cpu()
-        batch_id = int(_tensor_from_dlpack(_get_tensor(message, "batch_id")).cpu()[0].item())
+    def process_batch(self, batch, ctx):
+        count = len(batch.image_ids)
+        if count:
+            if self._start is None:
+                self._start = time.perf_counter()
+                self._first_batch_frames = count
+            self._batches += 1
+            self._frames += count
+            elapsed = max(time.perf_counter() - self._start, 1e-9)
+            fps = ((self._frames - self._first_batch_frames) / elapsed
+                   if self._batches > 1 else None)
+            fps_text = f"{fps:,.1f}" if fps is not None else "n/a"
+            print(f"[stats] batch={batch.batch_id} batches={self._batches} "
+                  f"frames={self._frames} fps={fps_text} "
+                  f"last_id={batch.image_ids[-1]} shape={batch.frames.shape} "
+                  f"dtype={batch.frames.dtype} device={batch.frames.device}", flush=True)
 
-        if self._start is None:
-            self._start = time.perf_counter()
-
-        num_frames = int(frames.shape[0])
-        self._batches += 1
-        self._frames += num_frames
-
-        elapsed = max(time.perf_counter() - self._start, 1e-9)
-        fps = self._frames / elapsed
-        last_id = int(image_ids[-1].item()) if image_ids.numel() else -1
-
-        print(
-            "[stats] "
-            f"batch={batch_id} batches={self._batches} frames={self._frames} "
-            f"fps={fps:,.1f} last_id={last_id} "
-            f"shape={tuple(frames.shape)} dtype={frames.dtype} device={frames.device}",
-            flush=True,
-        )
+    def compute(self, ctx):
+        batch = self.inp.receive_data()
+        self.process_batch(batch, ctx)
+        # This marker follows all data on both FIFO edges, including a partial batch.
+        if batch.end_of_stream:
+            ctx.request_completion()
 
 
-class BasicIngestApp(Application):
-    def __init__(self, config: BasicIngestConfig):
-        super().__init__()
+class BasicIngestApp:
+    def __init__(self, config: BasicIngestConfig, sink_type=StatsSinkOp):
         self.config = config
+        self.graph = hs.Graph("dectris-ingest", default_clock=hs.RealtimeClock)
+        rx = ZmqRxOp(self.graph, "zmq_rx", endpoint=config.endpoint, batch_size=config.batch_size)
+        decompress = DecompressGpuOp(self.graph, "decompress_gpu")
+        sink = self.graph.op(sink_type, "stats_sink")
+        self.graph.add_flow(rx.output, decompress.input, queue_depth=config.queue_depth)
+        self.graph.add_flow(decompress.output, sink.input, queue_depth=config.queue_depth)
+        # Preserve FIFO and bounded callback ordering across this linear graph.
+        self.graph.partition("ingest").include_all()
+        deployment = hs.execution.DeploymentBinding()
+        deployment.bind_tensor_output_device(
+            operator_path="decompress_gpu", output_port="output",
+            device=hs.execution.DeviceId(config.device))
+        self.plan = hs.compile(self.graph, hs.CompileOptions(deployment=deployment))
+        if not self.plan.ok:
+            raise RuntimeError(self.plan.summary())
 
-    def compose(self) -> None:
-        if self.config.scheduler_threads > 0:
-            try:
-                from holoscan.schedulers import MultiThreadScheduler
-
-                self.scheduler(
-                    MultiThreadScheduler(
-                        self,
-                        worker_thread_number=self.config.scheduler_threads,
-                    )
-                )
-            except Exception as exc:
-                print(f"[holoscan] using default scheduler: {exc}", flush=True)
-
-        rx = ZmqRxOp(
-            self,
-            endpoint=self.config.endpoint,
-            batch_size=self.config.batch_size,
-            name="zmq_rx",
-        )
-        decompress = DecompressGpuOp(self, name="decompress_gpu")
-        sink = StatsSinkOp(self, name="stats_sink")
-
-        self.add_flow(rx, decompress, {("output", "input")})
-        self.add_flow(decompress, sink, {("output", "input")})
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Basic DECTRIS Holoscan ingest pipeline.")
-    parser.add_argument("--config", type=Path, default=None)
-    parser.add_argument("--endpoint", default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--scheduler-threads", type=int, default=None)
-    return parser.parse_args()
+    def run(self):
+        stopping = threading.Event()
+        previous = {}
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                previous[sig] = signal.signal(sig, lambda *_: stopping.set())
+        try:
+            with hs.run_async(self.plan) as session:
+                print("[holoscan] ready", flush=True)
+                while not session.wait(timeout=0.1):
+                    if stopping.is_set():
+                        session.request_stop()
+                if session.termination not in (hs.RunTermination.REQUESTED_COMPLETED,
+                                                hs.RunTermination.COMPLETED,
+                                                hs.RunTermination.STOPPED):
+                    raise RuntimeError(f"Holoscan run failed: {session.summary()}")
+                return session.termination
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 def load_config(path: Path | None) -> BasicIngestConfig:
-    data = {}
-    if path is not None:
-        with path.open("r", encoding="utf-8") as stream:
-            data = yaml.safe_load(stream) or {}
-    return BasicIngestConfig(
-        endpoint=data.get("endpoint", BasicIngestConfig.endpoint),
-        batch_size=int(data.get("batch_size", BasicIngestConfig.batch_size)),
-        scheduler_threads=int(data.get("scheduler_threads", BasicIngestConfig.scheduler_threads)),
-    )
+    if path is None:
+        return BasicIngestConfig()
+    with path.open(encoding="utf-8") as stream:
+        data = yaml.safe_load(stream) or {}
+    # Fixed detector properties describe the supported input, not runtime parameters.
+    for key, expected in (("detector_shape", [96, 96]), ("dtype", "uint16"), ("compression", "bslz4")):
+        if data.pop(key, expected) != expected:
+            raise ValueError(f"unsupported {key}; expected {expected!r}")
+    return BasicIngestConfig(**data)
 
 
-def main() -> None:
-    args = parse_args()
-    file_config = load_config(args.config)
-    config = BasicIngestConfig(
-        endpoint=args.endpoint or file_config.endpoint,
-        batch_size=args.batch_size or file_config.batch_size,
-        scheduler_threads=args.scheduler_threads or file_config.scheduler_threads,
-    )
-    app = BasicIngestApp(config)
+def main():
+    parser = argparse.ArgumentParser(description="DECTRIS ingest pipeline for Holoscan SDK 5.")
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--endpoint")
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--device", type=int)
+    parser.add_argument("--queue-depth", type=int)
+    parser.add_argument("--plan", type=Path, help="Save the compiled execution plan.")
+    args = parser.parse_args()
+    config = load_config(args.config)
+    overrides = {key: getattr(args, key) for key in ("endpoint", "batch_size", "device", "queue_depth")
+                 if getattr(args, key) is not None}
+    app = BasicIngestApp(replace(config, **overrides))
+    if args.plan:
+        args.plan.write_text(app.plan.json(), encoding="utf-8")
     app.run()
 
 
