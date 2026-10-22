@@ -1,6 +1,6 @@
 """Holoscan source operator RdmaRxOp: receives imagemux's frames from the ring(s) and emits them
-as Start / Batch / End lists per ring, and StemOp, which turns those of one ring into 4D-STEM
-tensors with scan positions. The operators that consume those belong to the app, e.g.
+as Start / Batch / End lists per ring, and ScanTensorOp, which turns those of one ring into
+4D-STEM tensors with scan positions. The operators that consume those belong to the app, e.g.
 VirtualDetectorOp in examples/pipeline/operators.py.
 """
 
@@ -319,12 +319,12 @@ class RdmaRxOp(Operator):
 
 
 # ---------------------------------------------------------------------------------------------
-# StemOp
+# ScanTensorOp
 #
 # 4D-STEM tensors: the images of one ring with their scan positions, one emission per batch.
 # ---------------------------------------------------------------------------------------------
 
-class StemOp(Operator):
+class ScanTensorOp(Operator):
     """Consumes the lists of ``Start``, ``Batch`` and ``End`` items of one ring of an ``RdmaRxOp``
     on that ring's GPU ``device`` and emits, for each list, one tensor map on ``frames`` and the
     order of things on ``index``.

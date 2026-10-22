@@ -10,7 +10,7 @@ connection:
 
 execute:
   seconds: 0                           # run time; 0 = until Ctrl+C
-  threads: 3                           # concurrent source, stem and detector
+  threads: 3                           # concurrent source, scan tensors and detector
 
 receiver:
   receive_only: false                  # true: return the credit at once, no GPU work

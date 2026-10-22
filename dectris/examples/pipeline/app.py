@@ -1,7 +1,7 @@
 """4D-STEM receiver pipeline for the RDMA transport of the imagemux bstream output.
 
-    imagemux ==WRITE_WITH_IMM==> frame ring ==> RdmaRx -> Stem -> VirtualDetector (per ring)
-        ^------------- consumed ring position (RDMA WRITE) ----'
+    imagemux ==WRITE_WITH_IMM==> frame ring ==> RdmaRx -> ScanTensor -> VirtualDetector
+        ^------------- consumed ring position (RDMA WRITE) ----'          (per ring)
 
 The images become 4D-STEM tensors positioned in the configured raster scan.
 
@@ -10,7 +10,7 @@ We are the TCP client of imagemux's RDMA handshake address: we send our queue pa
 connected and RECEIVEs are posted we say Ready (imagemux.py). The ring is in GPU memory
 (GPUDirect RDMA): the CPU copies the frame headers out of it and the kernels read the images in place.
 
-Its operator after StemOp (VirtualDetectorOp) is in operators.py next to it; everything
+Its operator after ScanTensorOp (VirtualDetectorOp) is in operators.py next to it; everything
 else comes from the imx-receiver wheel (the base image,
 dectris/tools/build_base_image.sh); run it from anywhere:
 

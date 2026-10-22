@@ -30,7 +30,7 @@ if HAVE_GPU:
                                  "pipeline"))
     from operators import VirtualDetectorOp
     from dectris.messages import IMAGE_BYTES, Batch, End, ScanShape, Segment, Series, Start
-    from dectris.operators import StemOp
+    from dectris.operators import ScanTensorOp
 
 N_IMAGES = 600
 PIXEL_SUM = 96 * 96
@@ -93,7 +93,7 @@ class GpuTest(unittest.TestCase):
         ids = np.arange(0, 512, dtype=np.uint64)
         dispatched = Dispatcher(0).dispatch(self.addrs(ids, self.pinned.ptr), ids)
         stream = cp.cuda.Stream(non_blocking=True)
-        stream.wait_event(dispatched.event)  # what StemOp does
+        stream.wait_event(dispatched.event)  # what ScanTensorOp does
         with stream:
             total = int(dispatched.payload.sum(dtype=cp.uint64))
         self.assertEqual(total, int(expected(ids).sum()))
@@ -136,33 +136,35 @@ class GpuTest(unittest.TestCase):
         self.assert_images(images, ids)
 
     def test_warm_ups_leave_no_state(self):
-        for scan, max_batch in ((ScanShape(10, 10), 512), (ScanShape(2, 2), 3), (ScanShape(1, 1), 1)):
-            stem = StemOp(Application(), name="stem", device=0, scan=scan, max_batch=max_batch)
-            stem.initialize()
-            self.assertIsNone(stem.warned)
+        for scan, max_batch in ((ScanShape(10, 10), 512), (ScanShape(2, 2), 3),
+                                (ScanShape(1, 1), 1)):
+            tensors = ScanTensorOp(Application(), name="scan_tensors", device=0, scan=scan,
+                                   max_batch=max_batch)
+            tensors.initialize()
+            self.assertIsNone(tensors.warned)
             detector = VirtualDetectorOp(Application(), name="detector", device=0, scan=scan,
                                          max_batch=max_batch)
             detector.initialize()
             self.assertEqual((detector.series, detector.image, detector.last), (None, None, None))
 
-    def stem(self, scan):
-        op = StemOp(Application(), name="stem", device=0, scan=scan)
+    def scan_tensors(self, scan):
+        op = ScanTensorOp(Application(), name="scan_tensors", device=0, scan=scan)
         op.initialize()
         return op
 
-    def stem_out(self, scan, items):
-        """(frames or None, index) that StemOp emits for ``items``."""
+    def scan_tensors_out(self, scan, items):
+        """(frames or None, index) that ScanTensorOp emits for ``items``."""
         out = Out()
-        self.stem(scan).compute(In(items), out, None)
+        self.scan_tensors(scan).compute(In(items), out, None)
         (index,) = out.ports["index"]
         frames = out.ports.get("frames", [None])
         self.assertEqual(len(frames), 1)  # one message per port and tick
         return frames[0], index
 
-    def test_stem_tensors_and_positions(self):
+    def test_scan_tensors_and_positions(self):
         series = Series(5)
         ids = np.concatenate([np.arange(0, 100), np.arange(120, 170)])  # 20 images lost
-        frames, index = self.stem_out(ScanShape(20, 10), [
+        frames, index = self.scan_tensors_out(ScanShape(20, 10), [
             Start(series), self.batch(series, ids[:100]),
             self.batch(series, ids[100:]), End(series, 170)])
         self.assertEqual(index, [Start(series), Segment(series, 0, 100),
@@ -174,14 +176,14 @@ class GpuTest(unittest.TestCase):
         self.assertEqual(frames["positions"].dtype, cp.int32)
         np.testing.assert_array_equal(frames["positions"].get(), np.stack(divmod(ids, 20), 1))
 
-    def test_stem_leaves_out_images_beyond_the_scan(self):
+    def test_scan_tensors_leaves_out_images_beyond_the_scan(self):
         series = Series(6)
-        frames, index = self.stem_out(ScanShape(10, 10), [
+        frames, index = self.scan_tensors_out(ScanShape(10, 10), [
             self.batch(series, np.arange(50, 150))])
         self.assertEqual(index, [Segment(series, 0, 50)])
         np.testing.assert_array_equal(frames["ids"].get(), np.arange(50, 100))
         np.testing.assert_array_equal(frames["diffraction"][:, 0, 0].get(), np.arange(51, 101))
-        frames, index = self.stem_out(ScanShape(10, 10), [
+        frames, index = self.scan_tensors_out(ScanShape(10, 10), [
             self.batch(series, np.arange(100, 120)), End(series, 120)])
         self.assertIsNone(frames)  # nothing inside the scan: only the index
         self.assertEqual(index, [End(series, 120)])
@@ -192,8 +194,8 @@ class GpuTest(unittest.TestCase):
         return op
 
     def through(self, scan, items, detector=None):
-        """``items`` through a StemOp into a VirtualDetectorOp; returns the detector."""
-        frames, index = self.stem_out(scan, items)
+        """``items`` through a ScanTensorOp into a VirtualDetectorOp; returns the detector."""
+        frames, index = self.scan_tensors_out(scan, items)
         detector = detector or self.detector(scan)
         detector.compute(In({"frames": frames, "index": index}), Out(), None)
         return detector

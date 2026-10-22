@@ -1,5 +1,5 @@
 """Operators of the example receiver app: VirtualDetectorOp (virtual detector images of a 4D-STEM
-scan), which consumes what dectris.StemOp emits, wired up after dectris.RdmaRxOp by
+scan), which consumes what dectris.ScanTensorOp emits, wired up after dectris.RdmaRxOp by
 add_virtual_detectors.
 """
 
@@ -7,17 +7,17 @@ import cupy as cp
 import numpy as np
 from holoscan.core import ConditionType, Operator, OperatorSpec
 
-from dectris import IMAGE_SHAPE, End, ScanShape, Segment, Start, StemOp, scan_positions
+from dectris import IMAGE_SHAPE, End, ScanShape, Segment, Start, ScanTensorOp, scan_positions
 
 
 # ---------------------------------------------------------------------------------------------
 # VirtualDetectorOp
 #
-# Virtual detector images of a 4D-STEM scan, built batch by batch from StemOp's tensors.
+# Virtual detector images of a 4D-STEM scan, built batch by batch from ScanTensorOp's tensors.
 # ---------------------------------------------------------------------------------------------
 
 class VirtualDetectorOp(Operator):
-    """Inputs ``frames`` and ``index`` of a ``StemOp``, on its ``device``.
+    """Inputs ``frames`` and ``index`` of a ``ScanTensorOp``, on its ``device``.
 
     Each diffraction pattern is integrated over a bright-field disc (radius ``bf_radius`` pixels)
     and an annular dark-field ring (``adf_radii`` inner, outer), both centred on the detector, and
@@ -63,7 +63,7 @@ class VirtualDetectorOp(Operator):
         with self.stream:
             values = self._integrate(cp.ones((k, *IMAGE_SHAPE), dtype=cp.uint16))
             positions, _ = scan_positions(np.arange(k) % self.scan.size, self.scan)
-            positions = cp.asarray(positions)  # as StemOp makes them: on the host, then copied
+            positions = cp.asarray(positions)  # made on the host and copied, as ScanTensorOp does
             image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
             image[:, positions[:, 0], positions[:, 1]] = values.T
             image.sum(axis=(1, 2)).get()
@@ -117,13 +117,13 @@ class VirtualDetectorOp(Operator):
 
 
 def add_virtual_detectors(app, source, scan: ScanShape):
-    """A StemOp and a VirtualDetectorOp per ring of ``source`` (an RdmaRxOp), on the ring's
+    """A ScanTensorOp and a VirtualDetectorOp per ring of ``source`` (an RdmaRxOp), on the ring's
     GPU. With several rings each one only sees the scan positions of its images."""
     for path in source.paths:
-        stem = StemOp(app, name=f"stem{path.index}", device=path.device, scan=scan,
-                      max_batch=source.max_batch)
+        tensors = ScanTensorOp(app, name=f"scan_tensors{path.index}", device=path.device,
+                               scan=scan, max_batch=source.max_batch)
         detector = VirtualDetectorOp(app, name=f"detector{path.index}", device=path.device,
                                      scan=scan, max_batch=source.max_batch)
-        app.add_flow(source, stem, {(f"output{path.index}", "input")})
-        app.add_flow(stem, detector, {("frames", "frames"), ("index", "index")})
+        app.add_flow(source, tensors, {(f"output{path.index}", "input")})
+        app.add_flow(tensors, detector, {("frames", "frames"), ("index", "index")})
 

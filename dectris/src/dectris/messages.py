@@ -105,8 +105,8 @@ def scan_positions(ids, scan: ScanShape):
 
 @dataclass(frozen=True)
 class Segment:
-    """Rows ``start:stop`` of the tensors that ``StemOp`` emitted on ``frames`` in the same tick:
-    images of ``series``, in arrival order."""
+    """Rows ``start:stop`` of the tensors that ``ScanTensorOp`` emitted on ``frames`` in the same
+    tick: images of ``series``, in arrival order."""
 
     series: Series
     start: int

@@ -1,6 +1,6 @@
 """Receiver of imagemux's RDMA transport for Holoscan: the source operator (RdmaRxOp), the wire
-protocol (imagemux), the RDMA verbs (imxrdma, on libibverbs), and StemOp, which turns the images
-into 4D-STEM tensors. The operators that process those belong to the app
+protocol (imagemux), the RDMA verbs (imxrdma, on libibverbs), and ScanTensorOp, which turns the
+images into 4D-STEM tensors. The operators that process those belong to the app
 (examples/pipeline/operators.py has VirtualDetectorOp).
 
 Everything below is imported on first use, so ``import dectris`` and the protocol modules
@@ -22,8 +22,10 @@ emission is a list, in arrival order, of:
 A custom worker is a Holoscan ``Operator`` with an input that receives these lists, connected with
 ``app.add_flow(rx, worker, {(f"output{path.index}", "input")})``.
 
-For 4D-STEM, put a ``StemOp(app, device=path.device, scan=ScanShape(width, height))`` after the
-``RdmaRxOp``. For each list it emits a tensor map on ``frames``:
+These lists are Python objects, not Holoscan tensors, and the copy of the images may still be
+running when they are emitted. For 4D-STEM tensors, put a
+``ScanTensorOp(app, device=path.device, scan=ScanShape(width, height))`` after the ``RdmaRxOp``.
+For each list it emits a Holoscan tensor map on ``frames``:
 ``diffraction`` (k, 96, 96) uint16, ``positions`` (k, 2) int32 ``[row, column]`` in the raster
 scan and ``ids`` (k,) int64, on the ring's GPU and complete (readable on any stream, e.g. with
 ``torch.from_dlpack``), and on ``index`` the list of ``Start``, ``Segment`` (rows of ``frames`` of
@@ -43,7 +45,7 @@ __version__ = "0.1.0"
 # public name -> submodule that defines it
 _EXPORTS = {
     # operators
-    "RdmaRxOp": "operators", "RingPath": "operators", "StemOp": "operators",
+    "RdmaRxOp": "operators", "RingPath": "operators", "ScanTensorOp": "operators",
     # setup and running
     "VerbsConn": "connection", "run": "connection", "watch_liveness": "connection",
     # what the operators pass along a series

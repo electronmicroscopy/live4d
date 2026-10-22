@@ -14,7 +14,7 @@ DEFAULTS = {
     },
     "execute": {
         "seconds": 10.0,  # 0 = until Ctrl+C
-        "threads": 3,  # source, stem and detector run concurrently
+        "threads": 3,  # source, scan tensors and detector run concurrently
     },
     "receiver": {  # RdmaRxOp
         "receive_only": False,  # count images and return the credit at once, no GPU work

@@ -6,7 +6,7 @@ emitted as 4D-STEM tensors with their scan positions (see [4D-STEM output](#4d-s
 the example builds virtual detector images from them.
 
 ```
-imagemux -> gpu frame ring -> RdmaRx -> Stem -> VirtualDetector
+imagemux -> gpu frame ring -> RdmaRx -> ScanTensor -> VirtualDetector
    ^------------- consumed position (RDMA WRITE) ---^
 ```
 
@@ -59,7 +59,7 @@ Everything from `dectris`
 | What | Names |
 |---|---|
 | Source operator | `RdmaRxOp`, `RingPath` |
-| 4D-STEM tensors | `StemOp`, `ScanShape`, `Segment`, `scan_positions` |
+| 4D-STEM tensors | `ScanTensorOp`, `ScanShape`, `Segment`, `scan_positions` |
 | Setup and running | `VerbsConn`, `TcpConnector`, `ImagemuxCodec`, `LocalInfo`, `run`, `watch_liveness` |
 | Passed between operators | `Start`, `Batch`, `End`, `Series`, `IMAGE_SHAPE`, `IMAGE_BYTES` |
 | Protocol | `FrameReader`, `FrameHeader`, `FrameKind`, `CreditTracker`, `Peer`, `Link`, `RemoteRegion`, `QpEndpoint` |
@@ -70,7 +70,7 @@ Everything from `dectris`
 
 
 In `examples/pipeline/` is an example app: `app.py` wires `RdmaRxOp` into
-`StemOp` and the operator defined in `operators.py` (`VirtualDetectorOp`, which builds bright-field and annular dark-field images of the scan). It also has a container of its own based on the base image, with `app.py` as entrypoint; its configuration is in `examples/pipeline/pipeline.yaml`:
+`ScanTensorOp` and the operator defined in `operators.py` (`VirtualDetectorOp`, which builds bright-field and annular dark-field images of the scan). It also has a container of its own based on the base image, with `app.py` as entrypoint; its configuration is in `examples/pipeline/pipeline.yaml`:
 ```
 examples/pipeline/run.sh
 ```
@@ -110,7 +110,7 @@ the first argument (`run.sh` mounts it into the container):
 | `connection.ring_mib` | 64 | ring size in MiB |
 | `connection.timeout` | 10 | seconds for the TCP connection to imagemux |
 | `execute.seconds` | 10 | run time, 0 = until Ctrl+C |
-| `execute.threads` | 3 | scheduler worker threads (source, stem and detector run concurrently) |
+| `execute.threads` | 3 | scheduler worker threads (source, scan tensors and detector run concurrently) |
 | `receiver.receive_only` | false | no GPU work: frames are counted and their credit returned at once; the series end line then shows the raw rate the sender delivers |
 | `receiver.max_batch` | 512 | most completions (frames) taken from the receive queue per poll |
 | `scan.width` | 1000 | probe positions per row of the raster scan |
@@ -131,9 +131,13 @@ look for a first-use cost; if it happens throughout, the pipeline is too slow fo
 
 ## 4D-STEM output
 
-The app puts a `StemOp` after `RdmaRxOp`, one per ring on that ring's GPU. Scans are always raster: image id `i` of a series is at row `i // scan.width`, column
-`i % scan.width`. Each list `RdmaRxOp` emits (one poll of the receive queue) becomes one emission
-on each of `StemOp`'s two outputs:
+The app puts a `ScanTensorOp` after `RdmaRxOp`, one per ring on that ring's GPU. Scans are always
+raster: image id `i` of a series is at row `i // scan.width`, column `i % scan.width`.
+
+`RdmaRxOp` does not emit Holoscan tensors. For each poll of the receive queue it emits a Python
+list of `Start`, `Batch` and `End`, where `Batch.images` is a CuPy array whose copy out of the ring
+may still be running. `ScanTensorOp` turns each such list into one Holoscan tensor map on its
+`frames` output and one list on its `index` output:
 
 | Output | Content |
 |---|---|
@@ -142,7 +146,7 @@ on each of `StemOp`'s two outputs:
 
 - **Per batch.** Nothing waits for a scan row or the end of the series; `k` is what one poll
   brought (at most `receiver.max_batch` frames).
-- **Complete when emitted.** `StemOp` synchronises its stream before emitting, so consumers may
+- **Complete when emitted.** `ScanTensorOp` synchronises its stream before emitting, so consumers may
   read the tensors on any stream without waiting on CUDA events.
 - **Lost and extra images.** Lost images leave their scan positions empty, never shifting the
   others; images with ids beyond `width * height` are left out with a message per series.
@@ -151,7 +155,7 @@ on each of `StemOp`'s two outputs:
   `frames` input `.condition(ConditionType.NONE)` and ticks on `index` (see `VirtualDetectorOp`).
 - **PyTorch.** Not a dependency. A downstream operator can wrap the tensors without a copy with
   `torch.from_dlpack(frames["diffraction"])`.
-- **Warm-up.** The dispatcher, `StemOp` and `VirtualDetectorOp` run one full batch
+- **Warm-up.** The dispatcher, `ScanTensorOp` and `VirtualDetectorOp` run one full batch
   (`receiver.max_batch` images) when they are initialised. That compiles the kernels and grows the
   memory pools before the first frame arrives, not during the first series. It makes startup a
   few seconds slower, mostly for CuPy compiling kernels in the fresh container. A custom consumer
@@ -292,18 +296,18 @@ Registering needs locked memory: `examples/pipeline/run.sh` starts the container
 ## Multi-GPU
 
 The receiver supports multiple GPUs. Each GPU gets its own **ring** buffer in that GPU's memory
-that imagemux writes frames into. The imagemux decides which images go to which ring. For each ring the receiver keeps a `RingPath` (`operators.py`) with three parts: `FrameReader` which finds and decodes the frames imagemux has written into the ring, `Credits` which tell imagemux which parts of the ring it may overwrite again, `Dispatcher`, which launch the GPU kernels that copy the images out of the ring. The images of each ring are processed by their own `StemOp` and `VirtualDetectorOp`. There is only one ring currently pending imagemux support.
+that imagemux writes frames into. The imagemux decides which images go to which ring. For each ring the receiver keeps a `RingPath` (`operators.py`) with three parts: `FrameReader` which finds and decodes the frames imagemux has written into the ring, `Credits` which tell imagemux which parts of the ring it may overwrite again, `Dispatcher`, which launch the GPU kernels that copy the images out of the ring. The images of each ring are processed by their own `ScanTensorOp` and `VirtualDetectorOp`. There is only one ring currently pending imagemux support.
 
 ```
- ring 0 (GPU 0) --> copy kernel on GPU 0 --> StemOp 0 --> VirtualDetectorOp 0
- ring 1 (GPU 1) --> copy kernel on GPU 1 --> StemOp 1 --> VirtualDetectorOp 1
+ ring 0 (GPU 0) --> copy kernel on GPU 0 --> ScanTensorOp 0 --> VirtualDetectorOp 0
+ ring 1 (GPU 1) --> copy kernel on GPU 1 --> ScanTensorOp 1 --> VirtualDetectorOp 1
 ```
 
 1. **Dispatch** (`dispatch.py`): Each received batch in a ring becomes one kernel on that
    ring's GPU with its own stream. The kernel copies the images straight from the ring to GPU
    memory; the ring space is credited back to imagemux once the copy is done. The START and END
    frames of a series are sent to every ring's operators.
-2. **4D-STEM tensors** (`operators.py`): Each `StemOp` runs on its ring's GPU and scheduler
+2. **4D-STEM tensors** (`operators.py`): Each `ScanTensorOp` runs on its ring's GPU and scheduler
    thread. It waits for each batch's event on its own stream, positions the images in the scan
    and emits them (see [4D-STEM output](#4d-stem-output)).
 3. **Virtual detector** (`examples/pipeline/operators.py`): Each `VirtualDetectorOp` builds the
