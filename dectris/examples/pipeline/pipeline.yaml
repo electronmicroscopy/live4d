@@ -10,11 +10,10 @@ connection:
 
 execute:
   seconds: 0                           # run time; 0 = until Ctrl+C
-  threads: 3                           # concurrent source, worker and aggregator
+  threads: 3                           # concurrent source, stem and detector
 
 receiver:
   receive_only: false                  # true: return the credit at once, no GPU work
-  keep_images: true                   # true: 4D-STEM tensors (StemOp -> VirtualDetectorOp); false: pixel sums straight from the ring
   max_batch: 512                       # completions (frames) taken from the receive queue per poll
 
 scan:                                  # 4D-STEM raster scan (image id i: row i // width, column i % width)

@@ -1,7 +1,7 @@
 """Holoscan source operator RdmaRxOp: receives imagemux's frames from the ring(s) and emits them
 as Start / Batch / End lists per ring, and StemOp, which turns those of one ring into 4D-STEM
-tensors with scan positions. The operators that consume them belong to the app, e.g.
-WorkerOp, AggregateOp and VirtualDetectorOp in examples/pipeline/operators.py.
+tensors with scan positions. The operators that consume those belong to the app, e.g.
+VirtualDetectorOp in examples/pipeline/operators.py.
 """
 
 import time
@@ -14,7 +14,7 @@ from .dispatch import (DeviceRing, Dispatcher, flush_gpudirect_writes, ring_loca
                       set_sync_memops)
 from .imagemux import (Compression, CreditTracker, DataType, Frame, FrameKind, FrameReader,
                       RemoteRegion)
-from .messages import (IMAGE_BYTES, IMAGE_SHAPE, Batch, End, ScanShape, Segment, Start,
+from .messages import (IMAGE_BYTES, IMAGE_SHAPE, Batch, End, ScanShape, Segment, Series, Start,
                        parse_start, scan_positions)
 
 
@@ -57,8 +57,13 @@ class RingPath:
         self.credit_sent = 0
         self.dispatcher = None  # created in start(), on the thread that runs the operator
 
-    def start(self, reduce: bool):
-        self.dispatcher = Dispatcher(self.device, reduce=reduce)
+    def start(self, warm_up: int):
+        """Create the dispatcher; with ``warm_up`` > 0 run a batch of that many images through it.
+        Also loads what the first flush of the NIC's writes needs, before any frame arrives."""
+        self.dispatcher = Dispatcher(self.device)
+        if warm_up:
+            self.dispatcher.warm_up(warm_up)
+        flush_gpudirect_writes(self.ring_gpu)
 
     @property
     def held(self) -> int:
@@ -72,8 +77,8 @@ class RingPath:
 
 class RdmaRxOp(Operator):
     """Source: reads the frames imagemux writes into the ring(s) and emits, on ``output{i}`` of
-    each ring ``i``, a list in arrival order of ``Batch`` (images of one series on that ring's
-    GPU, as pixel sums or as images, with host image ids restarting at 0 per series), ``Start``
+    each ring ``i``, a list in arrival order of ``Batch`` (images of one series copied to that
+    ring's GPU, with host image ids restarting at 0 per series), ``Start``
     and ``End`` (with the image count); ``Start`` and ``End`` go to every output.
 
     There is one ``RingPath`` per ring (currently one). ``conn`` is the connected
@@ -81,18 +86,14 @@ class RdmaRxOp(Operator):
     """
 
     def __init__(self, fragment, *args, conn, ring: RemoteRegion, credit: RemoteRegion,
-                 reduce: bool = True, max_batch: int = 512,
-                 receive_only: bool = False, **kwargs):
+                 max_batch: int = 512, receive_only: bool = False, **kwargs):
         self.conn = conn
         self.imms = np.empty(max_batch, dtype=np.uint32)  # filled by conn.poll
-        self.reduce = reduce
         self.receive_only = receive_only  # count images and return the credit, no GPU work
         self.max_batch = max_batch
         self.paths = [RingPath(0, ring, credit)]
         what = ("receive only: frames are counted and their credit returned at once, nothing "
-                "is processed" if receive_only
-                else "pixel sums are computed straight from the ring" if reduce
-                else "images are copied to GPU memory")
+                "is processed" if receive_only else "images are copied to GPU memory")
         for path in self.paths:
             print(f"ring {path.index} of {path.ring.length >> 20} MiB in {path.where}; {what}",
                   flush=True)
@@ -100,6 +101,7 @@ class RdmaRxOp(Operator):
         self.images = 0  # images of the series received, or dropped if it has no Series
         self.next_id, self.missing, self.gaps_shown = None, 0, 0  # image id continuity check
         self.peak_fill = 0.0  # largest share of a ring held (read, credit not returned yet)
+        self.peak_at = 0  # images of the series received when it was reached
         self.lost = False  # the connection failed; the app is being stopped
         self.deficit = 0  # RECEIVEs that could not be re-posted yet
         super().__init__(fragment, *args, **kwargs)
@@ -115,14 +117,14 @@ class RdmaRxOp(Operator):
     def initialize(self):
         super().initialize()
         for path in self.paths:
-            path.start(self.reduce)
+            path.start(0 if self.receive_only else self.max_batch)
 
     def start_series(self, frame: Frame, path: RingPath):
         """Returns the Start marker of the series, or None if it was rejected."""
         header = frame.header
         self.images = 0
         self.next_id, self.missing, self.gaps_shown = None, 0, 0
-        self.peak_fill = 0.0
+        self.peak_fill, self.peak_at = 0.0, 0
         self.first_image = None  # when the first image frame arrived (START comes earlier)
         try:
             data = path.view[frame.data_offset:frame.data_offset + header.data_size]
@@ -148,7 +150,7 @@ class RdmaRxOp(Operator):
         took = time.perf_counter() - (self.first_image or time.perf_counter())
         rate = f" in {took:.2f} s ({self.images / took / 1e3:.1f} kHz)" if took > 0 else ""
         print(f"series {series.id} END: {self.images} images{lost}{rate}; ring held at most "
-              f"{100 * self.peak_fill:.0f}%", flush=True)
+              f"{100 * self.peak_fill:.0f}% (at image {self.peak_at})", flush=True)
         return End(series, self.images)
 
     def frame_images(self, frame: Frame, path: RingPath):
@@ -280,7 +282,9 @@ class RdmaRxOp(Operator):
                 sequence[-1][2].append(images[0])
                 sequence[-1][3].append(images[1])
 
-        self.peak_fill = max([self.peak_fill] + [p.held / p.ring.length for p in self.paths])
+        fill = max(p.held / p.ring.length for p in self.paths)
+        if fill > self.peak_fill:
+            self.peak_fill, self.peak_at = fill, self.images
 
         if self.receive_only:
             for path in self.paths:
@@ -302,8 +306,8 @@ class RdmaRxOp(Operator):
             events, keep = launched[path.index]
             events.append(dispatched.event)
             keep += dispatched.keep
-            data = {"sums": dispatched.payload} if self.reduce else {"images": dispatched.payload}
-            out[path.index].append(Batch(series, dispatched.ids, dispatched.event, **data))
+            out[path.index].append(Batch(series, dispatched.ids, dispatched.event,
+                                         dispatched.payload))
         for path in self.paths:
             events, keep = launched[path.index]
             path.credits.add(path.reader.position, events, keep)
@@ -321,9 +325,9 @@ class RdmaRxOp(Operator):
 # ---------------------------------------------------------------------------------------------
 
 class StemOp(Operator):
-    """Consumes the lists of ``Start``, ``Batch`` and ``End`` items of one ring (an ``RdmaRxOp``
-    with ``reduce=False``) on that ring's GPU ``device`` and emits, for each list, one tensor map
-    on ``frames`` and the order of things on ``index``.
+    """Consumes the lists of ``Start``, ``Batch`` and ``End`` items of one ring of an ``RdmaRxOp``
+    on that ring's GPU ``device`` and emits, for each list, one tensor map on ``frames`` and the
+    order of things on ``index``.
 
     ``frames`` (only if there are images): ``diffraction`` (k, 96, 96) uint16, ``positions``
     (k, 2) int32 ``[row, column]`` in the raster ``scan``, and ``ids`` (k,) int64 image ids, all
@@ -335,9 +339,11 @@ class StemOp(Operator):
     consumer tells the series in one ``frames`` apart and orders them with their start and end.
     """
 
-    def __init__(self, fragment, *args, device: int, scan: ScanShape, **kwargs):
+    def __init__(self, fragment, *args, device: int, scan: ScanShape, max_batch: int = 512,
+                 **kwargs):
         self.device = cp.cuda.Device(device)
         self.scan = scan
+        self.max_batch = max_batch  # images of the largest batch, for the warm-up
         self.warned = None  # series that was told about images outside the scan
         super().__init__(fragment, *args, **kwargs)
 
@@ -350,12 +356,26 @@ class StemOp(Operator):
         super().initialize()
         with self.device:
             self.stream = cp.cuda.Stream(non_blocking=True)
+            self._warm_up()
+
+    def _warm_up(self):
+        """Run a full-size tick now, not on the first (timed) batches: two batches of half
+        ``max_batch`` each, the second one crossing the end of the scan."""
+        series = Series(-1)
+        half = max(self.max_batch // 2, 1)
+        with self.stream:
+            ready = cp.cuda.Event(block=False, disable_timing=True)
+            ready.record(self.stream)
+            first = np.arange(half, dtype=np.int64)
+            last = np.arange(half, dtype=np.int64) + max(self.scan.size - half // 2, 0)
+            batches = [Batch(series, ids, ready, cp.zeros((half, *IMAGE_SHAPE), dtype=cp.uint16))
+                       for ids in (first, last)]
+        self.warned = series.id  # no message about the ids beyond the scan
+        self._frames(batches)
+        self.warned = None
 
     def _positioned(self, batch: Batch):
         """(images, positions, ids) of the images of ``batch`` that are inside the scan."""
-        if batch.images is None:
-            raise RuntimeError("StemOp needs the images: an RdmaRxOp with reduce=False "
-                               "(receiver.keep_images: true)")
         self.stream.wait_event(batch.ready)  # the images are copied on the dispatcher's stream
         ids = np.asarray(batch.ids, dtype=np.int64)
         positions, valid = scan_positions(ids, self.scan)
@@ -370,11 +390,14 @@ class StemOp(Operator):
             ids = ids[valid]
         return images, positions, ids
 
-    def compute(self, op_input, op_output, context):
+    def _frames(self, items):
+        """(index, frames or None) of a list of ``Start``, ``Batch`` and ``End`` items; ``frames``
+        is complete when returned."""
         index, images, positions, ids = [], [], [], []
         rows = 0
+        frames = None
         with self.device, self.stream:
-            for item in op_input.receive("input"):
+            for item in items:
                 if not isinstance(item, Batch):
                     index.append(item)
                     continue
@@ -394,5 +417,10 @@ class StemOp(Operator):
                 }
                 # Complete before it leaves: consumers may read it on any stream.
                 self.stream.synchronize()
-                op_output.emit(frames, "frames")
+        return index, frames
+
+    def compute(self, op_input, op_output, context):
+        index, frames = self._frames(op_input.receive("input"))
+        if frames is not None:
+            op_output.emit(frames, "frames")
         op_output.emit(index, "index")

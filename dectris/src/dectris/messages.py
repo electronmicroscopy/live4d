@@ -50,17 +50,16 @@ class Start:
 class Batch:
     """Consecutive images of one series from one ring, on the ring's GPU.
 
-    ``ids`` are the (k,) host image ids within the series (they restart at 0 with every series).
-    The data is either ``images``, the (k, 96, 96) uint16 images, or ``sums``, their (k,) uint64
-    pixel sums. It is produced asynchronously: it is only complete once the CUDA event ``ready``
-    has happened, so wait for it on the stream that reads the data.
+    ``ids`` are the (k,) host image ids within the series (they restart at 0 with every series),
+    ``images`` the (k, 96, 96) uint16 images. They are copied asynchronously: they are only
+    complete once the CUDA event ``ready`` has happened, so wait for it on the stream that reads
+    them.
     """
 
     series: Series
     ids: Any
     ready: Any
-    images: Any = None
-    sums: Any = None
+    images: Any
 
 
 @dataclass(frozen=True)

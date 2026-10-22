@@ -14,15 +14,14 @@ DEFAULTS = {
     },
     "execute": {
         "seconds": 10.0,  # 0 = until Ctrl+C
-        "threads": 3,  # source, worker and aggregator run concurrently
+        "threads": 3,  # source, stem and detector run concurrently
     },
     "receiver": {  # RdmaRxOp
         "receive_only": False,  # count images and return the credit at once, no GPU work
-        "keep_images": False,  # copy the images to GPU memory; False reduces them to pixel sums from the ring
         "max_batch": 512,  # most completions (frames) taken from the receive queue per poll
     },
     "scan": {  # 4D-STEM raster scan: image id i is at row i // width, column i % width
-        "width": 1000,  # probe positions per row; also the row width of the sums path
+        "width": 1000,  # probe positions per row
         "height": 1000,  # rows
     },
 }

@@ -1,4 +1,5 @@
-"""GPU side of the receive path: dispatch from a ring, event-ordered work, reconstruction.
+"""GPU side of the receive path: dispatch from a ring, event-ordered work, 4D-STEM tensors and
+virtual detector images.
 
 Needs a GPU, CuPy and Holoscan (run it in the image with the NVIDIA runtime); skipped otherwise.
 Image i of the test ring has every pixel equal to i + 1, so its pixel sum is (i + 1) * 9216.
@@ -27,7 +28,7 @@ if HAVE_GPU:
     # the example app's operators (examples/pipeline/operators.py)
     sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples",
                                  "pipeline"))
-    from operators import AggregateOp, VirtualDetectorOp, WorkerOp
+    from operators import VirtualDetectorOp
     from dectris.messages import IMAGE_BYTES, Batch, End, ScanShape, Segment, Series, Start
     from dectris.operators import StemOp
 
@@ -71,28 +72,30 @@ class GpuTest(unittest.TestCase):
     def addrs(self, ids, base):
         return np.uint64(base) + np.asarray(ids, dtype=np.uint64) * np.uint64(IMAGE_BYTES)
 
-    def sums_of(self, dispatched, reduce):
-        """(ids, sums) once the event has happened."""
+    def copied(self, dispatched):
+        """(ids, host copy of the images) once the event has happened."""
         dispatched.event.synchronize()
-        payload = dispatched.payload
-        sums = payload if reduce else payload.sum(axis=(1, 2), dtype=cp.uint64)
-        return dispatched.ids, sums.get()
+        return dispatched.ids, dispatched.payload.get()
 
-    def test_sums_and_copied_images_agree(self):
+    def assert_images(self, images, ids):
+        """Image i has every pixel equal to i + 1."""
+        want = (np.asarray(ids, dtype=np.uint16) + 1)[:, None, None]
+        np.testing.assert_array_equal(images, np.broadcast_to(want, (len(want), 96, 96)))
+
+    def test_dispatch_copies_the_images(self):
         ids = np.arange(0, 500, dtype=np.uint64)
-        for reduce in (True, False):
-            dispatched = Dispatcher(0, reduce=reduce).dispatch(self.addrs(ids, self.pinned.ptr), ids)
-            got_ids, sums = self.sums_of(dispatched, reduce)
-            np.testing.assert_array_equal(got_ids, ids)
-            np.testing.assert_array_equal(sums, expected(ids))
+        got_ids, images = self.copied(Dispatcher(0).dispatch(self.addrs(ids, self.pinned.ptr), ids))
+        np.testing.assert_array_equal(got_ids, ids)
+        self.assertEqual(images.dtype, np.uint16)
+        self.assert_images(images, ids)
 
     def test_dispatch_does_not_wait_and_events_order_the_data(self):
         ids = np.arange(0, 512, dtype=np.uint64)
         dispatched = Dispatcher(0).dispatch(self.addrs(ids, self.pinned.ptr), ids)
         stream = cp.cuda.Stream(non_blocking=True)
-        stream.wait_event(dispatched.event)  # what the worker does
+        stream.wait_event(dispatched.event)  # what StemOp does
         with stream:
-            total = int(dispatched.payload.sum())
+            total = int(dispatched.payload.sum(dtype=cp.uint64))
         self.assertEqual(total, int(expected(ids).sum()))
         self.assertTrue(dispatched.event.done)
 
@@ -101,9 +104,8 @@ class GpuTest(unittest.TestCase):
         self.assertEqual(ring_location(base), 0)
         self.assertIsNone(ring_location(self.pinned.ptr))
         ids = np.arange(100, 300, dtype=np.uint64)
-        got_ids, sums = self.sums_of(Dispatcher(0, reduce=True).dispatch(
-            self.addrs(ids, base), ids), True)
-        np.testing.assert_array_equal(sums, expected(got_ids))
+        got_ids, images = self.copied(Dispatcher(0).dispatch(self.addrs(ids, base), ids))
+        self.assert_images(images, got_ids)
         self.assertIn(flush_gpudirect_writes(0), (0, 801))  # done, or not supported by the GPU
 
     def test_sync_memops_can_be_set_on_gpu_memory(self):
@@ -119,92 +121,29 @@ class GpuTest(unittest.TestCase):
         self.assertEqual((decoded.kind, decoded.sequence, decoded.position), (FrameKind.START, 7, 4096))
         self.assertEqual(len(view[100:100]), 0)
 
-    def worker(self):
-        op = WorkerOp(Application(), name="worker", device=0)
-        op.initialize()
-        return op
-
-    def feed(self, op, items):
-        out = Out()
-        op.compute(In(items), out, None)
-        return out.messages
-
-    def batch(self, series, ids, reduce=True):
+    def batch(self, series, ids):
         ids = np.asarray(ids, dtype=np.uint64)
-        dispatched = Dispatcher(0, reduce=reduce).dispatch(self.addrs(ids, self.pinned.ptr), ids)
+        dispatched = Dispatcher(0).dispatch(self.addrs(ids, self.pinned.ptr), ids)
         # The pointer lists must outlive the kernels: they are kept until the event happened.
         dispatched.event.synchronize()
-        data = {"sums": dispatched.payload} if reduce else {"images": dispatched.payload}
-        return Batch(series, dispatched.ids, dispatched.event, **data)
+        return Batch(series, dispatched.ids, dispatched.event, dispatched.payload)
 
-    def test_worker_consecutive_and_gapped_batches(self):
-        series = Series(5)
-        for reduce in (True, False):
-            op = self.worker()
-            # 0..199 in two batches, then 220..299 after a gap of 20 lost images.
-            items = [self.batch(series, np.arange(0, 100), reduce),
-                     self.batch(series, np.arange(100, 200), reduce),
-                     self.batch(series, np.arange(220, 300), reduce),
-                     End(series, 300)]
-            (messages,) = self.feed(op, items)
-            (series_id, values), = messages
-            self.assertEqual(series_id, 5)
-            want = np.zeros(300, dtype=np.uint64)
-            for lo, hi in ((0, 200), (220, 300)):
-                want[lo:hi] = expected(np.arange(lo, hi))
-            np.testing.assert_array_equal(values.get(), want)
+    def test_dispatcher_warm_up(self):
+        dispatcher = Dispatcher(0)
+        dispatcher.warm_up(64)
+        ids = np.arange(10, 74, dtype=np.uint64)
+        _, images = self.copied(dispatcher.dispatch(self.addrs(ids, self.pinned.ptr), ids))
+        self.assert_images(images, ids)
 
-    def test_lost_tail_keeps_its_place(self):
-        series = Series(7)
-        (messages,) = self.feed(self.worker(), [self.batch(series, np.arange(0, 100)),
-                                                End(series, 120)])
-        (_, values), = messages
-        self.assertEqual(len(values), 120)  # 20 images lost at the end stay 0
-        np.testing.assert_array_equal(values.get()[100:], np.zeros(20, dtype=np.uint64))
-
-    def test_start_and_end_without_images_give_zeros(self):
-        series = Series(3, expected_images=50)
-        (messages,) = self.feed(self.worker(), [Start(series), End(series, 80)])
-        (series_id, values), = messages
-        self.assertEqual(series_id, 3)
-        np.testing.assert_array_equal(values.get(), np.zeros(80, dtype=np.uint64))
-
-    def test_start_does_not_change_the_result(self):
-        series = Series(4)
-        items = [self.batch(series, np.arange(0, 100)), End(series, 100)]
-        (without,) = self.feed(self.worker(), list(items))
-        (with_start,) = self.feed(self.worker(), [Start(series)] + items)
-        np.testing.assert_array_equal(with_start[0][1].get(), without[0][1].get())
-
-    def test_new_start_drops_a_series_without_end(self):
-        first, second = Series(5), Series(6)
-        messages = self.feed(self.worker(), [Start(first), self.batch(first, np.arange(0, 10)),
-                                             Start(second), End(second, 10)])
-        self.assertEqual([series_id for (series_id, _), in messages], [6])
-
-    def aggregate(self, series_width=None):
-        op = AggregateOp(Application(), name="aggregate", n_workers=2, device=0,
-                         series_width=series_width)
-        op.initialize()
-        return op
-
-    def test_aggregate_merges_by_image_id(self):
-        # Two rings with blocks of ids that are not id % 2, and image 150 lost.
-        series = Series(8)
-        results = []
-        for ids in (np.arange(0, 100), np.concatenate([np.arange(100, 150), np.arange(151, 200)])):
-            (messages,) = self.feed(self.worker(), [self.batch(series, ids), End(series, 199)])
-            results.append(messages[0][1])
-        image = self.aggregate()._aggregate(8, dict(enumerate(results)))
-        want = expected(np.arange(200))
-        want[150] = 0
-        np.testing.assert_array_equal(image.get().ravel(), want)
-        self.assertEqual(image.shape, (1, 200))
-
-    def test_aggregate_shapes_the_series_with_series_width(self):
-        values = cp.asarray(expected(np.arange(200)))
-        self.assertEqual(self.aggregate(series_width=20)._aggregate(9, {0: values}).shape, (10, 20))
-        self.assertEqual(self.aggregate(series_width=30)._aggregate(9, {0: values}).shape, (1, 200))
+    def test_warm_ups_leave_no_state(self):
+        for scan, max_batch in ((ScanShape(10, 10), 512), (ScanShape(2, 2), 3), (ScanShape(1, 1), 1)):
+            stem = StemOp(Application(), name="stem", device=0, scan=scan, max_batch=max_batch)
+            stem.initialize()
+            self.assertIsNone(stem.warned)
+            detector = VirtualDetectorOp(Application(), name="detector", device=0, scan=scan,
+                                         max_batch=max_batch)
+            detector.initialize()
+            self.assertEqual((detector.series, detector.image, detector.last), (None, None, None))
 
     def stem(self, scan):
         op = StemOp(Application(), name="stem", device=0, scan=scan)
@@ -224,8 +163,8 @@ class GpuTest(unittest.TestCase):
         series = Series(5)
         ids = np.concatenate([np.arange(0, 100), np.arange(120, 170)])  # 20 images lost
         frames, index = self.stem_out(ScanShape(20, 10), [
-            Start(series), self.batch(series, ids[:100], reduce=False),
-            self.batch(series, ids[100:], reduce=False), End(series, 170)])
+            Start(series), self.batch(series, ids[:100]),
+            self.batch(series, ids[100:]), End(series, 170)])
         self.assertEqual(index, [Start(series), Segment(series, 0, 100),
                                  Segment(series, 100, 150), End(series, 170)])
         diffraction = frames["diffraction"]
@@ -238,18 +177,14 @@ class GpuTest(unittest.TestCase):
     def test_stem_leaves_out_images_beyond_the_scan(self):
         series = Series(6)
         frames, index = self.stem_out(ScanShape(10, 10), [
-            self.batch(series, np.arange(50, 150), reduce=False)])
+            self.batch(series, np.arange(50, 150))])
         self.assertEqual(index, [Segment(series, 0, 50)])
         np.testing.assert_array_equal(frames["ids"].get(), np.arange(50, 100))
         np.testing.assert_array_equal(frames["diffraction"][:, 0, 0].get(), np.arange(51, 101))
         frames, index = self.stem_out(ScanShape(10, 10), [
-            self.batch(series, np.arange(100, 120), reduce=False), End(series, 120)])
+            self.batch(series, np.arange(100, 120)), End(series, 120)])
         self.assertIsNone(frames)  # nothing inside the scan: only the index
         self.assertEqual(index, [End(series, 120)])
-
-    def test_stem_needs_the_images(self):
-        with self.assertRaisesRegex(RuntimeError, "reduce=False"):
-            self.stem_out(ScanShape(10, 10), [self.batch(Series(1), np.arange(10))])
 
     def detector(self, scan):
         op = VirtualDetectorOp(Application(), name="detector", device=0, scan=scan)
@@ -272,7 +207,7 @@ class GpuTest(unittest.TestCase):
         scan, series = ScanShape(20, 10), Series(7)
         ids = np.concatenate([np.arange(0, 60), np.arange(80, 200)])  # 20 images lost
         detector = self.through(scan, [Start(series),
-                                       self.batch(series, ids, reduce=False),
+                                       self.batch(series, ids),
                                        End(series, 200)])
         series_id, image = detector.last
         self.assertEqual((series_id, image.shape), (7, (2, 10, 20)))
@@ -288,9 +223,9 @@ class GpuTest(unittest.TestCase):
         detector = self.detector(scan)
         finish = detector._finish
         detector._finish = lambda end: (finish(end), finished.append(detector.last))
-        self.through(scan, [Start(first), self.batch(first, np.arange(0, 30), reduce=False),
+        self.through(scan, [Start(first), self.batch(first, np.arange(0, 30)),
                             End(first, 30), Start(second),
-                            self.batch(second, np.arange(0, 5), reduce=False), End(second, 5)],
+                            self.batch(second, np.arange(0, 5)), End(second, 5)],
                      detector)
         self.assertEqual([series_id for series_id, _ in finished], [1, 2])
         np.testing.assert_allclose(finished[0][1][0, 2, :].get(),
@@ -302,9 +237,9 @@ class GpuTest(unittest.TestCase):
     def test_virtual_detector_series_over_several_ticks(self):
         scan, series = ScanShape(10, 10), Series(3)
         detector = self.through(scan, [Start(series),
-                                       self.batch(series, np.arange(0, 40), reduce=False)])
+                                       self.batch(series, np.arange(0, 40))])
         self.assertIsNone(detector.last)
-        self.through(scan, [self.batch(series, np.arange(40, 100), reduce=False),
+        self.through(scan, [self.batch(series, np.arange(40, 100)),
                             End(series, 100)], detector)
         np.testing.assert_allclose(detector.last[1][0].get().ravel(),
                                    self.bright_field(detector, np.arange(100)))

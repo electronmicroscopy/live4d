@@ -1,6 +1,7 @@
 """Receiver of imagemux's RDMA transport for Holoscan: the source operator (RdmaRxOp), the wire
-protocol (imagemux), and the RDMA verbs (imxrdma, on libibverbs). The operators that process the
-images belong to the app (examples/pipeline/operators.py has WorkerOp and AggregateOp).
+protocol (imagemux), the RDMA verbs (imxrdma, on libibverbs), and StemOp, which turns the images
+into 4D-STEM tensors. The operators that process those belong to the app
+(examples/pipeline/operators.py has VirtualDetectorOp).
 
 Everything below is imported on first use, so ``import dectris`` and the protocol modules
 work without holoscan or cupy.
@@ -14,24 +15,24 @@ conn.connect, port=...)``, and pass the link's queue pair, the ring and the peer
 emission is a list, in arrival order, of:
 
 - ``Start(series)``: a series begins (sent to every output);
-- ``Batch(series, ids, ready, images | sums)``: images of the series on the ring's GPU, as
-  (k, 96, 96) uint16 ``images`` (``reduce=False``) or (k,) uint64 pixel ``sums``
-  (``reduce=True``); wait for the CUDA event ``ready`` on your stream before reading them;
+- ``Batch(series, ids, ready, images)``: (k, 96, 96) uint16 ``images`` of the series copied to
+  the ring's GPU; wait for the CUDA event ``ready`` on your stream before reading them;
 - ``End(series, images)``: the series is over, with the number of images received.
 
 A custom worker is a Holoscan ``Operator`` with an input that receives these lists, connected with
 ``app.add_flow(rx, worker, {(f"output{path.index}", "input")})``.
 
 For 4D-STEM, put a ``StemOp(app, device=path.device, scan=ScanShape(width, height))`` after the
-``RdmaRxOp`` (``reduce=False``). For each list it emits a tensor map on ``frames``:
+``RdmaRxOp``. For each list it emits a tensor map on ``frames``:
 ``diffraction`` (k, 96, 96) uint16, ``positions`` (k, 2) int32 ``[row, column]`` in the raster
 scan and ``ids`` (k,) int64, on the ring's GPU and complete (readable on any stream, e.g. with
 ``torch.from_dlpack``), and on ``index`` the list of ``Start``, ``Segment`` (rows of ``frames`` of
 one series) and ``End`` in arrival order. ``frames`` is only emitted when there are images, so a
 consumer's ``frames`` input takes ``.condition(ConditionType.NONE)`` and its ticks follow
 ``index``.
- ``run(app, seconds, threads)`` and
-``watch_liveness(app, link)`` are the scheduler and stop-on-disconnect helpers.
+
+``run(app, seconds, threads)`` and ``watch_liveness(app, link)`` are the scheduler and
+stop-on-disconnect helpers.
 examples/pipeline/app.py (the receiver) is a complete app built this way.
 """
 
