@@ -4,7 +4,8 @@
 connection:
   remote_address: "10.42.41.10:31003"  # DCU RDMA handshake address
   local_address: "10.42.41.11"         # address of the local RoCE interface
-  ring_gpu: 0                          # GPU holding the RDMA ring
+  ring_gpu: 0                          # GPU processing the images
+  ring_memory: gpu                     # gpu or host_mapped
   ring_mib: 64                         # RDMA ring size in MiB
   timeout: 10                          # timeout seconds
 

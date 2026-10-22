@@ -17,6 +17,7 @@ class ResolveTest(unittest.TestCase):
         s = resolve({"connection": CONNECTION})
         self.assertEqual(s["connection"]["ring_mib"], 64)
         self.assertEqual(s["connection"]["ring_gpu"], 0)
+        self.assertEqual(s["connection"]["ring_memory"], "gpu")
         self.assertEqual(s["execute"], {"seconds": 10.0, "threads": 3})
         self.assertEqual(s["receiver"], {"receive_only": False, "max_batch": 512})
         self.assertEqual(s["scan"], {"width": 1000, "height": 1000})
@@ -32,6 +33,17 @@ class ResolveTest(unittest.TestCase):
         s = resolve({"connection": CONNECTION, "receiver": {"receive_only": True}})
         self.assertTrue(s["receiver"]["receive_only"])
         self.assertEqual(s["receiver"]["max_batch"], 512)
+
+    def test_ring_memory(self):
+        for value in ("gpu", "host_mapped"):
+            with self.subTest(value=value):
+                s = resolve({"connection": {**CONNECTION, "ring_memory": value}})
+                self.assertEqual(s["connection"]["ring_memory"], value)
+        for value in ("host", "GPU", "", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                        ValueError, "connection.ring_memory must be 'gpu' or 'host_mapped'"):
+                    resolve({"connection": {**CONNECTION, "ring_memory": value}})
 
     def test_required(self):
         with self.assertRaisesRegex(ValueError, "local_address"):

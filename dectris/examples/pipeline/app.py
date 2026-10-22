@@ -7,8 +7,9 @@ The images become 4D-STEM tensors positioned in the configured raster scan.
 
 We are the TCP client of imagemux's RDMA handshake address: we send our queue pair and ring
 (Hello), imagemux answers with its queue pair and credit word (Accept), and once our QP is
-connected and RECEIVEs are posted we say Ready (imagemux.py). The ring is in GPU memory
-(GPUDirect RDMA): the CPU copies the frame headers out of it and the kernels read the images in place.
+connected and RECEIVEs are posted we say Ready (imagemux.py). The ring uses GPU memory by default,
+or mapped host memory with ``connection.ring_memory`` set to ``host_mapped``. Kernels read images
+through the ring's CUDA address in either mode.
 
 Its operator after ScanTensorOp (VirtualDetectorOp) is in operators.py next to it; everything
 else comes from the imx-receiver wheel (the base image,
@@ -35,13 +36,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 class RdmaApp(Application):
     """Settings come from the YAML file (app.config); the connection is attached once made."""
 
-    def attach(self, settings, conn, ring, credit):
+    def attach(self, settings, conn, ring, credit, *, ring_device=None,
+               ring_device_address=None):
         self.settings = settings
         self.conn, self.ring, self.credit = conn, ring, credit
+        self.ring_device = ring_device
+        self.ring_device_address = ring_device_address
 
     def compose(self):
         rx = RdmaRxOp(self, name="rx", conn=self.conn, ring=self.ring,
-                      credit=self.credit, **self.settings["receiver"])
+                      credit=self.credit, ring_device=self.ring_device,
+                      ring_device_address=self.ring_device_address,
+                      **self.settings["receiver"])
         add_virtual_detectors(self, rx, ScanShape(**self.settings["scan"]))
 
 
@@ -62,7 +68,7 @@ def main():
     host, _, port = address.rpartition(":")
 
     verbs = VerbsConn(conn["local_address"], conn["ring_gpu"], conn["ring_mib"] << 20,
-                      conn["device"] or None)
+                      conn["device"] or None, ring_memory=conn["ring_memory"])
     try:
         endpoint, ring = verbs.endpoint, verbs.ring
         link = TcpConnector(host, ImagemuxCodec(), lambda: LocalInfo(ring, endpoint),
@@ -76,7 +82,9 @@ def main():
               f"credit addr={link.peer.credit.addr:#x} rkey={link.peer.credit.rkey:#x}",
               flush=True)
 
-        app.attach(settings, link.conn, ring, link.peer.credit)
+        app.attach(settings, link.conn, ring, link.peer.credit,
+                   ring_device=conn["ring_gpu"],
+                   ring_device_address=verbs.ring_device_address)
         closing = watch_liveness(app, link)
         try:
             run(app, execute["seconds"], execute["threads"])

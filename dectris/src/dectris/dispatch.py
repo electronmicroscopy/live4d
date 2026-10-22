@@ -1,7 +1,6 @@
-"""Get the images of a ring onto its GPU: copy them out of the ring.
+"""Copy images from an RDMA ring into GPU tensors.
 
-The ring is GPU memory that the NIC writes into (GPUDirect RDMA); the kernel reads the images
-where they are, with no staging copy.
+Kernels read the ring through its CUDA address, whether it is GPU memory or mapped host memory.
 """
 
 import ctypes
@@ -138,6 +137,20 @@ def load_cudart() -> ctypes.CDLL:
         except OSError:
             pass
     raise OSError("no CUDA runtime library (libcudart.so.13 / .12) found")
+
+
+def mapped_device_pointer(addr: int, device: int) -> int:
+    """Return the CUDA alias of a mapped host allocation for ``device``."""
+    cuda = load_cudart()
+    fn = cuda.cudaHostGetDevicePointer
+    fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    alias = ctypes.c_void_p()
+    with cp.cuda.Device(device):
+        status = fn(ctypes.byref(alias), addr, 0)
+    if status != 0 or alias.value is None:
+        raise RuntimeError(f"cudaHostGetDevicePointer failed with CUDA status {status}")
+    return alias.value
 
 
 def flush_gpudirect_writes(device: int):

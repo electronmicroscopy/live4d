@@ -4,14 +4,15 @@ as Start / Batch / End lists per ring, and ScanTensorOp, which turns those of on
 VirtualDetectorOp in examples/pipeline/operators.py.
 """
 
+import ctypes
 import time
 
 import cupy as cp
 import numpy as np
 from holoscan.core import Operator, OperatorSpec
 
-from .dispatch import (DeviceRing, Dispatcher, flush_gpudirect_writes, ring_location,
-                      set_sync_memops)
+from .dispatch import (DeviceRing, Dispatcher, flush_gpudirect_writes, mapped_device_pointer,
+                       ring_location, set_sync_memops)
 from .imagemux import (Compression, CreditTracker, DataType, Frame, FrameKind, FrameReader,
                       RemoteRegion)
 from .messages import (IMAGE_BYTES, IMAGE_SHAPE, Batch, End, ScanShape, Segment, Series, Start,
@@ -33,26 +34,36 @@ class RingPath:
     for it: where the CPU reads headers (``view``), the frame reader, the credits, and the
     dispatcher that gets the images onto the ring's GPU.
 
-    The ring is in GPU memory (a device memory region, GPUDirect RDMA) and its images are
-    processed on that GPU: a GPU only ever reads its own ring. The CPU reads the frame headers
-    from the ring, which in GPU memory means copying them out.
+    GPU rings use GPUDirect RDMA and copy headers to the CPU. Mapped host rings use direct
+    CPU header reads and a separate CUDA alias for image dispatch on the selected GPU.
     """
 
-    def __init__(self, index: int, ring: RemoteRegion, credit: RemoteRegion):
+    def __init__(self, index: int, ring: RemoteRegion, credit: RemoteRegion,
+                 *, ring_device: int | None = None, ring_device_address: int | None = None):
         self.index = index
         self.ring = ring
         self.credit = credit
         self.ring_gpu = ring_location(ring.addr)  # GPU holding the ring
         if self.ring_gpu is None:
-            raise ValueError(f"ring {index} is not in GPU memory")
-        self.device = self.ring_gpu
-        # The NIC's writes into GPU memory may become visible a little after the completion.
-        self.reader = FrameReader(ring.length, settle_s=GPU_RING_SETTLE_S)
-        self.view = DeviceRing(ring.addr, ring.length, self.ring_gpu)
-        status = set_sync_memops(ring.addr, self.ring_gpu)
-        if status != 0:
-            print(f"cuPointerSetAttribute(SYNC_MEMOPS) on ring {index} returned {status}",
-                  flush=True)
+            if ring_device is None or ring_device_address is None:
+                raise ValueError(f"ring {index} needs a GPU and a CUDA alias for mapped host memory")
+            alias = mapped_device_pointer(ring.addr, ring_device)
+            if alias != ring_device_address:
+                raise ValueError(f"ring {index} CUDA alias does not match its mapped host allocation")
+            self.device = ring_device
+            self.device_address = alias
+            self.reader = FrameReader(ring.length)
+            self.view = memoryview((ctypes.c_ubyte * ring.length).from_address(ring.addr)).cast("B")
+        else:
+            self.device = self.ring_gpu
+            self.device_address = ring.addr
+            # GPU ring headers can become visible after the completion.
+            self.reader = FrameReader(ring.length, settle_s=GPU_RING_SETTLE_S)
+            self.view = DeviceRing(ring.addr, ring.length, self.ring_gpu)
+            status = set_sync_memops(ring.addr, self.ring_gpu)
+            if status != 0:
+                print(f"cuPointerSetAttribute(SYNC_MEMOPS) on ring {index} returned {status}",
+                      flush=True)
         self.credits = CreditTracker()  # ring positions whose GPU reads have finished
         self.credit_sent = 0
         self.dispatcher = None  # created in start(), on the thread that runs the operator
@@ -63,7 +74,8 @@ class RingPath:
         self.dispatcher = Dispatcher(self.device)
         if warm_up:
             self.dispatcher.warm_up(warm_up)
-        flush_gpudirect_writes(self.ring_gpu)
+        if self.ring_gpu is not None:
+            flush_gpudirect_writes(self.ring_gpu)
 
     @property
     def held(self) -> int:
@@ -72,6 +84,8 @@ class RingPath:
 
     @property
     def where(self) -> str:
+        if self.ring_gpu is None:
+            return f"mapped host memory, processed on GPU {self.device}"
         return f"memory of GPU {self.ring_gpu} (GPUDirect RDMA)"
 
 
@@ -86,12 +100,14 @@ class RdmaRxOp(Operator):
     """
 
     def __init__(self, fragment, *args, conn, ring: RemoteRegion, credit: RemoteRegion,
-                 max_batch: int = 512, receive_only: bool = False, **kwargs):
+                 max_batch: int = 512, receive_only: bool = False,
+                 ring_device: int | None = None, ring_device_address: int | None = None, **kwargs):
         self.conn = conn
         self.imms = np.empty(max_batch, dtype=np.uint32)  # filled by conn.poll
         self.receive_only = receive_only  # count images and return the credit, no GPU work
         self.max_batch = max_batch
-        self.paths = [RingPath(0, ring, credit)]
+        self.paths = [RingPath(0, ring, credit, ring_device=ring_device,
+                               ring_device_address=ring_device_address)]
         what = ("receive only: frames are counted and their credit returned at once, nothing "
                 "is processed" if receive_only else "images are copied to GPU memory")
         for path in self.paths:
@@ -185,7 +201,7 @@ class RdmaRxOp(Operator):
         if self.receive_only:
             return None
         steps = np.arange(image.batch_size, dtype=np.uint64)
-        addrs = np.uint64(path.ring.addr + frame.data_offset) + steps * np.uint64(IMAGE_BYTES)
+        addrs = np.uint64(path.device_address + frame.data_offset) + steps * np.uint64(IMAGE_BYTES)
         return addrs, np.uint64(image.image_id) + steps
 
     def repost_recvs(self, n: int):
@@ -258,7 +274,8 @@ class RdmaRxOp(Operator):
         # protect the ring; the credit does.
         self.repost_recvs(k)
         for path in self.paths:
-            flush_gpudirect_writes(path.ring_gpu)  # the NIC's writes must be visible
+            if path.ring_gpu is not None:
+                flush_gpudirect_writes(path.ring_gpu)
 
         # In arrival order: [path, series, [addresses], [ids]] runs of images of one series from
         # one ring, and End markers between them.

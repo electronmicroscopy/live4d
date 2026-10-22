@@ -23,14 +23,14 @@ except Exception:  # no CuPy, Holoscan or driver
 
 if HAVE_GPU:
     from dectris.dispatch import (DeviceRing, Dispatcher, flush_gpudirect_writes,
-                                  ring_location, set_sync_memops)
-    from dectris.imagemux import FRAME_HEADER_LEN, FrameHeader, FrameKind
+                                 mapped_device_pointer, ring_location, set_sync_memops)
+    from dectris.imagemux import FRAME_HEADER_LEN, FrameHeader, FrameKind, RemoteRegion
     # the example app's operators (examples/pipeline/operators.py)
     sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples",
                                  "pipeline"))
     from operators import VirtualDetectorOp
     from dectris.messages import IMAGE_BYTES, Batch, End, ScanShape, Segment, Series, Start
-    from dectris.operators import ScanTensorOp
+    from dectris.operators import RingPath, ScanTensorOp
 
 N_IMAGES = 600
 PIXEL_SUM = 96 * 96
@@ -103,10 +103,36 @@ class GpuTest(unittest.TestCase):
         base = self.device_ring.data.ptr
         self.assertEqual(ring_location(base), 0)
         self.assertIsNone(ring_location(self.pinned.ptr))
+        path = RingPath(0, RemoteRegion(base, self.device_ring.nbytes, 0), RemoteRegion(0, 8, 0))
         ids = np.arange(100, 300, dtype=np.uint64)
-        got_ids, images = self.copied(Dispatcher(0).dispatch(self.addrs(ids, base), ids))
+        got_ids, images = self.copied(Dispatcher(path.device).dispatch(
+            self.addrs(ids, path.device_address), ids))
         self.assert_images(images, got_ids)
         self.assertIn(flush_gpudirect_writes(0), (0, 801))  # done, or not supported by the GPU
+
+    def test_mapped_host_ring_headers_and_gpu_images(self):
+        count = 4
+        size = FRAME_HEADER_LEN + count * IMAGE_BYTES
+        memory = cp.cuda.PinnedMemory(size, cp.cuda.runtime.hostAllocMapped)
+        buffer = cp.cuda.PinnedMemoryPointer(memory, 0)
+        header = FrameHeader(FrameKind.START, 7, 0, 5).encode()
+        np.frombuffer(buffer, dtype=np.uint8, count=FRAME_HEADER_LEN)[:] = np.frombuffer(
+            header, dtype=np.uint8)
+        pixels = np.frombuffer(buffer, dtype=np.uint16, offset=FRAME_HEADER_LEN).reshape(count, 96, 96)
+        pixels[:] = np.arange(1, count + 1, dtype=np.uint16)[:, None, None]
+        alias = mapped_device_pointer(memory.ptr, 0)
+        path = RingPath(0, RemoteRegion(memory.ptr, size, 0), RemoteRegion(0, 8, 0),
+                        ring_device=0, ring_device_address=alias)
+        decoded = FrameHeader.decode(path.view[:FRAME_HEADER_LEN])
+        self.assertEqual((decoded.kind, decoded.sequence), (FrameKind.START, 7))
+        ids = np.arange(count, dtype=np.uint64)
+        got_ids, images = self.copied(Dispatcher(path.device).dispatch(
+            self.addrs(ids, path.device_address + FRAME_HEADER_LEN), ids))
+        np.testing.assert_array_equal(got_ids, ids)
+        self.assert_images(images, ids)
+        with self.assertRaises(ValueError):
+            RingPath(0, RemoteRegion(memory.ptr, size, 0), RemoteRegion(0, 8, 0),
+                     ring_device=0, ring_device_address=alias + 128)
 
     def test_sync_memops_can_be_set_on_gpu_memory(self):
         ring = cp.zeros(1 << 20, dtype=cp.uint8)

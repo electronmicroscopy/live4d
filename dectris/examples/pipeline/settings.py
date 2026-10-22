@@ -8,7 +8,8 @@ DEFAULTS = {
         "remote_address": REQUIRED,  # imagemux bstream RDMA handshake address, e.g. 10.0.0.1:31003
         "local_address": REQUIRED,  # address of the RoCE interface to use
         "device": "",  # RDMA device; "" = the one holding local_address
-        "ring_gpu": 0,  # GPU holding the ring
+        "ring_gpu": 0,  # GPU processing the images
+        "ring_memory": "gpu",
         "ring_mib": 64,
         "timeout": 10,  # seconds for the TCP connection to imagemux
     },
@@ -47,4 +48,6 @@ def resolve(sections: dict) -> dict:
     for key, value in settings["scan"].items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"'scan.{key}' must be a positive integer, not {value!r}")
+    if settings["connection"]["ring_memory"] not in ("gpu", "host_mapped"):
+        raise ValueError("connection.ring_memory must be 'gpu' or 'host_mapped'")
     return settings
