@@ -10,12 +10,13 @@
 #include <nvcomp/lz4.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <vector>
 
-#include <nvtx3/nvToolsExt.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include "constants.h"
 #include "bitshuffle_kernel_gpu.cuh"
@@ -268,171 +269,62 @@ DecompressGpuOp::~DecompressGpuOp() {
 // ============================================================================
 
 void DecompressGpuOp::setup(OperatorSpec& spec) {
-  // Input: Compressed batch with pre-extracted data
-  spec.input<CompressedBatch>("input");
+  spec.input(input, "input").queue_depth(4U);
+  spec.output(output, "output").produces_tensor(TensorOutputSpec{
+      .representation = {.memory_kind = MemoryKind::kCudaDevice,
+                         .dtype = DLDataType{kDLUInt, 16, 1}, .rank = 3U},
+      .bounds = tensor_bounds(BATCH_SIZE * DETECTOR_SIZE * sizeof(uint16_t)),
+      .storage = TensorOutputStorage::kRuntimePool});
+}
 
-  // Output: TensorMap. Python converts "frames" to torch.Tensor with DLPack.
-  spec.output<holoscan::TensorMap>("output");
-
-  HOLOSCAN_LOG_INFO("DecompressGpuOp::setup() - GPU decompression operator configured");
+Contract DecompressGpuOp::contract() const {
+  Contract result;
+  result.trigger(OnEach{input});
+  return result;
 }
 
 void DecompressGpuOp::start() {
-  HOLOSCAN_LOG_INFO("DecompressGpuOp::start() - Initializing GPU resources");
-  HOLOSCAN_LOG_INFO("  Using pre-extracted compressed batches from ZmqRxOp");
-
-  batch_count_ = 0;
-  current_buffer_index_ = 0;
-
-  // Calculate worst-case compressed size per image
-  // For BSLZ4: Dectris header (12 bytes) + worst-case LZ4 (slightly larger than uncompressed)
-  size_t uncompressed_size = DETECTOR_HEIGHT * DETECTOR_WIDTH * sizeof(uint16_t);
-  max_compressed_size_per_image_ = 12 + uncompressed_size + (uncompressed_size / 255) + 16;
+  const size_t uncompressed_size = DETECTOR_SIZE * sizeof(uint16_t);
+  max_compressed_size_per_image_ = 12 + uncompressed_size + uncompressed_size / 255 + 16;
   max_compressed_batch_size_ = max_compressed_size_per_image_ * BATCH_SIZE;
-
-  HOLOSCAN_LOG_INFO("  Max compressed size per image: {} bytes", max_compressed_size_per_image_);
-  HOLOSCAN_LOG_INFO("  Max compressed batch size: {} MB", max_compressed_batch_size_ / (1024 * 1024));
-
-  // Allocate GPU resources
   allocate_gpu_resources();
-
-  // Preallocate MatX tensor pool on GPU
-  HOLOSCAN_LOG_INFO("  Allocating MatX tensor pool on GPU (POOL_SIZE={})", POOL_SIZE);
-  matx::make_tensor(decompressed_batch_pool_gpu_,
-                    {POOL_SIZE, BATCH_SIZE, DETECTOR_HEIGHT, DETECTOR_WIDTH},
-                    matx::MATX_DEVICE_MEMORY);
-  matx::make_tensor(image_indices_pool_, {POOL_SIZE, BATCH_SIZE}, matx::MATX_DEVICE_MEMORY);
-  matx::make_tensor(batch_id_pool_, {POOL_SIZE}, matx::MATX_DEVICE_MEMORY);
-
-  // Note: GPU buffer doesn't need initialization (will be filled by decompression)
-  // Initialize host buffers
-  (image_indices_pool_ = 0).run();
-  (batch_id_pool_ = 0).run();
-
-  HOLOSCAN_LOG_INFO("DecompressGpuOp::start() - Initialization complete");
 }
 
-void DecompressGpuOp::compute(InputContext& op_input, OutputContext& op_output,
-                              ExecutionContext& context) {
-  nvtx3::scoped_range range("DecompressGpuOp::compute", nvtx3::rgb{255, 165, 0}); // Orange
-
-  auto compressed_batch = op_input.receive<CompressedBatch>("input");
-
-  if (!compressed_batch) {
-    HOLOSCAN_LOG_WARN("DecompressGpuOp: Received null compressed batch");
-    return;
-  }
-
-  // Extract data from CompressedBatch (pre-extracted by zmq_rx_operator)
-  size_t num_images = compressed_batch->num_images;
-  uint64_t batch_id = compressed_batch->batch_id;
-  uint8_t* h_pinned_data = compressed_batch->h_pinned_data;
-  auto& sizes = *compressed_batch->sizes;
-  auto& offsets = *compressed_batch->offsets;
-  auto& image_ids = *compressed_batch->image_ids;
-
-  HOLOSCAN_LOG_INFO("DecompressGpuOp: Processing batch {} (batch_id: {}, {} images, buffer_index: {})",
-                    batch_count_ + 1, batch_id, num_images, current_buffer_index_);
-
-  if (num_images == 0) {
-    HOLOSCAN_LOG_WARN("DecompressGpuOp: Empty batch received");
-    return;
-  }
-
-  if (num_images > BATCH_SIZE) {
-    HOLOSCAN_LOG_ERROR("DecompressGpuOp: Batch size {} exceeds maximum {}", num_images, BATCH_SIZE);
-    return;
-  }
-
-  // ============================================================================
-  // Step 1: Build compressed data pointers (data already in pinned memory!)
-  // ============================================================================
-
-  std::vector<const uint8_t*> compressed_ptrs(num_images);
-  std::vector<size_t> compressed_sizes(num_images);
-  std::vector<uint64_t> image_ids_vec(num_images);
-
-  {
-    nvtx3::scoped_range extract_range("Build compressed pointers", nvtx3::rgb{0, 255, 0}); // Green
-
-    for (size_t i = 0; i < num_images; ++i) {
-      compressed_ptrs[i] = h_pinned_data + offsets(i);
-      compressed_sizes[i] = sizes(i);
-      image_ids_vec[i] = image_ids(i);
+expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
+  try {
+    HOLOSCAN_TRY(auto selected, input.selected_sample());
+    const auto& batch = selected.data();
+    const size_t count = batch.image_ids.size();
+    if (count > BATCH_SIZE || batch.sizes.size() != count || batch.offsets.size() != count)
+      return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid compressed batch metadata"});
+    const std::array<int64_t, 3> shape{static_cast<int64_t>(std::max(size_t{1}, count)),
+                                     DETECTOR_HEIGHT, DETECTOR_WIDTH};
+    HOLOSCAN_TRY(auto loan, output.allocate_tensor(shape));
+    stream_ = context.cuda_stream().get();  // Borrowed; Runtime owns this stream.
+    HOLOSCAN_TRY(auto writer, loan.write(context.cuda_stream()));
+    if (count > 0) {
+      const auto* data = static_cast<const uint8_t*>(batch.payload->data());
+      std::vector<const uint8_t*> pointers(count);
+      std::vector<size_t> sizes(count);
+      for (size_t i = 0; i < count; ++i) {
+        if (batch.offsets[i] > static_cast<size_t>(batch.payload->nbytes()) ||
+            batch.sizes[i] > static_cast<size_t>(batch.payload->nbytes()) - batch.offsets[i])
+          return make_unexpected(Error{ErrorCode::kProtocolError, "Compressed span out of bounds"});
+        pointers[i] = data + batch.offsets[i];
+        sizes[i] = batch.sizes[i];
+      }
+      if (!decompress_batch_gpu(pointers, sizes, count, writer.data_as<uint16_t>()))
+        return make_unexpected(Error{ErrorCode::kFailure, "GPU BSLZ4 decompression failed"});
     }
+    HOLOSCAN_TRY(std::move(writer).commit());
+    DecodedBatch decoded;
+    decoded.batch_id = batch.batch_id;
+    decoded.image_ids = batch.image_ids;
+    decoded.end_of_stream = batch.end_of_stream;
+    return output.emit_tensor(std::move(loan), decoded);
+  } catch (const std::exception& error) {
+    return make_unexpected(Error{ErrorCode::kFailure, error.what()});
   }
-
-  HOLOSCAN_LOG_DEBUG("  Using pre-extracted compressed data from zmq_rx_operator");
-
-  // ============================================================================
-  // Step 2: Get output buffer slice from MatX tensor pool
-  // ============================================================================
-
-  matx::index_t idx = static_cast<matx::index_t>(current_buffer_index_);
-
-  auto decompressed_batch_slice = matx::slice(decompressed_batch_pool_gpu_,
-                                              {idx, 0, 0, 0},
-                                              {idx + 1,
-                                               static_cast<matx::index_t>(num_images),
-                                               matx::matxEnd,
-                                               matx::matxEnd});
-  auto decompressed_batch = matx::slice<3>(decompressed_batch_slice,
-                                            {0, 0, 0, 0},
-                                            {matx::matxDropDim, matx::matxEnd, matx::matxEnd, matx::matxEnd});
-
-  auto image_indices_slice = matx::slice(image_indices_pool_,
-                                          {idx, 0},
-                                          {idx + 1, static_cast<matx::index_t>(num_images)});
-  auto image_indices = matx::slice<1>(image_indices_slice,
-                                      {0, 0},
-                                      {matx::matxDropDim, matx::matxEnd});
-
-  // ============================================================================
-  // Step 3: Perform GPU decompression
-  // ============================================================================
-
-  uint16_t* output_ptr = decompressed_batch.Data();
-
-  bool success = decompress_batch_gpu(compressed_ptrs, compressed_sizes, num_images, output_ptr);
-
-  if (!success) {
-    HOLOSCAN_LOG_ERROR("DecompressGpuOp: GPU decompression failed");
-    return;
-  }
-
-  // ============================================================================
-  // Step 4: Store metadata on device for PyTorch DLPack interop
-  // ============================================================================
-
-  auto batch_id_tensor = matx::slice<1>(batch_id_pool_, {idx}, {idx + 1});
-  CUDA_CHECK(cudaMemcpyAsync(image_indices.Data(),
-                             image_ids_vec.data(),
-                             num_images * sizeof(uint64_t),
-                             cudaMemcpyHostToDevice,
-                             stream_));
-  CUDA_CHECK(cudaMemcpyAsync(batch_id_tensor.Data(),
-                             &batch_id,
-                             sizeof(uint64_t),
-                             cudaMemcpyHostToDevice,
-                             stream_));
-  CUDA_CHECK(cudaStreamSynchronize(stream_));
-
-  // ============================================================================
-  // Step 5: Emit TensorMap for Python/PyTorch interop
-  // ============================================================================
-
-  holoscan::TensorMap output_batch;
-  output_batch.insert({"frames", std::make_shared<holoscan::Tensor>(decompressed_batch.ToDlPack())});
-  output_batch.insert({"image_ids", std::make_shared<holoscan::Tensor>(image_indices.ToDlPack())});
-  output_batch.insert({"batch_id", std::make_shared<holoscan::Tensor>(batch_id_tensor.ToDlPack())});
-
-  op_output.emit(output_batch, "output");
-
-  HOLOSCAN_LOG_INFO("DecompressGpuOp: Completed batch {} (batch_id: {}, buffer_index: {})",
-                    batch_count_ + 1, batch_id, current_buffer_index_);
-
-  batch_count_++;
-  current_buffer_index_ = (current_buffer_index_ + 1) % POOL_SIZE;
 }
 
 void DecompressGpuOp::stop() {
@@ -447,8 +339,6 @@ void DecompressGpuOp::stop() {
 void DecompressGpuOp::allocate_gpu_resources() {
   HOLOSCAN_LOG_INFO("  Allocating GPU buffers...");
 
-  // Create CUDA stream
-  CUDA_CHECK(cudaStreamCreate(&stream_));
 
   // Note: Pinned host buffer for compressed data is now provided by zmq_rx_operator
   // No need to allocate h_pinned_compressed_ here
@@ -478,10 +368,7 @@ void DecompressGpuOp::allocate_gpu_resources() {
 }
 
 void DecompressGpuOp::free_gpu_resources() {
-  if (stream_) {
-    cudaStreamDestroy(stream_);
-    stream_ = nullptr;
-  }
+  stream_ = nullptr;  // Borrowed from ExecutionContext; never destroy it here.
 
   // Note: h_pinned_compressed_ is now owned by zmq_rx_operator, don't free it here
 
@@ -565,7 +452,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
       h_compressed_sizes_no_dectris[i] = compressed_sizes[i] - 12;  // Size without Dectris header
 
       if (i < 3) {
-        HOLOSCAN_LOG_INFO("    Image {}: device_offset={}, dectris_header_skipped, bslz4_size={}",
+        HOLOSCAN_LOG_DEBUG("    Image {}: device_offset={}, dectris_header_skipped, bslz4_size={}",
                           i, device_offsets[i] + 12, h_compressed_sizes_no_dectris[i]);
       }
     }
@@ -576,7 +463,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
     CUDA_CHECK(cudaMemcpyAsync(d_compressed_sizes_, h_compressed_sizes_no_dectris.data(),
                                 num_images * sizeof(size_t), cudaMemcpyHostToDevice, stream_));
 
-    HOLOSCAN_LOG_INFO("  Built compressed pointer arrays: {} images", num_images);
+    HOLOSCAN_LOG_DEBUG("  Built compressed pointer arrays: {} images", num_images);
   }
 
   // ============================================================================
@@ -617,7 +504,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
       return false;
     }
 
-    HOLOSCAN_LOG_INFO("  GPU header parsing complete");
+    HOLOSCAN_LOG_DEBUG("  GPU header parsing complete");
   }
 
   // Get total number of blocks across all images (async copy with pinned memory)
@@ -632,7 +519,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
     total_blocks += h_pinned_num_blocks_[i];
   }
 
-  HOLOSCAN_LOG_INFO("  Total LZ4 blocks: {} (avg {:.1f} per image)",
+  HOLOSCAN_LOG_DEBUG("  Total LZ4 blocks: {} (avg {:.1f} per image)",
                     total_blocks, (double)total_blocks / num_images);
 
   if (total_blocks == 0) {
@@ -692,7 +579,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
       return false;
     }
 
-    HOLOSCAN_LOG_INFO("  Built nvcomp arrays for {} blocks", total_blocks);
+    HOLOSCAN_LOG_DEBUG("  Built nvcomp arrays for {} blocks", total_blocks);
   }
 
   // ============================================================================
@@ -720,7 +607,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
 
     nvcomp_temp_alloc.allocate(nvcomp_temp_size);
 
-    HOLOSCAN_LOG_INFO("  Allocated nvcomp temp buffer: {} MB", nvcomp_temp_size / (1024 * 1024));
+    HOLOSCAN_LOG_DEBUG("  Allocated nvcomp temp buffer: {} MB", nvcomp_temp_size / (1024 * 1024));
   }
 
   // ============================================================================
@@ -730,9 +617,9 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
   {
     nvtx3::scoped_range lz4_range("LZ4 Decompression (nvcomp)", nvtx3::rgb{0, 128, 255}); // Blue
 
-    HOLOSCAN_LOG_INFO("  Calling nvcompBatchedLZ4DecompressAsync:");
-    HOLOSCAN_LOG_INFO("    total_blocks: {}", total_blocks);
-    HOLOSCAN_LOG_INFO("    nvcomp_temp_size: {} bytes", nvcomp_temp_size);
+    HOLOSCAN_LOG_DEBUG("  Calling nvcompBatchedLZ4DecompressAsync:");
+    HOLOSCAN_LOG_DEBUG("    total_blocks: {}", total_blocks);
+    HOLOSCAN_LOG_DEBUG("    nvcomp_temp_size: {} bytes", nvcomp_temp_size);
 
     // Use default decompression options
     nvcompBatchedLZ4DecompressOpts_t decompress_opts = nvcompBatchedLZ4DecompressDefaultOpts;

@@ -5,7 +5,7 @@ services:
       dockerfile: docker/Dockerfile.holoscan
       args:
         CUDA_ARCHITECTURES: "86;89"
-    image: dectris-holoscan-basic:latest
+    image: dectris-holoscan-basic:hsdk5
     network_mode: host
     gpus:
       - driver: nvidia

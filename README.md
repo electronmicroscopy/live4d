@@ -95,6 +95,7 @@ GPU path needs system CUDA (`nvcc`) + `ninja` for the runtime kernel build
 
 `holoscan_pipeline/` is the successor ingest/decompress path under development. It wraps native
 C++ Holoscan operators for ZMQ receive/fast CBOR extraction and GPU bslz4 decompression, then
-composes them from Python with a Python stats sink that converts output frames to PyTorch.
+composes them through Holoscan SDK 5 typed graphs with a Python stats sink. Runtime-owned
+pinned/device tensors preserve buffer ownership; the SmB6 validator checks IDs and decoded pixels.
 
 See `docs/holoscan_basic_ingest.md` for container, build, and validation commands.
