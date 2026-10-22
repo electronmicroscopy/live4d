@@ -1,18 +1,17 @@
 # DECTRIS RDMA Example
 
-DECTRIS frame streams delivered by RDMA WRITE_WITH_IMM from DCU RDMA output into 
-a Holoscan pipeline as GPU tensors. A stream image series is bookmarked by a START and an END frame, 
-its images are processed on the GPU of the ring they were written to, then reconstructed, and aggregated 
-into one image when the END bookmark arrives.
+Consume DECTRIS streams delivered with RDMA into 
+a Holoscan pipeline directly as GPU tensors. The image series, bookmarked by START and an END frames, is processed on the GPU of the ring they were written to. They summed and then aggregated 
+into one image when the END arrives.
 
 ```
-imagemux ==WRITE_WITH_IMM==> frame ring ==> RdmaRx -> Worker -> Aggregate
-   ^------------- consumed position (RDMA WRITE) -----------'
+imagemux -> gpu frame ring -> RdmaRx -> Worker -> Aggregate
+   ^------------- consumed position (RDMA WRITE) -------^
 ```
 
 ## Prerequisites
 
-This example builds on the NGC holoscan container image. Log in to the NGC container registry to pull 
+This example builds on the NGC holoscan (4.4.0) container image. Log in to the NGC container registry to pull 
 the Holoscan image if not already available:
 ```
 docker login nvcr.io
@@ -21,42 +20,40 @@ Username `$oauthtoken`, password your NGC API key.
 
 ## Python wheel
 
-The receiver is in one package: the Holoscan operators
-(`RdmaRxOp`), the wire protocol (`imagemux`, `messages`), GPU dispatch
-(`dispatch`), connection and run helpers (`connection`), and the native module `imxrdma`. The
-receiver app itself is `examples/pipeline/pipeline.py`, which imports all of that from the wheel.
-`pyproject.toml` builds it with scikit-build-core, which runs `native/CMakeLists.txt`:
+The receiver is provided as a python package: the Holoscan operators
+(`RdmaRxOp`), wire protocol (`imagemux`, `messages`), GPU dispatch
+(`dispatch`), connection helpers (`connection`), wrapping a native (C/C++) module `imxrdma`. The
+receiver app itself is `examples/pipeline/app.py`, and imports all of this from the wheel. The 
+`pyproject.toml` builds it with scikit-build-core which runs `native/CMakeLists.txt`:
 ```
 python3 -m pip wheel --no-deps . -w dist     # needs cmake, a C/C++ compiler, libibverbs-dev
 python3 -m pip install dist/imx_receiver-*.whl
 ```
-The Dockerfile does this in a build stage and installs only the wheel into the image. The result
+The Dockerfile does this automatically in a build stage and installs only the wheel into the container image. The result
 is one wheel per CPython version and architecture, e.g.
 `imx_receiver-0.1.0-cp312-cp312-linux_aarch64.whl` for the Holoscan 4.4 image.
 
-- **Run time:** the wheel links libibverbs dynamically and does not bundle it; the machine needs
-  rdma-core (`libibverbs1`, `ibverbs-providers`). `holoscan` and `cupy` are not hard dependencies
-  (they come with the Holoscan image); `pip install "imx-receiver[cuda13]"` (or `[cuda12]`) pulls
+- **Run time:** The wheel links libibverbs dynamically; the machine needs
+  rdma-core (`libibverbs1`, `ibverbs-providers`). The `holoscan` and `cupy` are not hard dependencies
+  (they come with the Holoscan image); use `pip install "imx-receiver[cuda13]"` (or `[cuda12]`) pulls
   CuPy for a bare install.
-- **No commands:** the receiver itself is an app built on the package,
-  `examples/pipeline/pipeline.py` (see "Base image").
-- **Using the operators in another app:** see "Base image" below.
 
 ## Base image
 
-Other containers build their own Holoscan apps and operators on `imx-receiver-base`: the
-Holoscan image with rdma-core and the wheel installed, and the wheel file itself in
-`$IMX_WHEELS` (`/opt/dectris/stanford-dectris-nvidia-4d-stem/wheels`). It is the `imx-base`
-target of the Dockerfile; the receiver image of this repo is built on it.
+Other containers can build their own Holoscan apps and operators on `imx-receiver-base`: the
+Holoscan image with rdma-core and the wheel installed, and the wheel file itself
+(in `/opt/dectris/stanford-dectris-nvidia-4d-stem/wheels`). This is the `imx-base`
+target of the Dockerfile; the example image of this repo is built on it.
 ```
 dectris/tools/build_base_image.sh    # imx-receiver-base:0.1.0 and :latest
 ```
 A consumer:
 ```
 FROM imx-receiver-base:0.1.0
-COPY pipeline.py .
+COPY app.py .
 ```
-and in its code, everything from `dectris`
+
+Everything from `dectris`
 
 | What | Names |
 |---|---|
@@ -67,46 +64,61 @@ and in its code, everything from `dectris`
 | GPU | `Dispatcher`, `DeviceRing` |
 | RDMA verbs | `imxrdma` (`Context`, `QueuePair`, `MemoryRegion`) |
 
-`RdmaRxOp` emits on `output{i}` (one per ring) lists, in arrival order, of `Start`, `Batch` (the
-images on the ring's GPU with `reduce=False`, or their pixel sums with `reduce=True`; wait for its
-`ready` event before reading) and `End`. The app's own operators take those lists on an input.
-The docstring of `dectris/__init__.py` has the details.
+`RdmaRxOp` emits on `output{i}` (per ring) and the app's own operators take those on an input.
 
-`examples/pipeline/` is the receiver itself as such an app: `pipeline.py` wires `RdmaRxOp` into
-the operators of `operators.py` (`WorkerOp` per ring, reconstructing each image's integrated
-intensity, and `AggregateOp`, merging them per series); the receiver image runs it. It also has a
-container of its own on the base image, `pipeline.py` as entrypoint:
-```
-examples/pipeline/run.sh 10.42.41.10:31003 --local-addr 10.42.41.11 --seconds 0
-```
-`run.sh` builds `imx-pipeline-example` (`BUILD=0` skips that) and runs it with the RDMA device,
-GPU, host network and memlock flags; its arguments go to `pipeline.py`.
 
-An image on another base can take just the wheel:
+In `examples/pipeline/` is an example app: `app.py` wires `RdmaRxOp` into
+the operators defined in `operators.py` (`WorkerOp` integrates intensity, and `AggregateOp`, accumulates the series. It also has a container of its own based on the base image, with `app.py` as entrypoint; its configuration is in `examples/pipeline/pipeline.yaml`:
+```
+examples/pipeline/run.sh
+```
+`run.sh` builds `imx-pipeline-example` and runs it with the RDMA device,
+GPU, host network and memlock flags.
+
+An image for another example can take just the wheel:
 `COPY --from=imx-receiver-base:0.1.0 /opt/dectris/stanford-dectris-nvidia-4d-stem/wheels /tmp/wheels`
 then `pip install /tmp/wheels/imx_receiver-*.whl` (cp312, aarch64, with rdma-core installed).
 
 ## Running
 
 ```
-./examples/pipeline/run.sh 10.42.41.10:31003 --local-addr 10.42.41.11 --seconds 0
+./examples/pipeline/run.sh --config ./examples/pipeline/pipeline.yaml
 ```
-`run.sh` builds the `imx-pipeline-example` image (`BUILD=0` skips that) and runs `pipeline.py` in it
+`run.sh` builds the `imx-pipeline-example` image (`BUILD=0` skips that) and runs `app.py` in it
 with the RDMA device, GPU, host network and memlock flags; its arguments are passed on to
-`pipeline.py`.
+`app.py`.
 
-The positional argument is imagemux's RDMA handshake address. `--local-addr` is the address of the
-RoCE interface (e.g. `roceP5p3s0f1`). Options: `--seconds S`
-(default 10, 0 = until Ctrl+C), `--series-width W`, `--keep-images`, `--gpu N` (GPU holding the
-ring, default 0), `--ring-mib M` (default 64), `--device` (RDMA device, default: the one holding
-`--local-addr`), `--receive-only` (no GPU work: frames are counted and their credit returned at
-once; the series end line then shows the raw rate the sender delivers).
 
-A series is whatever arrives between its start and end frame. Its number of images and the shape
+## Configuration
+
+The settings are read with Holoscan's own configuration mechanics from
+`examples/pipeline/pipeline.yaml`, which is baked into the image. To use another file, pass it as
+the first argument (`run.sh` mounts it into the container):
+```
+./examples/pipeline/run.sh --config my.yaml
+```
+
+
+| Key | Default | Meaning |
+|---|---|---|
+| `connection.remote_address` | required | imagemux's RDMA handshake address, e.g. `10.42.41.10:31003` |
+| `connection.local_address` | required | address of the RoCE interface to use |
+| `connection.device` | `""` | RDMA device; `""` holding `local_address` |
+| `connection.ring_gpu` | 0 | GPU holding the ring |
+| `connection.ring_mib` | 64 | ring size in MiB |
+| `connection.timeout` | 10 | seconds for the TCP connection to imagemux |
+| `execute.seconds` | 10 | run time, 0 = until Ctrl+C |
+| `execute.threads` | 3 | scheduler worker threads (source, worker and aggregator run concurrently) |
+| `receiver.receive_only` | false | no GPU work: frames are counted and their credit returned at once; the series end line then shows the raw rate the sender delivers |
+| `receiver.keep_images` | false | true copies the images to GPU memory (what a real reconstruction needs); false reduces them to pixel sums straight from the ring |
+| `receiver.max_batch` | 512 | most completions (frames) taken from the receive queue per poll |
+| `aggregate.series_width` | 0 | see below |
+
+## Operation
+
+A series is whatever arrives between its START and END frame. Its number of images and the shape
 of its scan are not known in advance (`number_of_images` of the start message is only used as a
-size hint), so nothing is validated against them; the image count is taken at the end frame.
-`--series-width W` is optional: if `W` divides the number of images of a series, its image is
-shaped `(N / W) x W`, otherwise it is a single row. A series whose images are not 96x96 uint16,
+size hint). A series whose images are **not 96x96 uint16**,
 or an image frame outside a start/end pair, is rejected or dropped with a message.
 
 
@@ -225,12 +237,12 @@ Two kinds of operations are used:
 ### Network: 
 
 The receiver needs an interface with an IPv4 address on the same Ethernet segment as
-the sender and an RDMA device on top of it (`rdma link show`). `--local-addr` must use that address;
+the sender and an RDMA device on top of it (`rdma link show`). `connection.local_address` must use that address;
 the RDMA device, port and GID index are found from it.
 
 ### Memory Regions:
 
-There is a single memory region: the ring, 64 MiB (`--ring-mib`) of GPU memory (`--gpu`) from
+There is a single memory region: the ring, 64 MiB (`connection.ring_mib`) of GPU memory (`connection.ring_gpu`) from
 `cudaMalloc`, registered remote-writable (`dectris/connection.py`, `VerbsConn`). The RECEIVEs are
 zero-length and the credit word is written inline, so neither needs a buffer.
 
@@ -248,7 +260,7 @@ that imagemux writes frames into. The imagemux decides which images go to which 
 ```
 
 1. **Dispatch** (`dispatch.py`): Each received batch in a ring becomes one kernel on that
-   ring's GPU with its own stream. The kernel reads the images straight from the ring and either sums their pixels (default) or copies them to GPU memory (`--keep-images`). The START and END frames of a series are sent to every worker.
+   ring's GPU with its own stream. The kernel reads the images straight from the ring and either sums their pixels (default) or copies them to GPU memory (`receiver.keep_images: true`). The START and END frames of a series are sent to every worker.
 2. **Work** (`examples/pipeline/operators.py`): Each `WorkerOp` runs on its ring's GPU and scheduler
    thread. It begins a series on its START frame, waits for each batch's event on its own stream and
    keeps one value per image id (a growing array; the series' length is not known). It performs a 
@@ -257,10 +269,10 @@ that imagemux writes frames into. The imagemux decides which images go to which 
    next one starts.
 3. **Aggregate** (`examples/pipeline/operators.py`): `AggregateOp` copies each worker's values onto
    one GPU and holds them in a `pending[series]` map. When all workers have delivered a series it
-   merges them and shapes the result with `--series-width` if possible.
+   merges them and shapes the result with `aggregate.series_width` if possible.
 
 Today the handshake defines a single ring, so a run has one path, one worker and the aggregate
-only reshapes. The ring is in GPU memory and is processed by the GPU that holds it (`--gpu`).
+only reshapes. The ring is in GPU memory and is processed by the GPU that holds it (`connection.ring_gpu`).
 
 ## Glossary
 

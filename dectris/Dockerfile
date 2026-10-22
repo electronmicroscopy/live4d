@@ -50,4 +50,4 @@ RUN python3 -m pip install --no-cache-dir pyyaml
 WORKDIR /opt/dectris/stanford-dectris-nvidia-4d-stem
 COPY examples ./examples
 
-CMD ["python3", "examples/pipeline/pipeline.py", "--help"]
+CMD ["python3", "examples/pipeline/app.py", "--help"]

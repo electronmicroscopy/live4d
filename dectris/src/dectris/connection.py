@@ -1,5 +1,5 @@
 """Connection and run helpers of a receiver app: the queue pair and GPU ring (VerbsConn), stopping
-when imagemux goes away (watch_liveness), and the scheduler (run). examples/pipeline/pipeline.py
+when imagemux goes away (watch_liveness), and the scheduler (run). examples/pipeline/app.py
 puts them together with its own operators.
 
 The RDMA verbs come from imxrdma (native/, plain libibverbs).

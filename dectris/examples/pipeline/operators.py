@@ -190,7 +190,7 @@ class AggregateOp(Operator):
         note = ""
         if not width or width <= 0 or total % width:
             if width:
-                note = f" (--series-width {width} does not divide {total}; one row)"
+                note = f" (series_width {width} does not divide {total}; one row)"
             width = max(total, 1)
         image = merged.reshape(-1, width) if total else merged.reshape(1, 0)
         print(f"aggregate series: {series} {total} images -> {image.shape[1]}x{image.shape[0]}"

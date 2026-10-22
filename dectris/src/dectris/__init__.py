@@ -22,7 +22,7 @@ emission is a list, in arrival order, of:
 A custom worker is a Holoscan ``Operator`` with an input that receives these lists, connected with
 ``app.add_flow(rx, worker, {(f"output{path.index}", "input")})``. ``run(app, seconds, threads)`` and
 ``watch_liveness(app, link)`` are the scheduler and stop-on-disconnect helpers.
-examples/pipeline/pipeline.py (the receiver) is a complete app built this way.
+examples/pipeline/app.py (the receiver) is a complete app built this way.
 """
 
 import importlib
