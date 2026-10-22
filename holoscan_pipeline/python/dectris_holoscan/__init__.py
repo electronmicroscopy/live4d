@@ -1,5 +1,13 @@
-"""Python Holoscan application for the DECTRIS 4D-STEM ingest path."""
+"""DECTRIS transport selection and shared Holoscan 4D-STEM processing."""
 
-from .app import BasicIngestApp, BasicIngestConfig, StatsSinkOp
+__all__ = ["PipelineApp", "PipelineConfig"]
 
-__all__ = ["BasicIngestApp", "BasicIngestConfig", "StatsSinkOp"]
+
+def __getattr__(name):
+    if name == "PipelineConfig":
+        from .config import PipelineConfig
+        return PipelineConfig
+    if name == "PipelineApp":
+        from .app import PipelineApp
+        return PipelineApp
+    raise AttributeError(name)

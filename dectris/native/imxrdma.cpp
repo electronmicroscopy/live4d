@@ -107,6 +107,10 @@ PYBIND11_MODULE(imxrdma, m) {
       .def("close", &MemoryRegion::close, "Deregister now instead of on garbage collection.");
 
   py::class_<QueuePair, std::shared_ptr<QueuePair>>(m, "QueuePair")
+      .def_property_readonly(
+          "native_handle",
+          [](const QueuePair &q) { return reinterpret_cast<uintptr_t>(q.get()); },
+          "Borrow the queue pair while its Python owner remains alive.")
       .def_property_readonly("endpoint",
                              [](const QueuePair &q) {
                                imx_endpoint ep;

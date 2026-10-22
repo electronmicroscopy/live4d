@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <nvtx3/nvtx3.hpp>
@@ -284,16 +286,25 @@ Contract DecompressGpuOp::contract() const {
 }
 
 void DecompressGpuOp::start() {
+  publication_window_ = ::dectris::access(params().publication_window);
+  input_window_ = ::dectris::access(params().input_window);
+  last_capture_ns_ = -1;
   const size_t uncompressed_size = DETECTOR_SIZE * sizeof(uint16_t);
-  max_compressed_size_per_image_ = 12 + uncompressed_size + uncompressed_size / 255 + 16;
+  max_compressed_size_per_image_ = 12 + uncompressed_size + uncompressed_size / 255 + 3 * (16 + 4);
   max_compressed_batch_size_ = max_compressed_size_per_image_ * BATCH_SIZE;
   allocate_gpu_resources();
 }
 
 expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
   try {
+    if (context.cancellation().stop_requested()) return {};
     HOLOSCAN_TRY(auto selected, input.selected_sample());
     const auto& batch = selected.data();
+    while (publication_window_ && !publication_window_->admits(batch.batch_id)) {
+      if (context.cancellation().stop_requested()) return {};
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    if (context.cancellation().stop_requested()) return {};
     const size_t count = batch.image_ids.size();
     if (count > BATCH_SIZE || batch.sizes.size() != count || batch.offsets.size() != count)
       return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid compressed batch metadata"});
@@ -302,6 +313,30 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
     HOLOSCAN_TRY(auto loan, output.allocate_tensor(shape));
     stream_ = context.cuda_stream().get();  // Borrowed; Runtime owns this stream.
     HOLOSCAN_TRY(auto writer, loan.write(context.cuda_stream()));
+    if (batch.pipeline_ready) {
+      // Literal LZ4 blocks of zeroed bitshuffled pixels exercise nvCOMP and CUDA before READY.
+      std::vector<uint8_t> image(12, 0);
+      for (size_t bytes : {size_t{8192}, size_t{8192}, size_t{2048}}) {
+        std::vector<uint8_t> block{0xf0};
+        size_t remaining = bytes - 15;
+        while (remaining >= 255) { block.push_back(255); remaining -= 255; }
+        block.push_back(static_cast<uint8_t>(remaining));
+        block.resize(block.size() + bytes, 0);
+        const auto n = static_cast<uint32_t>(block.size());
+        for (int shift : {24, 16, 8, 0}) image.push_back((n >> shift) & 255);
+        image.insert(image.end(), block.begin(), block.end());
+      }
+      std::vector<uint8_t> data;
+      data.reserve(image.size() * BATCH_SIZE);
+      for (size_t i = 0; i < BATCH_SIZE; ++i) data.insert(data.end(), image.begin(), image.end());
+      std::vector<const uint8_t*> pointers(BATCH_SIZE);
+      std::vector<size_t> sizes(BATCH_SIZE, image.size());
+      for (size_t i = 0; i < BATCH_SIZE; ++i) pointers[i] = data.data() + i * image.size();
+      DeviceAllocation scratch;
+      scratch.allocate(BATCH_SIZE * DETECTOR_SIZE * sizeof(uint16_t));
+      if (!decompress_batch_gpu(pointers, sizes, BATCH_SIZE, scratch.as<uint16_t>()))
+        return make_unexpected(Error{ErrorCode::kFailure, "GPU decompression warm-up failed"});
+    }
     if (count > 0) {
       const auto* data = static_cast<const uint8_t*>(batch.payload->data());
       std::vector<const uint8_t*> pointers(count);
@@ -320,8 +355,22 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
     DecodedBatch decoded;
     decoded.batch_id = batch.batch_id;
     decoded.image_ids = batch.image_ids;
-    decoded.end_of_stream = batch.end_of_stream;
-    return output.emit_tensor(std::move(loan), decoded);
+    decoded.end_of_series = batch.end_of_series;
+    decoded.start_of_series = batch.start_of_series;
+    decoded.series_id = batch.series_id;
+    decoded.start_metadata = batch.start_metadata;
+    decoded.series_images = batch.series_images;
+    decoded.pipeline_ready = batch.pipeline_ready;
+    auto capture = context.activation_time();
+    // Several OnEach activations may share a reference time. The fanout join needs one key
+    // per message, including the data batch and END that can become runnable together.
+    capture.timestamp_ns = std::max(capture.timestamp_ns, last_capture_ns_ + 1);
+    last_capture_ns_ = capture.timestamp_ns;
+    auto published = output.emit_tensor(std::move(loan), decoded,
+                                        EmitOptions{.capture_time = capture});
+    if (!published) return make_unexpected(std::move(published).error());
+    if (input_window_) input_window_->release(batch.batch_id);
+    return {};
   } catch (const std::exception& error) {
     return make_unexpected(Error{ErrorCode::kFailure, error.what()});
   }

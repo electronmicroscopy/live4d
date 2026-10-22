@@ -49,6 +49,9 @@ zmq_message_type_t fast_detect_message_type(
     const uint8_t* msg_data,
     size_t msg_size);
 
+// Read the unsigned series_id from a tagged or bare Stream2 map.
+int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id);
+
 /**
  * Fast extraction of compressed BSLZ4 data from Dectris IMAGE message.
  *

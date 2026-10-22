@@ -6,15 +6,18 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Optional resolver secret supports hosts whose Docker DNS differs from the host resolver.
 RUN --mount=type=secret,id=build_resolv,target=/etc/resolv.conf,mode=0444 \
     apt-get update && apt-get install -y --no-install-recommends \
-      build-essential libzmq3-dev libnvcomp5-dev-cuda-13 ninja-build python3-dev python3-pip \
+      build-essential pkg-config libzmq3-dev libnvcomp5-dev-cuda-13 ninja-build python3-dev python3-pip \
+      libibverbs-dev rdma-core ibverbs-providers ibverbs-utils \
     && rm -rf /var/lib/apt/lists/*
 RUN --mount=type=secret,id=build_resolv,target=/etc/resolv.conf,mode=0444 \
-    python3 -m pip install --no-cache-dir "numpy>=2.1,<3" pyyaml
+    python3 -m pip install --no-cache-dir "numpy>=2.1,<3" pyyaml cbor2 cupy-cuda13x pyzmq pytest
 
 FROM dependencies AS pipeline
 ARG CUDA_ARCHITECTURES=86;89
 WORKDIR /opt/dectris/stanford-dectris-nvidia-4d-stem
 COPY holoscan_pipeline ./holoscan_pipeline
+COPY dectris ./dectris
+RUN python3 -m pip install --no-cache-dir ./dectris
 RUN cmake -S holoscan_pipeline -B build/holoscan_pipeline -G Ninja \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
     && cmake --build build/holoscan_pipeline --parallel 4

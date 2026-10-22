@@ -1,0 +1,18 @@
+transport: rdma
+batch_size: 512
+queue_depth: 4
+device: 0
+execute:
+  mode: finite
+  seconds: 0
+scan:
+  width: 1000
+  height: 1000
+rdma:
+  remote_address: 192.0.2.20:31003
+  local_address: 192.0.2.10
+  device: ""
+  ring_memory: host_mapped
+  ring_mib: 64
+  max_batch: 512
+  timeout: 10

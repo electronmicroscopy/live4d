@@ -6,7 +6,12 @@ table CompressedBatch {
   sizes: [ulong] (id: 2);
   offsets: [ulong] (id: 3);
   payload: holoscan.schema.Tensor (id: 4);
-  end_of_stream: bool (id: 5);
+  end_of_series: bool (id: 5);
+  start_of_series: bool (id: 6);
+  series_id: ulong (id: 7);
+  start_metadata: [ubyte] (id: 8);
+  series_images: ulong (id: 9);
+  pipeline_ready: bool (id: 10);
 }
 root_type CompressedBatch;
 file_identifier "DCBZ";

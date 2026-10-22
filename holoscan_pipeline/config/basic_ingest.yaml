@@ -1,7 +1,16 @@
-endpoint: tcp://127.0.0.1:5555
-batch_size: 1000
-device: 0
+transport: zmq
+batch_size: 512
 queue_depth: 4
-detector_shape: [96, 96]
-dtype: uint16
-compression: bslz4
+device: 0
+execute:
+  mode: finite
+  seconds: 0
+scan:
+  width: 1000
+  height: 1000
+detector:
+  bf_radius: 16.0
+  adf_inner: 24.0
+  adf_outer: 48.0
+zmq:
+  endpoint: tcp://127.0.0.1:5555

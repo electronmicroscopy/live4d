@@ -68,6 +68,48 @@ static int read_cbor_uint(const uint8_t** data, const uint8_t* end, uint64_t* va
     return -1;
 }
 
+static int skip_cbor(const uint8_t** ptr, const uint8_t* end, unsigned depth) {
+    if (*ptr >= end || depth > 32) return -1;
+    const uint8_t major = **ptr >> 5;
+    uint64_t n;
+    if (read_cbor_uint(ptr, end, &n)) return -1;
+    if (major == 2 || major == 3) {
+        if (n > (uint64_t)(end - *ptr)) return -1;
+        *ptr += n;
+    } else if (major == 4 || major == 5 || major == 6) {
+        if (major == 5) {
+            if (n > (uint64_t)(end - *ptr) / 2) return -1;
+            n *= 2;
+        }
+        if (major == 6) n = 1;
+        if (n > (uint64_t)(end - *ptr)) return -1;
+        while (n--) if (skip_cbor(ptr, end, depth + 1)) return -1;
+    }
+    return 0;
+}
+
+int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id) {
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
+    uint64_t n;
+    while (ptr < end && (*ptr >> 5) == 6)
+        if (read_cbor_uint(&ptr, end, &n)) return -1;
+    if (ptr >= end || (*ptr >> 5) != 5 || read_cbor_uint(&ptr, end, &n)) return -1;
+    while (n--) {
+        uint64_t len;
+        if (ptr >= end || (*ptr >> 5) != 3 || read_cbor_uint(&ptr, end, &len)
+            || len > (uint64_t)(end - ptr)) return -1;
+        const int matches = len == 9 && memcmp(ptr, "series_id", 9) == 0;
+        ptr += len;
+        if (matches) {
+            if (ptr >= end || (*ptr >> 5) != 0) return -1;
+            return read_cbor_uint(&ptr, end, series_id);
+        }
+        if (skip_cbor(&ptr, end, 0)) return -1;
+    }
+    return -1;
+}
+
 /**
  * Read CBOR byte string length and get pointer to data.
  */

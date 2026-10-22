@@ -1,104 +1,93 @@
+"""Run either DECTRIS transport through the shared Holoscan 4D-STEM pipeline."""
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+from pathlib import Path
 import signal
 import threading
 import time
-from dataclasses import dataclass, replace
-from pathlib import Path
 
 import holoscan as hs
-import yaml
 
-from .operators import DecompressGpuOp, ZmqRxOp
-from .schemas.decoded_batch import DecodedBatch
-
-
-@dataclass(frozen=True)
-class BasicIngestConfig:
-    endpoint: str = "tcp://127.0.0.1:5555"
-    batch_size: int = 1000
-    device: int = 0
-    queue_depth: int = 4
-
-    def __post_init__(self):
-        if not 1 <= self.batch_size <= 1000:
-            raise ValueError("batch_size must be between 1 and 1000")
-        if self.device < 0 or self.queue_depth < 2:
-            raise ValueError("device must be nonnegative and queue_depth must be at least 2")
-        if not self.endpoint:
-            raise ValueError("endpoint must not be empty")
+from .config import PipelineConfig, load_config
+from .operators import DecompressGpuOp, RdmaRxOp, ZmqRxOp, _PublicationWindow
+from .processing import ScanTensorOp, VirtualDetectorOp
 
 
-class StatsSinkOp(hs.Operator):
-    """Report device Tensor metadata without copying image pixels to the CPU."""
-    inp = hs.Input("input", DecodedBatch)
-
-    def setup(self, spec):
-        spec.input(self.inp)
-        self._start = None
-        self._batches = 0
-        self._frames = 0
-        self._first_batch_frames = 0
-
-    def contract(self):
-        return hs.Contract().trigger(hs.OnEach(self.inp))
-
-    def process_batch(self, batch, ctx):
-        count = len(batch.image_ids)
-        if count:
-            if self._start is None:
-                self._start = time.perf_counter()
-                self._first_batch_frames = count
-            self._batches += 1
-            self._frames += count
-            elapsed = max(time.perf_counter() - self._start, 1e-9)
-            fps = ((self._frames - self._first_batch_frames) / elapsed
-                   if self._batches > 1 else None)
-            fps_text = f"{fps:,.1f}" if fps is not None else "n/a"
-            print(f"[stats] batch={batch.batch_id} batches={self._batches} "
-                  f"frames={self._frames} fps={fps_text} "
-                  f"last_id={batch.image_ids[-1]} shape={batch.frames.shape} "
-                  f"dtype={batch.frames.dtype} device={batch.frames.device}", flush=True)
-
-    def compute(self, ctx):
-        batch = self.inp.receive_data()
-        self.process_batch(batch, ctx)
-        # This marker follows all data on both FIFO edges, including a partial batch.
-        if batch.end_of_stream:
-            ctx.request_completion()
-
-
-class BasicIngestApp:
-    def __init__(self, config: BasicIngestConfig, sink_type=StatsSinkOp):
+class PipelineApp:
+    def __init__(self, config: PipelineConfig, *, conn=None, ring=None, credit=None,
+                 ring_device_address=None, observer=None):
         self.config = config
-        self.graph = hs.Graph("dectris-ingest", default_clock=hs.RealtimeClock)
-        rx = ZmqRxOp(self.graph, "zmq_rx", endpoint=config.endpoint, batch_size=config.batch_size)
-        decompress = DecompressGpuOp(self.graph, "decompress_gpu")
-        sink = self.graph.op(sink_type, "stats_sink")
-        self.graph.add_flow(rx.output, decompress.input, queue_depth=config.queue_depth)
-        self.graph.add_flow(decompress.output, sink.input, queue_depth=config.queue_depth)
-        # Preserve FIFO and bounded callback ordering across this linear graph.
-        self.graph.partition("ingest").include_all()
+        self.ready = threading.Event()
+        # One spare queue slot covers a released input until its callback commits consumption.
+        self.decoded_window = _PublicationWindow(config.queue_depth - 1)
+        self.graph = hs.Graph("dectris-4dstem", default_clock=hs.RealtimeClock)
+        graph = self.graph
+        if config.transport == "zmq":
+            self.compressed_window = _PublicationWindow(config.queue_depth - 1)
+            rx = ZmqRxOp(graph, "zmq_rx", endpoint=config.zmq["endpoint"], batch_size=config.batch_size,
+                         publication_window=self.compressed_window.handle)
+            decoded = DecompressGpuOp(graph, "decompress_gpu",
+                                      publication_window=self.decoded_window.handle,
+                                      input_window=self.compressed_window.handle)
+            graph.add_flow(rx.output, decoded.input, queue_depth=config.queue_depth)
+            graph.partition("receiver").add(rx)
+            graph.partition("decode").add(decoded)
+        else:
+            if conn is None or ring is None or credit is None:
+                raise ValueError("RDMA graph requires a connected receiver and registered ring")
+            # These owners must outlive the compiled graph and its runtime session.
+            self.conn = conn
+            decoded = RdmaRxOp(graph, "rdma_rx", qp_handle=conn.native_handle,
+                               ring_address=ring.addr, ring_device_address=ring_device_address,
+                               ring_bytes=ring.length, ring_memory=config.rdma["ring_memory"],
+                               credit_address=credit.addr, credit_rkey=credit.rkey,
+                               batch_size=config.batch_size, max_batch=config.rdma["max_batch"],
+                               device=config.device, publication_window=self.decoded_window.handle)
+            graph.partition("receiver").add(decoded)
+        scan = graph.op(ScanTensorOp, "scan", scan_width=config.scan["width"],
+                        scan_height=config.scan["height"])
+        graph.add_flow(decoded.output, scan.input, queue_depth=config.queue_depth)
+        ready, finite = self.ready, config.execute["mode"] == "finite"
+        release = self.decoded_window.release
+
+        class BoundDetector(VirtualDetectorOp):
+            def __init__(self):
+                super().__init__(ready=ready, finite=finite, observer=observer, release=release)
+
+        detector = graph.op(BoundDetector, "detector", device_id=config.device,
+                            scan_width=config.scan["width"], scan_height=config.scan["height"],
+                            batch_size=config.batch_size, **config.detector)
+        graph.add_flow(decoded.output, detector.input, queue_depth=config.queue_depth)
+        graph.add_flow(scan.output, detector.positions, queue_depth=config.queue_depth)
+        graph.partition("scan").add(scan)
+        graph.partition("detector").add(detector)
         deployment = hs.execution.DeploymentBinding()
         deployment.bind_tensor_output_device(
-            operator_path="decompress_gpu", output_port="output",
-            device=hs.execution.DeviceId(config.device))
-        self.plan = hs.compile(self.graph, hs.CompileOptions(deployment=deployment))
+            operator_path="decompress_gpu" if config.transport == "zmq" else "rdma_rx",
+            output_port="output", device=hs.execution.DeviceId(config.device))
+        self.plan = hs.compile(graph, hs.CompileOptions(deployment=deployment))
         if not self.plan.ok:
             raise RuntimeError(self.plan.summary())
 
-    def run(self):
-        stopping = threading.Event()
+    def run(self, sender_gone=None, *, stop_event=None):
+        stopping = stop_event if stop_event is not None else threading.Event()
         previous = {}
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGINT, signal.SIGTERM):
                 previous[sig] = signal.signal(sig, lambda *_: stopping.set())
         try:
             with hs.run_async(self.plan) as session:
-                print("[holoscan] ready", flush=True)
-                while not session.wait(timeout=0.1):
-                    if stopping.is_set():
+                deadline = None
+                reported = False
+                while not session.wait(timeout=0.05):
+                    if self.ready.is_set() and not reported:
+                        reported = True
+                        seconds = self.config.execute["seconds"]
+                        deadline = time.monotonic() + seconds if seconds else None
+                    if (stopping.is_set() or (sender_gone is not None and sender_gone.is_set())
+                            or (deadline is not None and time.monotonic() >= deadline)):
                         session.request_stop()
                 if session.termination not in (hs.RunTermination.REQUESTED_COMPLETED,
                                                 hs.RunTermination.COMPLETED,
@@ -110,34 +99,48 @@ class BasicIngestApp:
                 signal.signal(sig, handler)
 
 
-def load_config(path: Path | None) -> BasicIngestConfig:
-    if path is None:
-        return BasicIngestConfig()
-    with path.open(encoding="utf-8") as stream:
-        data = yaml.safe_load(stream) or {}
-    # Fixed detector properties describe the supported input, not runtime parameters.
-    for key, expected in (("detector_shape", [96, 96]), ("dtype", "uint16"), ("compression", "bslz4")):
-        if data.pop(key, expected) != expected:
-            raise ValueError(f"unsupported {key}; expected {expected!r}")
-    return BasicIngestConfig(**data)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="DECTRIS ingest pipeline for Holoscan SDK 5.")
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--endpoint")
+    parser.add_argument("--transport", choices=("zmq", "rdma"))
+    parser.add_argument("--endpoint", help="Override zmq.endpoint")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--device", type=int)
     parser.add_argument("--queue-depth", type=int)
-    parser.add_argument("--plan", type=Path, help="Save the compiled execution plan.")
+    parser.add_argument("--plan", type=Path)
     args = parser.parse_args()
     config = load_config(args.config)
-    overrides = {key: getattr(args, key) for key in ("endpoint", "batch_size", "device", "queue_depth")
+    overrides = {key: getattr(args, key) for key in ("transport", "batch_size", "device", "queue_depth")
                  if getattr(args, key) is not None}
-    app = BasicIngestApp(replace(config, **overrides))
-    if args.plan:
-        args.plan.write_text(app.plan.json(), encoding="utf-8")
-    app.run()
+    if args.endpoint:
+        overrides["zmq"] = config.zmq | dict(endpoint=args.endpoint)
+    config = replace(config, **overrides)
+    if config.transport == "zmq":
+        app = PipelineApp(config)
+        if args.plan:
+            args.plan.write_text(app.plan.json(), encoding="utf-8")
+        app.run()
+        return
+    from dectris import ImagemuxCodec, LocalInfo, TcpConnector, VerbsConn, watch_liveness
+    rdma = config.rdma
+    host, _, port = rdma["remote_address"].rpartition(":")
+    verbs = VerbsConn(rdma["local_address"], config.device, rdma["ring_mib"] << 20,
+                      rdma["device"] or None, ring_memory=rdma["ring_memory"])
+    try:
+        link = TcpConnector(host, ImagemuxCodec(), lambda: LocalInfo(verbs.ring, verbs.endpoint),
+                            verbs.connect, port=int(port), timeout_s=rdma["timeout"]).connect()
+        closing, sender_gone = watch_liveness(link)
+        try:
+            app = PipelineApp(config, conn=link.conn, ring=verbs.ring, credit=link.peer.credit,
+                              ring_device_address=verbs.ring_device_address)
+            if args.plan:
+                args.plan.write_text(app.plan.json(), encoding="utf-8")
+            app.run(sender_gone)
+        finally:
+            closing.set()
+            link.close()
+    finally:
+        verbs.close()
 
 
 if __name__ == "__main__":

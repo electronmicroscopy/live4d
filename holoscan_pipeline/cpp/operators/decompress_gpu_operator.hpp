@@ -10,10 +10,21 @@
 #include <holoscan/core/execution_context.hpp>
 #include <holoscan/logger/logger.hpp>
 #include "constants.h"
+#include "batch_window.hpp"
 #include "pipeline_types.hpp"
 
 namespace holoscan::ops {
-class DecompressGpuOp final : public Operator<> {
+struct DecompressGpuParams {
+  uint64_t publication_window{};
+  uint64_t input_window{};
+};
+HOLOSCAN_PARAM_SCHEMA(
+    DecompressGpuParams,
+    holoscan::param_schema("holoscan.dectris.DecompressGpuParams", 1),
+    holoscan::field<&DecompressGpuParams::publication_window>("publication_window"),
+    holoscan::field<&DecompressGpuParams::input_window>("input_window"));
+
+class DecompressGpuOp final : public Operator<DecompressGpuParams> {
  public:
   ~DecompressGpuOp() override;
   static constexpr size_t MAX_BLOCKS_PER_IMAGE = 256;
@@ -32,6 +43,9 @@ class DecompressGpuOp final : public Operator<> {
   int* h_pinned_num_blocks_ = nullptr;
   nvcompStatus_t* h_pinned_statuses_ = nullptr;
   cudaStream_t stream_ = nullptr;
+  int64_t last_capture_ns_ = -1;
+  ::dectris::BatchWindow* publication_window_{};
+  ::dectris::BatchWindow* input_window_{};
   size_t max_compressed_size_per_image_ = 0;
   size_t max_compressed_batch_size_ = 0;
   void allocate_gpu_resources();
