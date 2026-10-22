@@ -1,0 +1,45 @@
+cmake_minimum_required(VERSION 3.18)
+project(imxrx LANGUAGES C CXX)
+
+option(IMXRX_BUILD_PYTHON "Build the imxrdma Python module (needs pybind11)" ON)
+option(IMXRX_BUILD_TESTS "Build the loopback test (needs an active RDMA port)" ON)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(IBVERBS REQUIRED IMPORTED_TARGET libibverbs)
+
+add_library(imxrx STATIC imxrx.c)
+target_include_directories(imxrx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(imxrx PUBLIC PkgConfig::IBVERBS)
+target_compile_options(imxrx PRIVATE -Wall -Wextra)
+
+if(IMXRX_BUILD_PYTHON)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+  find_package(pybind11 CONFIG REQUIRED)
+  pybind11_add_module(imxrdma imxrdma.cpp)
+  target_link_libraries(imxrdma PRIVATE imxrx)
+  if(SKBUILD)
+    # Built by scikit-build-core (pyproject.toml): the module goes into the dectris package.
+    install(TARGETS imxrdma LIBRARY DESTINATION dectris)
+  else()
+    install(TARGETS imxrdma LIBRARY DESTINATION lib/python)
+  endif()
+endif()
+
+if(IMXRX_BUILD_TESTS)
+  add_executable(imxrx_loopback test_loopback.c)
+  target_link_libraries(imxrx_loopback PRIVATE imxrx)
+  target_compile_options(imxrx_loopback PRIVATE -Wall -Wextra)
+  install(TARGETS imxrx_loopback RUNTIME DESTINATION bin)
+endif()
+
+if(NOT SKBUILD)
+  install(TARGETS imxrx ARCHIVE DESTINATION lib)
+  install(FILES imxrx.h DESTINATION include)
+endif()
