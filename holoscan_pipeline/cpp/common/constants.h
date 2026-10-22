@@ -5,7 +5,6 @@
 namespace holoscan::ops::dectris {
 
 constexpr std::size_t kMaxBatchSize = 1000;
-constexpr std::size_t kPoolSize = 3;
 
 constexpr std::size_t kDetectorWidth = 96;
 constexpr std::size_t kDetectorHeight = 96;

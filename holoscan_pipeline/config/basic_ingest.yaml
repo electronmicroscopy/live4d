@@ -1,6 +1,7 @@
 endpoint: tcp://127.0.0.1:5555
 batch_size: 1000
-scheduler_threads: 4
+device: 0
+queue_depth: 4
 detector_shape: [96, 96]
 dtype: uint16
 compression: bslz4

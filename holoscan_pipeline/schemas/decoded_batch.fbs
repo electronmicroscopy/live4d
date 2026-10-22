@@ -1,0 +1,10 @@
+include "tensor.fbs";
+namespace dectris.schema.decoded;
+table DecodedBatch {
+  batch_id: ulong (id: 0);
+  image_ids: [ulong] (id: 1);
+  frames: holoscan.schema.Tensor (id: 2);
+  end_of_stream: bool (id: 3);
+}
+root_type DecodedBatch;
+file_identifier "DCFR";
