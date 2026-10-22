@@ -7,13 +7,13 @@ name = "imx-receiver"
 version = "0.1.0"
 description = "Holoscan receiver for imagemux's RDMA transport (RoCE, GPUDirect), on plain libibverbs"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = ["numpy", "cbor2"]
 
 [project.optional-dependencies]
-# holoscan and cupy usually come with the Holoscan container; these pull cupy for a bare install.
-cuda12 = ["cupy-cuda12x"]
-cuda13 = ["cupy-cuda13x"]
+# The standalone Holoscan application needs these runtime packages in addition to the SDK.
+cuda12 = ["cupy-cuda12x", "PyYAML"]
+cuda13 = ["cupy-cuda13x", "PyYAML"]
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"

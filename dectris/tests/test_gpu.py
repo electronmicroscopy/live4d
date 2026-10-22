@@ -6,7 +6,12 @@ Image i of the test ring has every pixel equal to i + 1, so its pixel sum is (i 
 """
 
 import os
+import signal
 import sys
+import threading
+import time
+from datetime import timedelta
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -15,9 +20,10 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "
 
 try:
     import cupy as cp
-    from holoscan.core import Application
+    import holoscan as hs
 
-    HAVE_GPU = cp.cuda.runtime.getDeviceCount() > 0
+    HAVE_GPU = (cp.cuda.runtime.getDeviceCount() > 0 and hasattr(hs, "Graph")
+                and hasattr(hs, "compile") and hasattr(hs, "run_async"))
 except Exception:  # no CuPy, Holoscan or driver
     HAVE_GPU = False
 
@@ -28,9 +34,10 @@ if HAVE_GPU:
     # the example app's operators (examples/pipeline/operators.py)
     sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples",
                                  "pipeline"))
+    from app import run_plan
     from operators import VirtualDetectorOp
     from dectris.messages import IMAGE_BYTES, Batch, End, ScanShape, Segment, Series, Start
-    from dectris.operators import RingPath, ScanTensorOp
+    from dectris.operators import RdmaRxOp, RingPath, ScanTensorOp
 
 N_IMAGES = 600
 PIXEL_SUM = 96 * 96
@@ -38,26 +45,6 @@ PIXEL_SUM = 96 * 96
 
 def expected(ids):
     return (np.asarray(ids, dtype=np.uint64) + 1) * PIXEL_SUM
-
-
-class In:
-    """Input ports: ``items`` for every port, or a dict port name -> items."""
-
-    def __init__(self, items):
-        self.items = items
-
-    def receive(self, name):
-        return self.items[name] if isinstance(self.items, dict) else self.items
-
-
-class Out:
-    def __init__(self):
-        self.messages = []
-        self.ports = {}  # port name -> messages
-
-    def emit(self, message, port):
-        self.messages.append(message)
-        self.ports.setdefault(port, []).append(message)
 
 
 @unittest.skipUnless(HAVE_GPU, "needs a GPU, CuPy and Holoscan")
@@ -161,116 +148,349 @@ class GpuTest(unittest.TestCase):
         _, images = self.copied(dispatcher.dispatch(self.addrs(ids, self.pinned.ptr), ids))
         self.assert_images(images, ids)
 
-    def test_warm_ups_leave_no_state(self):
-        for scan, max_batch in ((ScanShape(10, 10), 512), (ScanShape(2, 2), 3),
-                                (ScanShape(1, 1), 1)):
-            tensors = ScanTensorOp(Application(), name="scan_tensors", device=0, scan=scan,
-                                   max_batch=max_batch)
-            tensors.initialize()
-            self.assertIsNone(tensors.warned)
-            detector = VirtualDetectorOp(Application(), name="detector", device=0, scan=scan,
-                                         max_batch=max_batch)
-            detector.initialize()
-            self.assertEqual((detector.series, detector.image, detector.last), (None, None, None))
+    def test_failed_completion_requests_hsdk5_graph_completion(self):
+        class FailedConnection:
+            endpoint = SimpleNamespace(qp_num=7)
+            errors = ()
+            stats = {}
 
-    def scan_tensors(self, scan):
-        op = ScanTensorOp(Application(), name="scan_tensors", device=0, scan=scan)
-        op.initialize()
-        return op
+            def poll(self, imms):
+                return 0, 0, 1
 
-    def scan_tensors_out(self, scan, items):
-        """(frames or None, index) that ScanTensorOp emits for ``items``."""
-        out = Out()
-        self.scan_tensors(scan).compute(In(items), out, None)
-        (index,) = out.ports["index"]
-        frames = out.ports.get("frames", [None])
-        self.assertEqual(len(frames), 1)  # one message per port and tick
-        return frames[0], index
+        connection = FailedConnection()
+        ring_storage = cp.zeros(1 << 20, dtype=cp.uint8)
+        ring = RemoteRegion(ring_storage.data.ptr, ring_storage.nbytes, 1)
+        credit = RemoteRegion(0, 8, 2)
 
-    def test_scan_tensors_and_positions(self):
-        series = Series(5)
-        ids = np.concatenate([np.arange(0, 100), np.arange(120, 170)])  # 20 images lost
-        frames, index = self.scan_tensors_out(ScanShape(20, 10), [
-            Start(series), self.batch(series, ids[:100]),
-            self.batch(series, ids[100:]), End(series, 170)])
-        self.assertEqual(index, [Start(series), Segment(series, 0, 100),
-                                 Segment(series, 100, 150), End(series, 170)])
-        diffraction = frames["diffraction"]
-        self.assertEqual((diffraction.shape, diffraction.dtype), ((150, 96, 96), cp.uint16))
-        np.testing.assert_array_equal(diffraction[:, 5, 7].get(), ids + 1)  # image i is i + 1
-        np.testing.assert_array_equal(frames["ids"].get(), ids)
-        self.assertEqual(frames["positions"].dtype, cp.int32)
-        np.testing.assert_array_equal(frames["positions"].get(), np.stack(divmod(ids, 20), 1))
+        class ConnectedReceiver(RdmaRxOp):
+            def __init__(self):
+                super().__init__(conn=connection, ring=ring, credit=credit)
 
-    def test_scan_tensors_leaves_out_images_beyond_the_scan(self):
-        series = Series(6)
-        frames, index = self.scan_tensors_out(ScanShape(10, 10), [
-            self.batch(series, np.arange(50, 150))])
-        self.assertEqual(index, [Segment(series, 0, 50)])
-        np.testing.assert_array_equal(frames["ids"].get(), np.arange(50, 100))
-        np.testing.assert_array_equal(frames["diffraction"][:, 0, 0].get(), np.arange(51, 101))
-        frames, index = self.scan_tensors_out(ScanShape(10, 10), [
-            self.batch(series, np.arange(100, 120)), End(series, 120)])
-        self.assertIsNone(frames)  # nothing inside the scan: only the index
-        self.assertEqual(index, [End(series, 120)])
+        graph = hs.Graph("failed-completion-test", default_clock=hs.RealtimeClock)
+        graph.op(ConnectedReceiver, "rx", max_batch=4, receive_only=True)
+        graph.partition("pipeline").include_all()
+        plan = hs.compile(graph)
+        self.assertTrue(plan.ok, plan.summary())
+        with hs.run_async(plan) as session:
+            self.assertTrue(session.wait(timeout=5), session.summary())
+            self.assertEqual(session.termination, hs.RunTermination.REQUESTED_COMPLETED)
 
-    def detector(self, scan):
-        op = VirtualDetectorOp(Application(), name="detector", device=0, scan=scan)
-        op.initialize()
-        return op
+    def test_run_plan_waits_for_started_event_before_ready(self):
+        import io
+        from contextlib import redirect_stdout
 
-    def through(self, scan, items, detector=None):
-        """``items`` through a ScanTensorOp into a VirtualDetectorOp; returns the detector."""
-        frames, index = self.scan_tensors_out(scan, items)
-        detector = detector or self.detector(scan)
-        detector.compute(In({"frames": frames, "index": index}), Out(), None)
-        return detector
+        downstream_started = threading.Event()
+        early_compute = threading.Event()
+        started = threading.Event()
 
-    def bright_field(self, detector, ids):
-        """BF value of images ``ids``: every pixel of image i is i + 1."""
-        disc = int(detector.masks[:, 0].sum())
-        return (np.asarray(ids, dtype=np.float64) + 1) * disc
+        class Source(hs.Operator):
+            output = hs.Output("output", hs.pyobject)
+
+            def __init__(self):
+                super().__init__()
+                self.sent = False
+
+            def setup(self, spec):
+                spec.output(self.output)
+
+            def contract(self):
+                return hs.Contract().trigger(
+                    hs.OnClock(period=timedelta(milliseconds=2)))
+
+            def compute(self, context):
+                if not downstream_started.is_set():
+                    early_compute.set()
+                if not self.sent:
+                    self.output.emit("startup")
+                    self.sent = True
+                started.set()
+
+        class DelayedSink(hs.Operator):
+            inp = hs.Input("input", hs.pyobject)
+
+            def __init__(self):
+                super().__init__()
+
+            def setup(self, spec):
+                spec.input(self.inp)
+
+            def contract(self):
+                return hs.Contract().trigger(hs.OnEach(self.inp))
+
+            def start(self):
+                time.sleep(0.3)
+                downstream_started.set()
+
+            def compute(self, context):
+                self.inp.receive_data()
+
+        graph = hs.Graph("ready-test", default_clock=hs.RealtimeClock)
+        source = graph.op(Source, "source")
+        sink = graph.op(DelayedSink, "sink")
+        graph.add_flow(source.output, sink.input)
+        graph.partition("source").add(source)
+        graph.partition("sink").add(sink)
+        plan = hs.compile(graph)
+        self.assertTrue(plan.ok, plan.summary())
+        output = io.StringIO()
+        with redirect_stdout(output):
+            termination = run_plan(plan, 0.05, threading.Event(), started=started)
+        self.assertTrue(downstream_started.is_set())
+        self.assertFalse(early_compute.is_set())
+        self.assertTrue(started.is_set())
+        self.assertEqual(output.getvalue().strip(), "[holoscan] ready")
+        self.assertIn(termination, (hs.RunTermination.REQUESTED_COMPLETED,
+                                    hs.RunTermination.COMPLETED, hs.RunTermination.STOPPED))
+
+    def test_run_plan_accepts_sigterm_during_startup(self):
+        import io
+        from contextlib import redirect_stdout
+
+        class Source(hs.Operator):
+            output = hs.Output("output", hs.pyobject)
+
+            def __init__(self):
+                super().__init__()
+
+            def setup(self, spec):
+                spec.output(self.output)
+
+            def contract(self):
+                return hs.Contract().trigger(
+                    hs.OnClock(period=timedelta(milliseconds=2)))
+
+            def compute(self, context):
+                pass
+
+        class DelayedSink(hs.Operator):
+            inp = hs.Input("input", hs.pyobject)
+
+            def __init__(self):
+                super().__init__()
+
+            def setup(self, spec):
+                spec.input(self.inp)
+
+            def contract(self):
+                return hs.Contract().trigger(hs.OnEach(self.inp))
+
+            def start(self):
+                time.sleep(0.4)
+
+            def compute(self, context):
+                self.inp.receive_data()
+
+        graph = hs.Graph("startup-signal-test", default_clock=hs.RealtimeClock)
+        source = graph.op(Source, "source")
+        sink = graph.op(DelayedSink, "sink")
+        graph.add_flow(source.output, sink.input)
+        graph.partition("source").add(source)
+        graph.partition("sink").add(sink)
+        plan = hs.compile(graph)
+        self.assertTrue(plan.ok, plan.summary())
+        started = threading.Event()
+        output = io.StringIO()
+        timer = threading.Timer(0.15, signal.raise_signal, args=(signal.SIGTERM,))
+        with redirect_stdout(output):
+            timer.start()
+            termination = run_plan(plan, 0, threading.Event(), started=started)
+            timer.join(timeout=1)
+        self.assertFalse(started.is_set())
+        self.assertNotIn("[holoscan] ready", output.getvalue())
+        self.assertIn(termination, (hs.RunTermination.REQUESTED_COMPLETED,
+                                    hs.RunTermination.COMPLETED, hs.RunTermination.STOPPED))
+
+    def run_stages(self, scan, items, *, polls=None, threads=1, max_batch=8, observe=True):
+        """Pass received image messages through the compiled scan and detector graph."""
+        polls = [items] if polls is None else polls
+        received_pairs = []
+        completed = []
+        done = threading.Event()
+
+        class Source(hs.Operator):
+            output0 = hs.Output("output0", hs.pyobject)
+
+            def __init__(self):
+                super().__init__()
+                self.poll = 0
+
+            def setup(self, spec):
+                spec.output(self.output0)
+
+            def contract(self):
+                return hs.Contract().trigger(
+                    hs.OnClock(period=timedelta(milliseconds=5)))
+
+            def compute(self, context):
+                if self.poll < len(polls):
+                    self.output0.emit(polls[self.poll])
+                    self.poll += 1
+
+        class RecordingDetector(VirtualDetectorOp):
+            def _finish(self, end):
+                super()._finish(end)
+                completed.append(self.last)
+                done.set()
+
+        class Observer(hs.Operator):
+            inp = hs.Input("input", hs.pyobject)
+
+            def __init__(self):
+                super().__init__()
+
+            def setup(self, spec):
+                spec.input(self.inp)
+
+            def contract(self):
+                return hs.Contract().trigger(hs.OnEach(self.inp))
+
+            def compute(self, context):
+                received_pairs.append(self.inp.receive_data())
+
+        graph = hs.Graph("gpu-test", default_clock=hs.RealtimeClock)
+        source = graph.op(Source, "source")
+        tensors = graph.op(ScanTensorOp, "scan_tensors", device_id=0,
+                           scan_width=scan.width, scan_height=scan.height,
+                           max_batch=max_batch)
+        detector = graph.op(RecordingDetector, "detector", device_id=0,
+                            scan_width=scan.width, scan_height=scan.height,
+                            max_batch=max_batch)
+        graph.add_flow(source.output0, tensors.input)
+        graph.add_flow(tensors.output, detector.input)
+        observer = graph.op(Observer, "observer") if observe else None
+        if observer is not None:
+            graph.add_flow(tensors.output, observer.input)
+        if threads <= 1:
+            graph.partition("pipeline").include_all()
+        else:
+            graph.partition("receiver").add(source)
+            if threads == 2:
+                processing = graph.partition("processing")
+                processing.add(tensors).add(detector)
+                if observer is not None:
+                    processing.add(observer)
+            else:
+                scanning = graph.partition("scan").add(tensors)
+                if observer is not None:
+                    scanning.add(observer)
+                graph.partition("detector").add(detector)
+
+        plan = hs.compile(graph)
+        self.assertTrue(plan.ok, plan.summary())
+        observed_count = len(polls) if observe else 0
+        with hs.run_async(plan) as session:
+            deadline = time.monotonic() + 15
+            while ((not done.is_set() or len(received_pairs) < observed_count)
+                   and time.monotonic() < deadline):
+                if session.wait(timeout=0.05):
+                    break
+            if not done.is_set() or len(received_pairs) < observed_count:
+                session.request_stop()
+                self.fail(f"Timed out waiting for GPU pipeline output: {session.summary()}")
+            session.request_stop()
+            self.assertTrue(session.wait(timeout=5), session.summary())
+        if observe:
+            self.assertGreaterEqual(len(received_pairs), len(polls),
+                                    "ScanTensorOp did not emit the expected batch")
+        return received_pairs, completed
 
     def test_virtual_detector_places_values_by_scan_position(self):
         scan, series = ScanShape(20, 10), Series(7)
         ids = np.concatenate([np.arange(0, 60), np.arange(80, 200)])  # 20 images lost
-        detector = self.through(scan, [Start(series),
-                                       self.batch(series, ids),
-                                       End(series, 200)])
-        series_id, image = detector.last
+        pairs, completed = self.run_stages(scan, [Start(series), self.batch(series, ids),
+                                                  End(series, 200)])
+        series_id, image = completed[-1]
         self.assertEqual((series_id, image.shape), (7, (2, 10, 20)))
         want = np.zeros(200)
-        want[ids] = self.bright_field(detector, ids)
+        y, x = cp.mgrid[:96, :96].astype(cp.float32)
+        radius = cp.hypot(y - 47.5, x - 47.5)
+        disc = int((radius <= 16.0).sum().get())
+        ring = int(((radius >= 24.0) & (radius <= 48.0)).sum().get())
+        want[ids] = (np.asarray(ids, dtype=np.float64) + 1) * disc
         np.testing.assert_allclose(image[0].get().ravel(), want)
-        ring = int(detector.masks[:, 1].sum())
         np.testing.assert_allclose(image[1, 9, 19].get(), 200 * ring)  # ADF of image 199
+        observed_index, frames = pairs[0]
+        self.assertEqual(observed_index, [Start(series), Segment(series, 0, 180), End(series, 200)])
+        self.assertEqual((frames["diffraction"].shape, frames["diffraction"].dtype),
+                         ((180, 96, 96), cp.uint16))
+        np.testing.assert_array_equal(frames["ids"].get(), ids)
+        self.assertEqual(frames["positions"].dtype, cp.int32)
+        np.testing.assert_array_equal(frames["positions"].get(), np.stack(divmod(ids, 20), 1))
 
     def test_virtual_detector_two_series_in_one_tick(self):
         scan, first, second = ScanShape(10, 10), Series(1), Series(2)
-        finished = []
-        detector = self.detector(scan)
-        finish = detector._finish
-        detector._finish = lambda end: (finish(end), finished.append(detector.last))
-        self.through(scan, [Start(first), self.batch(first, np.arange(0, 30)),
-                            End(first, 30), Start(second),
-                            self.batch(second, np.arange(0, 5)), End(second, 5)],
-                     detector)
+        pairs, finished = self.run_stages(
+            scan, [Start(first), self.batch(first, np.arange(0, 30)), End(first, 30),
+                   Start(second), self.batch(second, np.arange(0, 5)), End(second, 5)])
         self.assertEqual([series_id for series_id, _ in finished], [1, 2])
-        np.testing.assert_allclose(finished[0][1][0, 2, :].get(),
-                                   self.bright_field(detector, np.arange(20, 30)))
-        np.testing.assert_allclose(finished[1][1][0, 0, :5].get(),
-                                   self.bright_field(detector, np.arange(5)))
-        self.assertEqual(float(finished[1][1][0, 0, 5:].sum().get()), 0.0)
+        _, image1 = finished[0]
+        _, image2 = finished[1]
+        disc = int((cp.hypot(cp.mgrid[:96, :96][0] - 47.5,
+                             cp.mgrid[:96, :96][1] - 47.5) <= 16.0).sum().get())
+        np.testing.assert_allclose(image1[0, 2, :].get(),
+                                   (np.arange(20, 30) + 1) * disc)
+        np.testing.assert_allclose(image2[0, 0, :5].get(),
+                                   (np.arange(5) + 1) * disc)
+        self.assertEqual(float(image2[0, 0, 5:].sum().get()), 0.0)
+        index, frames = pairs[0]
+        self.assertEqual(index, [Start(first), Segment(first, 0, 30), End(first, 30),
+                                 Start(second), Segment(second, 30, 35), End(second, 5)])
+        np.testing.assert_array_equal(frames["ids"].get(), np.r_[np.arange(30), np.arange(5)])
+
+    def test_scan_clips_outside_images_and_keeps_control_only_end(self):
+        scan, series = ScanShape(10, 10), Series(4)
+        polls = [[Start(series), self.batch(series, np.arange(50, 150))],
+                 [self.batch(series, np.arange(100, 120)), End(series, 120)]]
+        pairs, completed = self.run_stages(scan, [], polls=polls)
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(pairs[0][0], [Start(series), Segment(series, 0, 50)])
+        np.testing.assert_array_equal(pairs[0][1]["ids"].get(), np.arange(50, 100))
+        self.assertEqual(pairs[1], ([End(series, 120)], None))
+        self.assertEqual(len(completed), 1)
+        series_id, image = completed[0]
+        self.assertEqual(series_id, series.id)
+        self.assertEqual(image.shape, (2, 10, 10))
+        y, x = cp.mgrid[:96, :96].astype(cp.float32)
+        disc = int((cp.hypot(y - 47.5, x - 47.5) <= 16.0).sum().get())
+        want = np.zeros(100)
+        want[50:100] = (np.arange(50, 100) + 1) * disc
+        np.testing.assert_allclose(image[0].get().ravel(), want)
+
+    def test_control_only_pair_and_partition_layouts(self):
+        series = Series(10)
+        pairs, completed = self.run_stages(
+            ScanShape(2, 2), [Start(series), End(series, 0)], max_batch=4)
+        self.assertEqual(pairs[0], ([Start(series), End(series, 0)], None))
+        series_id, image = completed[-1]
+        self.assertEqual(series_id, series.id)
+        self.assertEqual(image.shape, (2, 2, 2))
+        self.assertEqual(float(image.sum().get()), 0.0)
+
+        for threads in (1, 2, 3):
+            with self.subTest(threads=threads):
+                series = Series(10 + threads)
+                pairs, completed = self.run_stages(
+                    ScanShape(2, 2), [Start(series), End(series, 0)], threads=threads,
+                    max_batch=4, observe=False)
+                series_id, image = completed[-1]
+                self.assertEqual(series_id, series.id)
+                self.assertEqual(image.shape, (2, 2, 2))
+                self.assertEqual(float(image.sum().get()), 0.0)
 
     def test_virtual_detector_series_over_several_ticks(self):
         scan, series = ScanShape(10, 10), Series(3)
-        detector = self.through(scan, [Start(series),
-                                       self.batch(series, np.arange(0, 40))])
-        self.assertIsNone(detector.last)
-        self.through(scan, [self.batch(series, np.arange(40, 100)),
-                            End(series, 100)], detector)
-        np.testing.assert_allclose(detector.last[1][0].get().ravel(),
-                                   self.bright_field(detector, np.arange(100)))
+        first, second = self.batch(series, np.arange(0, 40)), self.batch(series, np.arange(40, 100))
+        pairs, completed = self.run_stages(
+            scan, [], polls=[[Start(series), first], [second, End(series, 100)]])
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(pairs[0][0], [Start(series), Segment(series, 0, 40)])
+        self.assertEqual(pairs[1][0], [Segment(series, 0, 60), End(series, 100)])
+        series_id, image = completed[-1]
+        self.assertEqual(series_id, 3)
+        y, x = cp.mgrid[:96, :96].astype(cp.float32)
+        disc = int((cp.hypot(y - 47.5, x - 47.5) <= 16.0).sum().get())
+        np.testing.assert_allclose(image[0].get().ravel(),
+                                   (np.arange(100) + 1) * disc)
 
 
 if __name__ == "__main__":

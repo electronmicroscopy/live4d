@@ -5,7 +5,7 @@ add_virtual_detectors.
 
 import cupy as cp
 import numpy as np
-from holoscan.core import ConditionType, Operator, OperatorSpec
+import holoscan as hs
 
 from dectris import IMAGE_SHAPE, End, ScanShape, Segment, Start, ScanTensorOp, scan_positions
 
@@ -16,8 +16,8 @@ from dectris import IMAGE_SHAPE, End, ScanShape, Segment, Start, ScanTensorOp, s
 # Virtual detector images of a 4D-STEM scan, built batch by batch from ScanTensorOp's tensors.
 # ---------------------------------------------------------------------------------------------
 
-class VirtualDetectorOp(Operator):
-    """Inputs ``frames`` and ``index`` of a ``ScanTensorOp``, on its ``device``.
+class VirtualDetectorOp(hs.Operator):
+    """Integrate the paired scan metadata and frames emitted by ``ScanTensorOp``.
 
     Each diffraction pattern is integrated over a bright-field disc (radius ``bf_radius`` pixels)
     and an annular dark-field ring (``adf_radii`` inner, outer), both centred on the detector, and
@@ -27,30 +27,36 @@ class VirtualDetectorOp(Operator):
     arrives is dropped when the next one starts.
     """
 
-    def __init__(self, fragment, *args, device: int, scan: ScanShape, bf_radius: float = 16.0,
-                 adf_radii: tuple = (24.0, 48.0), max_batch: int = 512, **kwargs):
-        self.device = cp.cuda.Device(device)
-        self.scan = scan
-        self.max_batch = max_batch  # images of the largest batch, for the warm-up
-        self.bf_radius = bf_radius
-        self.adf_radii = adf_radii
+    inp = hs.Input("input", hs.pyobject)
+    device_id = hs.Param(0)
+    scan_width = hs.Param(1000)
+    scan_height = hs.Param(1000)
+    bf_radius = hs.Param(16.0)
+    adf_inner = hs.Param(24.0)
+    adf_outer = hs.Param(48.0)
+    max_batch = hs.Param(512)
+
+    def __init__(self):
+        super().__init__()
         self.series = None
         self.image = None  # (2, height, width) BF / ADF of the series
         self.placed = 0  # images put into it
         self.last = None
-        super().__init__(fragment, *args, **kwargs)
 
-    def setup(self, spec: OperatorSpec):
-        spec.input("frames").condition(ConditionType.NONE)  # not emitted when there are no images
-        spec.input("index")
+    def setup(self, spec):
+        spec.input(self.inp)
 
-    def initialize(self):
-        super().initialize()
+    def contract(self):
+        return hs.Contract().trigger(hs.OnEach(self.inp))
+
+    def start(self):
+        self.device = cp.cuda.Device(self.device_id)
+        self.scan = ScanShape(self.scan_width, self.scan_height)
         with self.device:
             self.stream = cp.cuda.Stream(non_blocking=True)
             y, x = cp.mgrid[:IMAGE_SHAPE[0], :IMAGE_SHAPE[1]].astype(cp.float32)
             r = cp.hypot(y - (IMAGE_SHAPE[0] - 1) / 2, x - (IMAGE_SHAPE[1] - 1) / 2)
-            inner, outer = self.adf_radii
+            inner, outer = self.adf_inner, self.adf_outer
             masks = cp.stack([r <= self.bf_radius, (r >= inner) & (r <= outer)])
             self.masks = masks.reshape(2, -1).T.astype(cp.float32)  # (pixels, 2)
             self._warm_up()
@@ -97,9 +103,8 @@ class VirtualDetectorOp(Operator):
               flush=True)
         self.last = (end.series.id, image)
 
-    def compute(self, op_input, op_output, context):
-        index = op_input.receive("index")
-        frames = op_input.receive("frames")
+    def compute(self, context):
+        index, frames = self.inp.receive_data()
         with self.device, self.stream:
             if frames is not None:
                 positions = cp.asarray(frames["positions"])
@@ -116,14 +121,14 @@ class VirtualDetectorOp(Operator):
             self.stream.synchronize()
 
 
-def add_virtual_detectors(app, source, scan: ScanShape):
-    """A ScanTensorOp and a VirtualDetectorOp per ring of ``source`` (an RdmaRxOp), on the ring's
-    GPU. With several rings each one only sees the scan positions of its images."""
-    for path in source.paths:
-        tensors = ScanTensorOp(app, name=f"scan_tensors{path.index}", device=path.device,
-                               scan=scan, max_batch=source.max_batch)
-        detector = VirtualDetectorOp(app, name=f"detector{path.index}", device=path.device,
-                                     scan=scan, max_batch=source.max_batch)
-        app.add_flow(source, tensors, {(f"output{path.index}", "input")})
-        app.add_flow(tensors, detector, {("frames", "frames"), ("index", "index")})
+def add_virtual_detectors(graph, source, scan: ScanShape, *, device_id: int,
+                          max_batch: int):
+    """Connect the receiver's single ring to scan positioning and virtual detectors."""
+    tensors = graph.op(ScanTensorOp, "scan_tensors", device_id=device_id,
+                       scan_width=scan.width, scan_height=scan.height, max_batch=max_batch)
+    detector = graph.op(VirtualDetectorOp, "detector", device_id=device_id,
+                        scan_width=scan.width, scan_height=scan.height, max_batch=max_batch)
+    graph.add_flow(source.output0, tensors.input)
+    graph.add_flow(tensors.output, detector.input)
+    return tensors, detector
 

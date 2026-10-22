@@ -20,50 +20,114 @@ dectris/tools/build_base_image.sh); run it from anywhere:
 
 import argparse
 import os
+import signal
 import sys
+import threading
+import time
 
-from holoscan.core import Application
+import holoscan as hs
+import yaml
 
-from dectris import (ImagemuxCodec, LocalInfo, RdmaRxOp, ScanShape, TcpConnector, VerbsConn, run,
+from dectris import (ImagemuxCodec, LocalInfo, RdmaRxOp, ScanShape, TcpConnector, VerbsConn,
                      watch_liveness)
 
-from operators import add_virtual_detectors  # this app's operators, next to this file
-from settings import DEFAULTS, resolve
+from operators import add_virtual_detectors
+from settings import resolve
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-class RdmaApp(Application):
-    """Settings come from the YAML file (app.config); the connection is attached once made."""
+def load_settings(path):
+    with open(path, encoding="utf-8") as stream:
+        return resolve(yaml.safe_load(stream) or {})
 
-    def attach(self, settings, conn, ring, credit, *, ring_device=None,
-               ring_device_address=None):
-        self.settings = settings
-        self.conn, self.ring, self.credit = conn, ring, credit
-        self.ring_device = ring_device
-        self.ring_device_address = ring_device_address
 
-    def compose(self):
-        rx = RdmaRxOp(self, name="rx", conn=self.conn, ring=self.ring,
-                      credit=self.credit, ring_device=self.ring_device,
-                      ring_device_address=self.ring_device_address,
-                      **self.settings["receiver"])
-        add_virtual_detectors(self, rx, ScanShape(**self.settings["scan"]))
+def compile_graph(settings, conn, ring, credit, *, ring_device=None,
+                  ring_device_address=None, ready=None):
+    graph = hs.Graph("dectris-rdma", default_clock=hs.RealtimeClock)
+
+    class ConnectedRdmaRxOp(RdmaRxOp):
+        def __init__(self):
+            super().__init__(conn=conn, ring=ring, credit=credit,
+                             ring_device=ring_device,
+                             ring_device_address=ring_device_address)
+            self.reported_ready = False
+
+        def compute(self, context):
+            super().compute(context)
+            if ready is not None and not self.reported_ready:
+                self.reported_ready = True
+                if not self.lost:
+                    ready.set()
+
+    receiver = graph.op(ConnectedRdmaRxOp, "rx", **settings["receiver"])
+    tensors, detector = add_virtual_detectors(
+        graph, receiver, ScanShape(**settings["scan"]),
+        device_id=settings["connection"]["ring_gpu"],
+        max_batch=settings["receiver"]["max_batch"])
+
+    threads = settings["execute"]["threads"]
+    if threads <= 1:
+        graph.partition("pipeline").include_all()
+    else:
+        graph.partition("receiver").add(receiver)
+        if threads == 2:
+            processing = graph.partition("processing")
+            processing.add(tensors).add(detector)
+        else:
+            graph.partition("scan").add(tensors)
+            graph.partition("detector").add(detector)
+
+    plan = hs.compile(graph)
+    if not plan.ok:
+        raise RuntimeError(f"Holoscan plan rejected: {plan.summary()}")
+    return plan
+
+
+def run_plan(plan, seconds, sender_gone, started=None):
+    stopping = threading.Event()
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, lambda *_: stopping.set())
+    try:
+        with hs.run_async(plan) as session:
+            if started is None:
+                print("[holoscan] ready", flush=True)
+                deadline = time.monotonic() + seconds if seconds > 0 else None
+            else:
+                deadline = None
+                while not started.is_set() and not session.wait(timeout=0.1):
+                    if stopping.is_set() or sender_gone.is_set():
+                        session.request_stop()
+                if started.is_set():
+                    print("[holoscan] ready", flush=True)
+                    deadline = time.monotonic() + seconds if seconds > 0 else None
+            while not session.wait(timeout=0.1):
+                if (stopping.is_set() or sender_gone.is_set()
+                        or (deadline is not None and time.monotonic() >= deadline)):
+                    session.request_stop()
+            if session.termination not in (hs.RunTermination.REQUESTED_COMPLETED,
+                                            hs.RunTermination.COMPLETED,
+                                            hs.RunTermination.STOPPED):
+                raise RuntimeError(f"Holoscan run failed: {session.summary()}")
+            return session.termination
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", default=os.path.join(HERE, "pipeline.yaml"),
                     help="Holoscan YAML configuration (default: pipeline.yaml next to this file)")
-    config = ap.parse_known_args()[0].config
+    config = ap.parse_args().config
 
-    app = RdmaApp()
-    app.config(config)
     try:
-        settings = resolve({name: app.kwargs(name) for name in DEFAULTS})
+        settings = load_settings(config)
     except ValueError as e:
         sys.exit(f"{config}: {e}")
-    conn, execute = settings["connection"], settings["execute"]
+    conn = settings["connection"]
     address = conn["remote_address"]
     host, _, port = address.rpartition(":")
 
@@ -82,12 +146,13 @@ def main():
               f"credit addr={link.peer.credit.addr:#x} rkey={link.peer.credit.rkey:#x}",
               flush=True)
 
-        app.attach(settings, link.conn, ring, link.peer.credit,
-                   ring_device=conn["ring_gpu"],
-                   ring_device_address=verbs.ring_device_address)
-        closing = watch_liveness(app, link)
+        closing, sender_gone = watch_liveness(link)
         try:
-            run(app, execute["seconds"], execute["threads"])
+            started = threading.Event()
+            plan = compile_graph(settings, link.conn, ring, link.peer.credit,
+                                 ring_device=conn["ring_gpu"],
+                                 ring_device_address=verbs.ring_device_address, ready=started)
+            run_plan(plan, settings["execute"]["seconds"], sender_gone, started=started)
         finally:
             closing.set()
             link.close()

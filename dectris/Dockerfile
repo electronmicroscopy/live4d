@@ -1,5 +1,5 @@
 ARG CUDA_ARCHITECTURES=86;89
-ARG BASE_SDK_VERSION=v4.4.0
+ARG BASE_SDK_VERSION=v5.0.0
 ARG BASE_IMAGE=nvcr.io/nvidia/clara-holoscan/holoscan:${BASE_SDK_VERSION}-cuda13
 
 FROM ${BASE_IMAGE} AS base
@@ -38,6 +38,7 @@ COPY --from=build /dist/*.whl ${IMX_WHEELS}/
 COPY --from=build /dist/bin/imxrx_loopback /usr/local/bin/
 
 RUN python3 -m pip install --no-cache-dir ${IMX_WHEELS}/imx_receiver-*.whl
+RUN python3 -m pip install --no-cache-dir cupy-cuda13x pyyaml
 
 ENV PYTHONDONTWRITEBYTECODE=1
 
@@ -45,9 +46,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 FROM imx-base AS receiver
 
-RUN python3 -m pip install --no-cache-dir pyyaml
-
 WORKDIR /opt/dectris/stanford-dectris-nvidia-4d-stem
-COPY examples ./examples
+COPY dectris/examples ./examples
 
 CMD ["python3", "examples/pipeline/app.py", "--help"]

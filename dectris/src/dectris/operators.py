@@ -6,10 +6,11 @@ VirtualDetectorOp in examples/pipeline/operators.py.
 
 import ctypes
 import time
+from datetime import timedelta
 
 import cupy as cp
 import numpy as np
-from holoscan.core import Operator, OperatorSpec
+import holoscan as hs
 
 from .dispatch import (DeviceRing, Dispatcher, flush_gpudirect_writes, mapped_device_pointer,
                        ring_location, set_sync_memops)
@@ -89,7 +90,7 @@ class RingPath:
         return f"memory of GPU {self.ring_gpu} (GPUDirect RDMA)"
 
 
-class RdmaRxOp(Operator):
+class RdmaRxOp(hs.Operator):
     """Source: reads the frames imagemux writes into the ring(s) and emits, on ``output{i}`` of
     each ring ``i``, a list in arrival order of ``Batch`` (images of one series copied to that
     ring's GPU, with host image ids restarting at 0 per series), ``Start``
@@ -99,20 +100,16 @@ class RdmaRxOp(Operator):
     ``imxrdma.QueuePair``; it is only used from this operator's compute.
     """
 
-    def __init__(self, fragment, *args, conn, ring: RemoteRegion, credit: RemoteRegion,
-                 max_batch: int = 512, receive_only: bool = False,
-                 ring_device: int | None = None, ring_device_address: int | None = None, **kwargs):
+    output0 = hs.Output("output0", hs.pyobject)
+    max_batch = hs.Param(512)
+    receive_only = hs.Param(False)
+
+    def __init__(self, *, conn, ring: RemoteRegion, credit: RemoteRegion,
+                 ring_device: int | None = None, ring_device_address: int | None = None):
+        super().__init__()
         self.conn = conn
-        self.imms = np.empty(max_batch, dtype=np.uint32)  # filled by conn.poll
-        self.receive_only = receive_only  # count images and return the credit, no GPU work
-        self.max_batch = max_batch
         self.paths = [RingPath(0, ring, credit, ring_device=ring_device,
                                ring_device_address=ring_device_address)]
-        what = ("receive only: frames are counted and their credit returned at once, nothing "
-                "is processed" if receive_only else "images are copied to GPU memory")
-        for path in self.paths:
-            print(f"ring {path.index} of {path.ring.length >> 20} MiB in {path.where}; {what}",
-                  flush=True)
         self.series = None  # Series between its start and end frame; None outside or if rejected
         self.images = 0  # images of the series received, or dropped if it has no Series
         self.next_id, self.missing, self.gaps_shown = None, 0, 0  # image id continuity check
@@ -120,19 +117,24 @@ class RdmaRxOp(Operator):
         self.peak_at = 0  # images of the series received when it was reached
         self.lost = False  # the connection failed; the app is being stopped
         self.deficit = 0  # RECEIVEs that could not be re-posted yet
-        super().__init__(fragment, *args, **kwargs)
 
     def path_of(self, imm: int) -> RingPath:
         """The ring that the write announced by ``imm`` went to. There is only one for now."""
         return self.paths[0]
 
-    def setup(self, spec: OperatorSpec):
-        for path in self.paths:
-            spec.output(f"output{path.index}")
+    def setup(self, spec):
+        spec.output(self.output0)
 
-    def initialize(self):
-        super().initialize()
+    def contract(self):
+        return hs.Contract().trigger(hs.OnClock(period=timedelta(milliseconds=1)))
+
+    def start(self):
+        self.imms = np.empty(self.max_batch, dtype=np.uint32)  # filled by conn.poll
+        what = ("receive only: frames are counted and their credit returned at once, nothing "
+                "is processed" if self.receive_only else "images are copied to GPU memory")
         for path in self.paths:
+            print(f"ring {path.index} of {path.ring.length >> 20} MiB in {path.where}; {what}",
+                  flush=True)
             path.start(0 if self.receive_only else self.max_batch)
 
     def start_series(self, frame: Frame, path: RingPath):
@@ -235,7 +237,6 @@ class RdmaRxOp(Operator):
               f"was put in the error state without a completion, typically by a remote access "
               f"error on one of imagemux's plain RDMA writes (QP access flags, ring rkey or "
               f"address range)", flush=True)
-        self.fragment.stop_execution()
 
     def send_credit(self, path: RingPath):
         """Return the ring position up to which the GPUs are done reading to imagemux. It is
@@ -248,16 +249,22 @@ class RdmaRxOp(Operator):
         else:  # the send queue is full
             print(f"credit write not posted (ring {path.index}, position={position})", flush=True)
 
-    def compute(self, op_input, op_output, context):
-        self.receive(op_output)
+    def compute(self, context):
+        received = self.receive()
+        if self.lost:
+            context.request_completion()
+            return
+        for index, items in received.items():
+            if index == 0:
+                self.output0.emit(items)
 
-    def receive(self, op_output) -> int:
-        """One poll of the receive loop; returns the number of completions it found.
+    def receive(self) -> dict[int, list]:
+        """One poll of the receive loop; returns nonempty per-ring emissions.
         Drains up to max_batch completions without blocking. Each one announces a frame written
         into the ring; its immediate is the frame's sequence number. Completed credit writes are
         reaped in the same poll."""
         if self.lost:
-            return 0
+            return {}
         if self.deficit:
             self.repost_recvs(0)
         k, _, failed = self.conn.poll(self.imms)
@@ -265,11 +272,11 @@ class RdmaRxOp(Operator):
         if failed:
             # A failed completion (e.g. bad rkey) leaves the QP in error: stop.
             self.connection_lost(failed)
-            return 0
+            return {}
         if k == 0:
             for path in self.paths:
                 self.send_credit(path)  # retry a credit that could not be posted
-            return 0
+            return {}
         # Re-arm the zero-length RECEIVEs first so that their number stays constant. They do not
         # protect the ring; the credit does.
         self.repost_recvs(k)
@@ -307,7 +314,7 @@ class RdmaRxOp(Operator):
             for path in self.paths:
                 path.credits.add(path.reader.position)
                 self.send_credit(path)
-            return k
+            return {}
 
         # The kernels read the images straight out of the ring and are not waited for: the ring
         # positions are only credited back once their events have happened (CreditTracker).
@@ -329,10 +336,7 @@ class RdmaRxOp(Operator):
             events, keep = launched[path.index]
             path.credits.add(path.reader.position, events, keep)
             self.send_credit(path)
-        for index, items in out.items():
-            if items:
-                op_output.emit(items, f"output{index}")
-        return k
+        return {index: items for index, items in out.items() if items}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -341,36 +345,37 @@ class RdmaRxOp(Operator):
 # 4D-STEM tensors: the images of one ring with their scan positions, one emission per batch.
 # ---------------------------------------------------------------------------------------------
 
-class ScanTensorOp(Operator):
-    """Consumes the lists of ``Start``, ``Batch`` and ``End`` items of one ring of an ``RdmaRxOp``
-    on that ring's GPU ``device`` and emits, for each list, one tensor map on ``frames`` and the
-    order of things on ``index``.
+class ScanTensorOp(hs.Operator):
+    """Map received images to raster positions and emit paired metadata and frames.
 
-    ``frames`` (only if there are images): ``diffraction`` (k, 96, 96) uint16, ``positions``
-    (k, 2) int32 ``[row, column]`` in the raster ``scan``, and ``ids`` (k,) int64 image ids, all
-    CuPy arrays on ``device``. They are complete when emitted, so they can be read on any stream
-    (and handed to e.g. PyTorch with DLPack). Images outside the scan are left out.
-
-    ``index`` (always): a list in arrival order of ``Start``, ``Segment`` (rows of ``frames`` that
-    are images of one series) and ``End``. A port carries one message per tick, so this is how a
-    consumer tells the series in one ``frames`` apart and orders them with their start and end.
+    ``input`` carries ordered Start/Batch/End lists. ``output`` carries one ``(index, frames)``
+    Python object: an ordered Start/Segment/End list and an optional dictionary of CuPy arrays.
+    The dictionary contains ``diffraction`` (k, 96, 96) uint16, ``positions`` (k, 2) int32
+    ``[row, column]``, and ``ids`` (k,) int64. Images outside the configured scan are omitted.
+    Arrays are complete on emission and can be consumed on another CUDA stream.
     """
 
-    def __init__(self, fragment, *args, device: int, scan: ScanShape, max_batch: int = 512,
-                 **kwargs):
-        self.device = cp.cuda.Device(device)
-        self.scan = scan
-        self.max_batch = max_batch  # images of the largest batch, for the warm-up
+    inp = hs.Input("input", hs.pyobject)
+    out = hs.Output("output", hs.pyobject)
+    device_id = hs.Param(0)
+    scan_width = hs.Param(1000)
+    scan_height = hs.Param(1000)
+    max_batch = hs.Param(512)
+
+    def __init__(self):
+        super().__init__()
         self.warned = None  # series that was told about images outside the scan
-        super().__init__(fragment, *args, **kwargs)
 
-    def setup(self, spec: OperatorSpec):
-        spec.input("input")
-        spec.output("frames")
-        spec.output("index")
+    def setup(self, spec):
+        spec.input(self.inp)
+        spec.output(self.out)
 
-    def initialize(self):
-        super().initialize()
+    def contract(self):
+        return hs.Contract().trigger(hs.OnEach(self.inp))
+
+    def start(self):
+        self.device = cp.cuda.Device(self.device_id)
+        self.scan = ScanShape(self.scan_width, self.scan_height)
         with self.device:
             self.stream = cp.cuda.Stream(non_blocking=True)
             self._warm_up()
@@ -436,8 +441,6 @@ class ScanTensorOp(Operator):
                 self.stream.synchronize()
         return index, frames
 
-    def compute(self, op_input, op_output, context):
-        index, frames = self._frames(op_input.receive("input"))
-        if frames is not None:
-            op_output.emit(frames, "frames")
-        op_output.emit(index, "index")
+    def compute(self, context):
+        index, frames = self._frames(self.inp.receive_data())
+        self.out.emit((index, frames))

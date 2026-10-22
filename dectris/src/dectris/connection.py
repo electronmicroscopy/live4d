@@ -1,17 +1,12 @@
-"""Connection and run helpers: the queue pair and registered ring (VerbsConn), stopping
-when imagemux goes away (watch_liveness), and the scheduler (run). examples/pipeline/app.py
-puts them together with its own operators.
+"""Own RDMA connection resources and report sender disconnection.
 
 The RDMA verbs come from imxrdma (native/, plain libibverbs).
 """
 
 import ctypes
 import threading
-import time
 
 import cupy as cp
-from holoscan.core import Application
-from holoscan.schedulers import EventBasedScheduler, GreedyScheduler
 
 from . import imxrdma
 from .dispatch import mapped_device_pointer
@@ -82,29 +77,22 @@ class VerbsConn:
         self.ctx = None
 
 
-def watch_liveness(app: Application, link: Link) -> threading.Event:
-    """Stop the app when imagemux's handshake connection drops, after a moment to drain the ring
-    (a series can be over in milliseconds). Set the returned event before closing the link
-    ourselves, which would otherwise look like imagemux going away."""
+def watch_liveness(link: Link) -> tuple[threading.Event, threading.Event]:
+    """Return events for local closure and sender disconnection after the drain interval.
+
+    Set the first event before closing the link locally. The application's session loop
+    watches the second event and requests cooperative shutdown when it is set.
+    """
     closing = threading.Event()
+    sender_gone = threading.Event()
 
     def stop():
         link.liveness.wait_dead()
         if closing.is_set():
             return
         print(f"sender gone: {link.liveness.reason}", flush=True)
-        time.sleep(DRAIN_S)
-        app.stop_execution()
+        if not closing.wait(DRAIN_S):
+            sender_gone.set()
+
     threading.Thread(target=stop, name="imagemux-stop", daemon=True).start()
-    return closing
-
-
-def run(app, seconds, threads=1):
-    """Run for `seconds` (0 = until Ctrl+C). threads > 1 lets operators run concurrently."""
-    limit = {"max_duration_ms": int(seconds * 1000)} if seconds > 0 else {}
-    if threads > 1:
-        app.scheduler(EventBasedScheduler(app, name="sched", worker_thread_number=threads,
-                                          **limit))
-    else:
-        app.scheduler(GreedyScheduler(app, name="sched", **limit))
-    app.run()
+    return closing, sender_gone

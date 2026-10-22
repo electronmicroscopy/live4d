@@ -12,7 +12,7 @@ imagemux -> gpu frame ring -> RdmaRx -> ScanTensor -> VirtualDetector
 
 ## Prerequisites
 
-This example builds on the NGC holoscan (4.4.0) container image. Log in to the NGC container registry to pull 
+This example builds on the NGC Holoscan SDK 5.0.0 CUDA 13 container image. Log in to the NGC container registry to pull
 the Holoscan image if not already available:
 ```
 docker login nvcr.io
@@ -32,12 +32,12 @@ python3 -m pip install dist/imx_receiver-*.whl
 ```
 The Dockerfile does this automatically in a build stage and installs only the wheel into the container image. The result
 is one wheel per CPython version and architecture, e.g.
-`imx_receiver-0.1.0-cp312-cp312-linux_aarch64.whl` for the Holoscan 4.4 image.
+`imx_receiver-0.1.0-cp312-cp312-linux_aarch64.whl` for the Holoscan SDK 5 image.
 
 - **Run time:** The wheel links libibverbs dynamically; the machine needs
-  rdma-core (`libibverbs1`, `ibverbs-providers`). The `holoscan` and `cupy` are not hard dependencies
-  (they come with the Holoscan image); use `pip install "imx-receiver[cuda13]"` (or `[cuda12]`) pulls
-  CuPy for a bare install.
+  rdma-core (`libibverbs1`, `ibverbs-providers`), Holoscan SDK 5, and CuPy. The receiver image
+  installs the CUDA 13 CuPy extra; use `pip install "imx-receiver[cuda13]"` when installing
+  the wheel into another compatible environment.
 
 ## Base image
 
@@ -60,7 +60,7 @@ Everything from `dectris`
 |---|---|
 | Source operator | `RdmaRxOp`, `RingPath` |
 | 4D-STEM tensors | `ScanTensorOp`, `ScanShape`, `Segment`, `scan_positions` |
-| Setup and running | `VerbsConn`, `TcpConnector`, `ImagemuxCodec`, `LocalInfo`, `run`, `watch_liveness` |
+| Setup and running | `VerbsConn`, `TcpConnector`, `ImagemuxCodec`, `LocalInfo`, `watch_liveness` |
 | Passed between operators | `Start`, `Batch`, `End`, `Series`, `IMAGE_SHAPE`, `IMAGE_BYTES` |
 | Protocol | `FrameReader`, `FrameHeader`, `FrameKind`, `CreditTracker`, `Peer`, `Link`, `RemoteRegion`, `QpEndpoint` |
 | GPU | `Dispatcher`, `DeviceRing` |
@@ -93,7 +93,7 @@ with the RDMA device, GPU, host network and memlock flags; its arguments are pas
 
 ## Configuration
 
-The settings are read with Holoscan's own configuration mechanics from
+The settings are read from YAML and validated before the graph is compiled. The default file is
 `examples/pipeline/pipeline.yaml`, which is baked into the image. To use another file, pass it as
 the first argument (`run.sh` mounts it into the container):
 ```
@@ -106,17 +106,26 @@ the first argument (`run.sh` mounts it into the container):
 | `connection.remote_address` | required | imagemux's RDMA handshake address, e.g. `10.42.41.10:31003` |
 | `connection.local_address` | required | address of the RoCE interface to use |
 | `connection.device` | `""` | RDMA device; `""` holding `local_address` |
-| `connection.ring_gpu` | 0 | GPU holding the ring |
+| `connection.ring_gpu` | 0 | GPU processing the images |
+| `connection.ring_memory` | `gpu` | ring allocation: `gpu` for GPUDirect RDMA, or `host_mapped` for pinned host memory with a CUDA alias |
 | `connection.ring_mib` | 64 | ring size in MiB |
 | `connection.timeout` | 10 | seconds for the TCP connection to imagemux |
 | `execute.seconds` | 10 | run time, 0 = until Ctrl+C |
-| `execute.threads` | 3 | scheduler worker threads (source, scan tensors and detector run concurrently) |
+| `execute.threads` | 3 | execution partition layout: 1 groups all operators, 2 separates RX from processing, 3 or more separates all three stages |
 | `receiver.receive_only` | false | no GPU work: frames are counted and their credit returned at once; the series end line then shows the raw rate the sender delivers |
 | `receiver.max_batch` | 512 | most completions (frames) taken from the receive queue per poll |
 | `scan.width` | 1000 | probe positions per row of the raster scan |
 | `scan.height` | 1000 | rows of the raster scan |
 
 ## Operation
+
+The application builds an HSDK 5 graph, compiles an execution plan, and runs it in a managed
+session. The configured partition layout keeps Python messages in one process. SIGINT,
+SIGTERM, the run-time limit, and handshake disconnection request cooperative session shutdown.
+The existing CUDA events and stream waits govern CuPy array readiness and ring credits.
+Wait for `[holoscan] ready` before starting acquisition. This marker follows GPU warm-up
+and the first receiver activation; creating an asynchronous session alone does not mean
+the pipeline is ready to receive at full rate.
 
 A series is whatever arrives between its START and END frame. Its number of images is not known
 in advance (`number_of_images` of the start message is only used as a size hint). The shape of its
@@ -134,25 +143,25 @@ look for a first-use cost; if it happens throughout, the pipeline is too slow fo
 The app puts a `ScanTensorOp` after `RdmaRxOp`, one per ring on that ring's GPU. Scans are always
 raster: image id `i` of a series is at row `i // scan.width`, column `i % scan.width`.
 
-`RdmaRxOp` does not emit Holoscan tensors. For each poll of the receive queue it emits a Python
-list of `Start`, `Batch` and `End`, where `Batch.images` is a CuPy array whose copy out of the ring
-may still be running. `ScanTensorOp` turns each such list into one Holoscan tensor map on its
-`frames` output and one list on its `index` output:
+The standalone graph uses typed `hs.pyobject` ports within one process. `RdmaRxOp` emits a
+Python list of `Start`, `Batch` and `End` for each nonempty poll. `Batch.images` is a CuPy array
+whose copy out of the ring may still be running; its CUDA event controls readiness and ring
+credit. `ScanTensorOp` emits one `(index, frames)` pair on its `output` port:
 
-| Output | Content |
+| Item | Content |
 |---|---|
-| `frames` | tensor map, only when there are images: `diffraction` (k, 96, 96) uint16, `positions` (k, 2) int32 `[row, column]`, `ids` (k,) int64 image ids; CuPy arrays on the ring's GPU |
-| `index` | list in arrival order of `Start`, `Segment(series, start, stop)` (rows `start:stop` of `frames` that are images of `series`) and `End` |
+| `frames` | dictionary, or `None` when there are no images: `diffraction` (k, 96, 96) uint16, `positions` (k, 2) int32 `[row, column]`, `ids` (k,) int64; CuPy arrays on the selected GPU |
+| `index` | list in arrival order of `Start`, `Segment(series, start, stop)` (rows `start:stop` of `frames` belonging to that series), and `End` |
 
-- **Per batch.** Nothing waits for a scan row or the end of the series; `k` is what one poll
-  brought (at most `receiver.max_batch` frames).
-- **Complete when emitted.** `ScanTensorOp` synchronises its stream before emitting, so consumers may
-  read the tensors on any stream without waiting on CUDA events.
-- **Lost and extra images.** Lost images leave their scan positions empty, never shifting the
-  others; images with ids beyond `width * height` are left out with a message per series.
-- **Why two ports.** A Holoscan port carries one message per tick, and one poll can hold the end
-  of one series and the start of the next; `index` keeps their order. A consumer gives its
-  `frames` input `.condition(ConditionType.NONE)` and ticks on `index` (see `VirtualDetectorOp`).
+- **Per poll.** Nothing waits for a scan row or the end of the series. `receiver.max_batch`
+  limits received transport frames per poll, and each transport frame can contain multiple
+  images. The output image count is variable.
+- **Complete when emitted.** `ScanTensorOp` synchronizes its stream before emitting, so consumers
+  may read the arrays on any stream without waiting on CUDA events.
+- **Lost and extra images.** Lost images leave their scan positions empty; images with IDs
+  beyond `width * height` are left out with one message per series.
+- **Paired data and metadata.** One message carries both `index` and `frames`, keeping series
+  transitions paired with their images even when a poll spans more than one series.
 - **PyTorch.** Not a dependency. A downstream operator can wrap the tensors without a copy with
   `torch.from_dlpack(frames["diffraction"])`.
 - **Warm-up.** The dispatcher, `ScanTensorOp` and `VirtualDetectorOp` run one full batch
@@ -307,16 +316,16 @@ that imagemux writes frames into. The imagemux decides which images go to which 
    ring's GPU with its own stream. The kernel copies the images straight from the ring to GPU
    memory; the ring space is credited back to imagemux once the copy is done. The START and END
    frames of a series are sent to every ring's operators.
-2. **4D-STEM tensors** (`operators.py`): Each `ScanTensorOp` runs on its ring's GPU and scheduler
-   thread. It waits for each batch's event on its own stream, positions the images in the scan
+2. **4D-STEM tensors** (`operators.py`): Each `ScanTensorOp` runs on its selected GPU and execution
+   partition. It waits for each batch's event on its own stream, positions the images in the scan
    and emits them (see [4D-STEM output](#4d-stem-output)).
 3. **Virtual detector** (`examples/pipeline/operators.py`): Each `VirtualDetectorOp` builds the
    BF / ADF images of a series from its ring's tensors. A series without an END frame is dropped
    when the next one starts. Nothing merges the rings yet: with several rings each detector only
    fills the scan positions of the images its ring received.
 
-Today the handshake defines a single ring, so a run has one path. The ring is in GPU memory and is
-processed by the GPU that holds it (`connection.ring_gpu`).
+Today the handshake defines a single ring, so a run has one path. `connection.ring_memory` selects
+GPU memory or mapped pinned host memory; `connection.ring_gpu` selects the GPU that processes it.
 
 ## Glossary
 

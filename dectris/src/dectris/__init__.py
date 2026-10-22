@@ -1,41 +1,26 @@
-"""Receiver of imagemux's RDMA transport for Holoscan: the source operator (RdmaRxOp), the wire
-protocol (imagemux), the RDMA verbs (imxrdma, on libibverbs), and ScanTensorOp, which turns the
-images into 4D-STEM tensors. The operators that process those belong to the app
-(examples/pipeline/operators.py has VirtualDetectorOp).
+"""Imagemux RDMA reception and standalone Holoscan SDK 5 operators.
 
-Everything below is imported on first use, so ``import dectris`` and the protocol modules
-work without holoscan or cupy.
+The package provides the native verbs binding, wire protocol, registered-ring ownership,
+GPU dispatch, and scan-position processing. Imports are lazy so protocol modules can be
+used without Holoscan or CuPy.
 
-Building your own operators
----------------------------
-``RdmaRxOp`` is the source. Set up the queue pair and the GPU ring with ``VerbsConn``, connect to
-imagemux with ``TcpConnector(host, ImagemuxCodec(), lambda: LocalInfo(conn.ring, conn.endpoint),
-conn.connect, port=...)``, and pass the link's queue pair, the ring and the peer's credit word to
-``RdmaRxOp``. It has one output ``output{i}`` per ring (``RdmaRxOp.paths``, one for now), and each
-emission is a list, in arrival order, of:
+``VerbsConn`` owns the queue pair and a GPU or mapped-host ring. ``TcpConnector`` performs
+imagemux's handshake. The example app binds those live resources to a graph-local
+``RdmaRxOp`` subclass, then compiles and runs an HSDK 5 graph in one process.
 
-- ``Start(series)``: a series begins (sent to every output);
-- ``Batch(series, ids, ready, images)``: (k, 96, 96) uint16 ``images`` of the series copied to
-  the ring's GPU; wait for the CUDA event ``ready`` on your stream before reading them;
-- ``End(series, images)``: the series is over, with the number of images received.
+``RdmaRxOp.output0`` carries an ``hs.pyobject`` list containing ordered ``Start``, ``Batch``,
+and ``End`` values. ``Batch.images`` is a CuPy array; wait for ``Batch.ready`` on the consuming
+CUDA stream before reading it. The receiver returns ring credits after the copy completes.
 
-A custom worker is a Holoscan ``Operator`` with an input that receives these lists, connected with
-``app.add_flow(rx, worker, {(f"output{path.index}", "input")})``.
+``ScanTensorOp`` consumes those lists and emits one ``(index, frames)`` pair on ``output``.
+``index`` preserves ``Start``, ``Segment``, and ``End`` ordering. ``frames`` is a dictionary
+containing ``diffraction`` (k, 96, 96) uint16, ``positions`` (k, 2) int32 raster coordinates,
+and ``ids`` (k,) int64 CuPy arrays, or ``None`` when there are no images. Arrays are complete
+when emitted. Keeping both values in one message preserves their pairing across series.
 
-These lists are Python objects, not Holoscan tensors, and the copy of the images may still be
-running when they are emitted. For 4D-STEM tensors, put a
-``ScanTensorOp(app, device=path.device, scan=ScanShape(width, height))`` after the ``RdmaRxOp``.
-For each list it emits a Holoscan tensor map on ``frames``:
-``diffraction`` (k, 96, 96) uint16, ``positions`` (k, 2) int32 ``[row, column]`` in the raster
-scan and ``ids`` (k,) int64, on the ring's GPU and complete (readable on any stream, e.g. with
-``torch.from_dlpack``), and on ``index`` the list of ``Start``, ``Segment`` (rows of ``frames`` of
-one series) and ``End`` in arrival order. ``frames`` is only emitted when there are images, so a
-consumer's ``frames`` input takes ``.condition(ConditionType.NONE)`` and its ticks follow
-``index``.
-
-``run(app, seconds, threads)`` and ``watch_liveness(app, link)`` are the scheduler and
-stop-on-disconnect helpers.
-examples/pipeline/app.py (the receiver) is a complete app built this way.
+``watch_liveness`` returns local-close and sender-disconnect events for the application's
+session loop. ``examples/pipeline/app.py`` shows graph construction, configuration, virtual
+detector processing, and cooperative shutdown.
 """
 
 import importlib
@@ -47,7 +32,7 @@ _EXPORTS = {
     # operators
     "RdmaRxOp": "operators", "RingPath": "operators", "ScanTensorOp": "operators",
     # setup and running
-    "VerbsConn": "connection", "run": "connection", "watch_liveness": "connection",
+    "VerbsConn": "connection", "watch_liveness": "connection",
     # what the operators pass along a series
     "Series": "messages", "Start": "messages", "Batch": "messages", "End": "messages",
     "IMAGE_SHAPE": "messages", "IMAGE_BYTES": "messages",
