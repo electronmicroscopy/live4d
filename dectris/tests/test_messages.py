@@ -1,4 +1,5 @@
-"""Start message of the imagemux bstream output -> series geometry (no RDMA, no GPU)."""
+"""Start message of the imagemux bstream output -> series geometry, and the raster scan positions
+of image ids (no RDMA, no GPU)."""
 
 import datetime
 import os
@@ -6,10 +7,11 @@ import sys
 import unittest
 
 import cbor2
+import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from dectris.messages import Series, parse_start  # noqa: E402
+from dectris.messages import ScanShape, Series, parse_start, scan_positions  # noqa: E402
 
 
 def start_message(**overrides) -> bytes:
@@ -62,6 +64,32 @@ class ParseStartTest(unittest.TestCase):
         ]:
             with self.assertRaises(ValueError):
                 parse_start(message)
+
+
+class ScanTest(unittest.TestCase):
+    def test_shape(self):
+        self.assertEqual(ScanShape(1000, 1000).size, 1_000_000)
+        for width, height in ((0, 1), (1, -1), (1.5, 2), (True, 2)):
+            with self.assertRaises(ValueError):
+                ScanShape(width, height)
+
+    def test_raster_positions(self):
+        positions, valid = scan_positions(np.array([0, 1, 4, 5, 11], dtype=np.uint64),
+                                          ScanShape(4, 3))
+        self.assertTrue(valid.all())
+        self.assertEqual(positions.dtype, np.int32)
+        np.testing.assert_array_equal(positions, [[0, 0], [0, 1], [1, 0], [1, 1], [2, 3]])
+
+    def test_gaps_keep_their_place(self):
+        positions, _ = scan_positions([2, 3, 7], ScanShape(4, 3))
+        np.testing.assert_array_equal(positions, [[0, 2], [0, 3], [1, 3]])
+
+    def test_ids_outside_the_scan(self):
+        positions, valid = scan_positions([10, 11, 12, 13], ScanShape(4, 3))
+        np.testing.assert_array_equal(valid, [True, True, False, False])
+        np.testing.assert_array_equal(positions, [[2, 2], [2, 3]])
+        positions, valid = scan_positions([], ScanShape(4, 3))
+        self.assertEqual(positions.shape, (0, 2))
 
 
 if __name__ == "__main__":

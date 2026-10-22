@@ -14,8 +14,9 @@ execute:
 
 receiver:
   receive_only: false                  # true: return the credit at once, no GPU work
-  keep_images: false                   # true: copy the images to GPU memory; false: work straight from the ring
+  keep_images: true                   # true: 4D-STEM tensors (StemOp -> VirtualDetectorOp); false: pixel sums straight from the ring
   max_batch: 512                       # completions (frames) taken from the receive queue per poll
 
-aggregate:
-  series_width: 0                      # images per series row; 0 = a single row
+scan:                                  # 4D-STEM raster scan (image id i: row i // width, column i % width)
+  width: 1000                          # probe positions per row
+  height: 1000                         # rows

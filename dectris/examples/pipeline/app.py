@@ -3,6 +3,9 @@
     imagemux ==WRITE_WITH_IMM==> frame ring ==> RdmaRx -> Worker x N -> Aggregate
         ^------------- consumed ring position (RDMA WRITE) -------------'
 
+With receiver.keep_images the images are kept and become 4D-STEM tensors instead:
+RdmaRx -> Stem -> VirtualDetector per ring, positioned in the configured raster scan.
+
 We are the TCP client of imagemux's RDMA handshake address: we send our queue pair and ring
 (Hello), imagemux answers with its queue pair and credit word (Accept), and once our QP is
 connected and RECEIVEs are posted we say Ready (imagemux.py). The ring is in GPU memory
@@ -21,10 +24,10 @@ import sys
 
 from holoscan.core import Application
 
-from dectris import (ImagemuxCodec, LocalInfo, RdmaRxOp, TcpConnector, VerbsConn, run,
+from dectris import (ImagemuxCodec, LocalInfo, RdmaRxOp, ScanShape, TcpConnector, VerbsConn, run,
                      watch_liveness)
 
-from operators import add_workers  # this app's operators, next to this file
+from operators import add_virtual_detectors, add_workers  # this app's operators, next to this file
 from settings import DEFAULTS, resolve
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +45,11 @@ class RdmaApp(Application):
         receiver["reduce"] = not receiver.pop("keep_images")  # RdmaRxOp's name for it
         rx = RdmaRxOp(self, name="rx", conn=self.conn, ring=self.ring,
                       credit=self.credit, **receiver)
-        add_workers(self, rx, self.settings["aggregate"]["series_width"] or None)
+        scan = ScanShape(**self.settings["scan"])
+        if receiver["reduce"]:
+            add_workers(self, rx, scan.width)
+        else:  # the images are kept: 4D-STEM tensors
+            add_virtual_detectors(self, rx, scan)
 
 
 def main():

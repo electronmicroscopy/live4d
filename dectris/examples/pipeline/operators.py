@@ -1,13 +1,15 @@
 """Operators of the example receiver app: WorkerOp (reconstruct the images of one ring) and
-AggregateOp (merge the workers' results per series). They consume what dectris.RdmaRxOp
-emits (lists of Start, Batch and End) and are wired up by add_workers.
+AggregateOp (merge the workers' results per series), which consume what dectris.RdmaRxOp emits
+(lists of Start, Batch and End) and are wired up by add_workers; and VirtualDetectorOp (virtual
+detector images of a 4D-STEM scan), which consumes what dectris.StemOp emits and is wired up by
+add_virtual_detectors.
 """
 
 import cupy as cp
 import numpy as np
-from holoscan.core import Operator, OperatorSpec
+from holoscan.core import ConditionType, Operator, OperatorSpec
 
-from dectris import IMAGE_SHAPE, Batch, End, Start
+from dectris import IMAGE_SHAPE, Batch, End, ScanShape, Segment, Start, StemOp
 
 
 # ---------------------------------------------------------------------------------------------
@@ -196,6 +198,116 @@ class AggregateOp(Operator):
         print(f"aggregate series: {series} {total} images -> {image.shape[1]}x{image.shape[0]}"
               f"{note} sum={int(merged.sum())}", flush=True)
         return image
+
+
+# ---------------------------------------------------------------------------------------------
+# VirtualDetectorOp
+#
+# Virtual detector images of a 4D-STEM scan, built batch by batch from StemOp's tensors.
+# ---------------------------------------------------------------------------------------------
+
+class VirtualDetectorOp(Operator):
+    """Inputs ``frames`` and ``index`` of a ``StemOp``, on its ``device``.
+
+    Each diffraction pattern is integrated over a bright-field disc (radius ``bf_radius`` pixels)
+    and an annular dark-field ring (``adf_radii`` inner, outer), both centred on the detector, and
+    the two values are put at the image's scan position. At the end of a series the (2, height,
+    width) float32 BF / ADF images are complete; the example only prints them and keeps the last
+    one (``last``: series id, image). Positions without an image stay 0. A series whose end never
+    arrives is dropped when the next one starts.
+    """
+
+    def __init__(self, fragment, *args, device: int, scan: ScanShape, bf_radius: float = 16.0,
+                 adf_radii: tuple = (24.0, 48.0), **kwargs):
+        self.device = cp.cuda.Device(device)
+        self.scan = scan
+        self.bf_radius = bf_radius
+        self.adf_radii = adf_radii
+        self.series = None
+        self.image = None  # (2, height, width) BF / ADF of the series
+        self.placed = 0  # images put into it
+        self.last = None
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("frames").condition(ConditionType.NONE)  # not emitted when there are no images
+        spec.input("index")
+
+    def initialize(self):
+        super().initialize()
+        with self.device:
+            self.stream = cp.cuda.Stream(non_blocking=True)
+            y, x = cp.mgrid[:IMAGE_SHAPE[0], :IMAGE_SHAPE[1]].astype(cp.float32)
+            r = cp.hypot(y - (IMAGE_SHAPE[0] - 1) / 2, x - (IMAGE_SHAPE[1] - 1) / 2)
+            inner, outer = self.adf_radii
+            masks = cp.stack([r <= self.bf_radius, (r >= inner) & (r <= outer)])
+            self.masks = masks.reshape(2, -1).T.astype(cp.float32)  # (pixels, 2)
+            self._warm_up()
+
+    def _warm_up(self):
+        """Compile the kernels that ``_add`` uses now, not on the first (timed) batch."""
+        with self.stream:
+            values = self._integrate(cp.ones((2, *IMAGE_SHAPE), dtype=cp.uint16))
+            image = cp.zeros((2, 2, 2), dtype=cp.float32)
+            image[:, cp.zeros(2, dtype=cp.int32), cp.arange(2, dtype=cp.int32)] = values.T
+        self.stream.synchronize()
+
+    def _integrate(self, diffraction):
+        """(k, 2) BF / ADF sums of the (k, 96, 96) patterns."""
+        return diffraction.reshape(diffraction.shape[0], -1).astype(cp.float32) @ self.masks
+
+    def _begin(self, series):
+        if self.image is not None:
+            print(f"virtual detector: series {self.series.id} has no end, dropped", flush=True)
+        self.series = series
+        self.image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
+        self.placed = 0
+
+    def _add(self, series, positions, values):
+        if self.series is None or series.id != self.series.id:
+            self._begin(series)
+        self.image[:, positions[:, 0], positions[:, 1]] = values.T
+        self.placed += positions.shape[0]
+
+    def _finish(self, end: End):
+        if self.series is None or end.series.id != self.series.id:
+            self._begin(end.series)  # no image of this series came
+        image, placed = self.image, self.placed
+        self.series = self.image = None
+        bf, adf = (float(s) for s in image.sum(axis=(1, 2)).get())
+        print(f"virtual detector series {end.series.id}: {placed} of {self.scan.size} positions "
+              f"({self.scan.width}x{self.scan.height}), BF sum={bf:.6g}, ADF sum={adf:.6g}",
+              flush=True)
+        self.last = (end.series.id, image)
+
+    def compute(self, op_input, op_output, context):
+        index = op_input.receive("index")
+        frames = op_input.receive("frames")
+        with self.device, self.stream:
+            if frames is not None:
+                positions = cp.asarray(frames["positions"])
+                values = self._integrate(cp.asarray(frames["diffraction"]))
+            for item in index:
+                if isinstance(item, Start):
+                    self._begin(item.series)
+                elif isinstance(item, Segment):
+                    self._add(item.series, positions[item.start:item.stop],
+                              values[item.start:item.stop])
+                elif isinstance(item, End):
+                    self._finish(item)
+            # The input tensors go back to their memory pool after this tick: be done with them.
+            self.stream.synchronize()
+
+
+def add_virtual_detectors(app, source, scan: ScanShape):
+    """A StemOp and a VirtualDetectorOp per ring of ``source`` (an RdmaRxOp with reduce=False),
+    on the ring's GPU. With several rings each one only sees the scan positions of its images."""
+    for path in source.paths:
+        stem = StemOp(app, name=f"stem{path.index}", device=path.device, scan=scan)
+        detector = VirtualDetectorOp(app, name=f"detector{path.index}", device=path.device,
+                                     scan=scan)
+        app.add_flow(source, stem, {(f"output{path.index}", "input")})
+        app.add_flow(stem, detector, {("frames", "frames"), ("index", "index")})
 
 
 def add_workers(app, source, series_width=None):

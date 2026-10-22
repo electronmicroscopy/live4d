@@ -19,7 +19,14 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(s["connection"]["ring_gpu"], 0)
         self.assertEqual(s["execute"], {"seconds": 10.0, "threads": 3})
         self.assertEqual(s["receiver"], {"receive_only": False, "keep_images": False, "max_batch": 512})
-        self.assertEqual(s["aggregate"], {"series_width": 0})
+        self.assertEqual(s["scan"], {"width": 1000, "height": 1000})
+
+    def test_scan(self):
+        s = resolve({"connection": CONNECTION, "scan": {"width": 256}})
+        self.assertEqual(s["scan"], {"width": 256, "height": 1000})
+        for bad in (0, -1, 1.5, "256", True):
+            with self.assertRaisesRegex(ValueError, "scan.height"):
+                resolve({"connection": CONNECTION, "scan": {"height": bad}})
 
     def test_override(self):
         s = resolve({"connection": CONNECTION, "receiver": {"receive_only": True}})

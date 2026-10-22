@@ -27,8 +27,9 @@ if HAVE_GPU:
     # the example app's operators (examples/pipeline/operators.py)
     sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples",
                                  "pipeline"))
-    from operators import AggregateOp, WorkerOp
-    from dectris.messages import IMAGE_BYTES, Batch, End, Series, Start
+    from operators import AggregateOp, VirtualDetectorOp, WorkerOp
+    from dectris.messages import IMAGE_BYTES, Batch, End, ScanShape, Segment, Series, Start
+    from dectris.operators import StemOp
 
 N_IMAGES = 600
 PIXEL_SUM = 96 * 96
@@ -51,9 +52,11 @@ class In:
 class Out:
     def __init__(self):
         self.messages = []
+        self.ports = {}  # port name -> messages
 
     def emit(self, message, port):
         self.messages.append(message)
+        self.ports.setdefault(port, []).append(message)
 
 
 @unittest.skipUnless(HAVE_GPU, "needs a GPU, CuPy and Holoscan")
@@ -202,6 +205,109 @@ class GpuTest(unittest.TestCase):
         values = cp.asarray(expected(np.arange(200)))
         self.assertEqual(self.aggregate(series_width=20)._aggregate(9, {0: values}).shape, (10, 20))
         self.assertEqual(self.aggregate(series_width=30)._aggregate(9, {0: values}).shape, (1, 200))
+
+    def stem(self, scan):
+        op = StemOp(Application(), name="stem", device=0, scan=scan)
+        op.initialize()
+        return op
+
+    def stem_out(self, scan, items):
+        """(frames or None, index) that StemOp emits for ``items``."""
+        out = Out()
+        self.stem(scan).compute(In(items), out, None)
+        (index,) = out.ports["index"]
+        frames = out.ports.get("frames", [None])
+        self.assertEqual(len(frames), 1)  # one message per port and tick
+        return frames[0], index
+
+    def test_stem_tensors_and_positions(self):
+        series = Series(5)
+        ids = np.concatenate([np.arange(0, 100), np.arange(120, 170)])  # 20 images lost
+        frames, index = self.stem_out(ScanShape(20, 10), [
+            Start(series), self.batch(series, ids[:100], reduce=False),
+            self.batch(series, ids[100:], reduce=False), End(series, 170)])
+        self.assertEqual(index, [Start(series), Segment(series, 0, 100),
+                                 Segment(series, 100, 150), End(series, 170)])
+        diffraction = frames["diffraction"]
+        self.assertEqual((diffraction.shape, diffraction.dtype), ((150, 96, 96), cp.uint16))
+        np.testing.assert_array_equal(diffraction[:, 5, 7].get(), ids + 1)  # image i is i + 1
+        np.testing.assert_array_equal(frames["ids"].get(), ids)
+        self.assertEqual(frames["positions"].dtype, cp.int32)
+        np.testing.assert_array_equal(frames["positions"].get(), np.stack(divmod(ids, 20), 1))
+
+    def test_stem_leaves_out_images_beyond_the_scan(self):
+        series = Series(6)
+        frames, index = self.stem_out(ScanShape(10, 10), [
+            self.batch(series, np.arange(50, 150), reduce=False)])
+        self.assertEqual(index, [Segment(series, 0, 50)])
+        np.testing.assert_array_equal(frames["ids"].get(), np.arange(50, 100))
+        np.testing.assert_array_equal(frames["diffraction"][:, 0, 0].get(), np.arange(51, 101))
+        frames, index = self.stem_out(ScanShape(10, 10), [
+            self.batch(series, np.arange(100, 120), reduce=False), End(series, 120)])
+        self.assertIsNone(frames)  # nothing inside the scan: only the index
+        self.assertEqual(index, [End(series, 120)])
+
+    def test_stem_needs_the_images(self):
+        with self.assertRaisesRegex(RuntimeError, "reduce=False"):
+            self.stem_out(ScanShape(10, 10), [self.batch(Series(1), np.arange(10))])
+
+    def detector(self, scan):
+        op = VirtualDetectorOp(Application(), name="detector", device=0, scan=scan)
+        op.initialize()
+        return op
+
+    def through(self, scan, items, detector=None):
+        """``items`` through a StemOp into a VirtualDetectorOp; returns the detector."""
+        frames, index = self.stem_out(scan, items)
+        detector = detector or self.detector(scan)
+        detector.compute(In({"frames": frames, "index": index}), Out(), None)
+        return detector
+
+    def bright_field(self, detector, ids):
+        """BF value of images ``ids``: every pixel of image i is i + 1."""
+        disc = int(detector.masks[:, 0].sum())
+        return (np.asarray(ids, dtype=np.float64) + 1) * disc
+
+    def test_virtual_detector_places_values_by_scan_position(self):
+        scan, series = ScanShape(20, 10), Series(7)
+        ids = np.concatenate([np.arange(0, 60), np.arange(80, 200)])  # 20 images lost
+        detector = self.through(scan, [Start(series),
+                                       self.batch(series, ids, reduce=False),
+                                       End(series, 200)])
+        series_id, image = detector.last
+        self.assertEqual((series_id, image.shape), (7, (2, 10, 20)))
+        want = np.zeros(200)
+        want[ids] = self.bright_field(detector, ids)
+        np.testing.assert_allclose(image[0].get().ravel(), want)
+        ring = int(detector.masks[:, 1].sum())
+        np.testing.assert_allclose(image[1, 9, 19].get(), 200 * ring)  # ADF of image 199
+
+    def test_virtual_detector_two_series_in_one_tick(self):
+        scan, first, second = ScanShape(10, 10), Series(1), Series(2)
+        finished = []
+        detector = self.detector(scan)
+        finish = detector._finish
+        detector._finish = lambda end: (finish(end), finished.append(detector.last))
+        self.through(scan, [Start(first), self.batch(first, np.arange(0, 30), reduce=False),
+                            End(first, 30), Start(second),
+                            self.batch(second, np.arange(0, 5), reduce=False), End(second, 5)],
+                     detector)
+        self.assertEqual([series_id for series_id, _ in finished], [1, 2])
+        np.testing.assert_allclose(finished[0][1][0, 2, :].get(),
+                                   self.bright_field(detector, np.arange(20, 30)))
+        np.testing.assert_allclose(finished[1][1][0, 0, :5].get(),
+                                   self.bright_field(detector, np.arange(5)))
+        self.assertEqual(float(finished[1][1][0, 0, 5:].sum().get()), 0.0)
+
+    def test_virtual_detector_series_over_several_ticks(self):
+        scan, series = ScanShape(10, 10), Series(3)
+        detector = self.through(scan, [Start(series),
+                                       self.batch(series, np.arange(0, 40), reduce=False)])
+        self.assertIsNone(detector.last)
+        self.through(scan, [self.batch(series, np.arange(40, 100), reduce=False),
+                            End(series, 100)], detector)
+        np.testing.assert_allclose(detector.last[1][0].get().ravel(),
+                                   self.bright_field(detector, np.arange(100)))
 
 
 if __name__ == "__main__":

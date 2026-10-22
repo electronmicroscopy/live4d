@@ -20,7 +20,17 @@ emission is a list, in arrival order, of:
 - ``End(series, images)``: the series is over, with the number of images received.
 
 A custom worker is a Holoscan ``Operator`` with an input that receives these lists, connected with
-``app.add_flow(rx, worker, {(f"output{path.index}", "input")})``. ``run(app, seconds, threads)`` and
+``app.add_flow(rx, worker, {(f"output{path.index}", "input")})``.
+
+For 4D-STEM, put a ``StemOp(app, device=path.device, scan=ScanShape(width, height))`` after the
+``RdmaRxOp`` (``reduce=False``). For each list it emits a tensor map on ``frames``:
+``diffraction`` (k, 96, 96) uint16, ``positions`` (k, 2) int32 ``[row, column]`` in the raster
+scan and ``ids`` (k,) int64, on the ring's GPU and complete (readable on any stream, e.g. with
+``torch.from_dlpack``), and on ``index`` the list of ``Start``, ``Segment`` (rows of ``frames`` of
+one series) and ``End`` in arrival order. ``frames`` is only emitted when there are images, so a
+consumer's ``frames`` input takes ``.condition(ConditionType.NONE)`` and its ticks follow
+``index``.
+ ``run(app, seconds, threads)`` and
 ``watch_liveness(app, link)`` are the scheduler and stop-on-disconnect helpers.
 examples/pipeline/app.py (the receiver) is a complete app built this way.
 """
@@ -32,12 +42,13 @@ __version__ = "0.1.0"
 # public name -> submodule that defines it
 _EXPORTS = {
     # operators
-    "RdmaRxOp": "operators", "RingPath": "operators",
+    "RdmaRxOp": "operators", "RingPath": "operators", "StemOp": "operators",
     # setup and running
     "VerbsConn": "connection", "run": "connection", "watch_liveness": "connection",
     # what the operators pass along a series
     "Series": "messages", "Start": "messages", "Batch": "messages", "End": "messages",
     "IMAGE_SHAPE": "messages", "IMAGE_BYTES": "messages",
+    "ScanShape": "messages", "Segment": "messages", "scan_positions": "messages",
     # wire protocol and connection
     "FrameReader": "imagemux", "FrameHeader": "imagemux", "FrameKind": "imagemux",
     "CreditTracker": "imagemux", "TcpConnector": "imagemux", "ImagemuxCodec": "imagemux",

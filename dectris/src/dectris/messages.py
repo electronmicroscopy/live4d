@@ -1,5 +1,5 @@
 """Image geometry and the messages passed along a series of the imagemux bstream output
-(start, images, end), plus parsing of the CBOR start message.
+(start, images, end), plus parsing of the CBOR start message and the scan geometry of 4D-STEM.
 
 No holoscan / cupy imports.
 """
@@ -69,6 +69,49 @@ class End:
 
     series: Series
     images: int
+
+
+# ---------------------------------------------------------------------------------------------
+# Scan
+#
+# A 4D-STEM scan is a raster of ``height`` rows of ``width`` probe positions; image id ``i`` of a
+# series is at row ``i // width``, column ``i % width``. The shape is configured, not announced by
+# the sender. Images beyond ``width * height`` have no position.
+# ---------------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ScanShape:
+    width: int
+    height: int
+
+    def __post_init__(self):
+        for name in ("width", "height"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"scan {name} must be a positive integer, not {value!r}")
+
+    @property
+    def size(self) -> int:
+        return self.width * self.height
+
+
+def scan_positions(ids, scan: ScanShape):
+    """``(positions, valid)`` of the image ids ``ids``: ``valid`` (bool, like ``ids``) marks the ids
+    inside the scan, ``positions`` the (n, 2) int32 ``[row, column]`` of those, in order."""
+    ids = np.asarray(ids, dtype=np.int64)
+    valid = (ids >= 0) & (ids < scan.size)
+    rows, cols = np.divmod(ids[valid], scan.width)
+    return np.stack([rows, cols], axis=1).astype(np.int32), valid
+
+
+@dataclass(frozen=True)
+class Segment:
+    """Rows ``start:stop`` of the tensors that ``StemOp`` emitted on ``frames`` in the same tick:
+    images of ``series``, in arrival order."""
+
+    series: Series
+    start: int
+    stop: int
 
 
 def parse_start(data) -> Series:

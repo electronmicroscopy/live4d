@@ -1,10 +1,12 @@
 """Holoscan source operator RdmaRxOp: receives imagemux's frames from the ring(s) and emits them
-as Start / Batch / End lists per ring. The operators that consume them belong to the app, e.g.
-WorkerOp and AggregateOp in examples/pipeline/operators.py.
+as Start / Batch / End lists per ring, and StemOp, which turns those of one ring into 4D-STEM
+tensors with scan positions. The operators that consume them belong to the app, e.g.
+WorkerOp, AggregateOp and VirtualDetectorOp in examples/pipeline/operators.py.
 """
 
 import time
 
+import cupy as cp
 import numpy as np
 from holoscan.core import Operator, OperatorSpec
 
@@ -12,7 +14,8 @@ from .dispatch import (DeviceRing, Dispatcher, flush_gpudirect_writes, ring_loca
                       set_sync_memops)
 from .imagemux import (Compression, CreditTracker, DataType, Frame, FrameKind, FrameReader,
                       RemoteRegion)
-from .messages import IMAGE_BYTES, IMAGE_SHAPE, Batch, End, Start, parse_start
+from .messages import (IMAGE_BYTES, IMAGE_SHAPE, Batch, End, ScanShape, Segment, Start,
+                       parse_start, scan_positions)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -309,3 +312,87 @@ class RdmaRxOp(Operator):
             if items:
                 op_output.emit(items, f"output{index}")
         return k
+
+
+# ---------------------------------------------------------------------------------------------
+# StemOp
+#
+# 4D-STEM tensors: the images of one ring with their scan positions, one emission per batch.
+# ---------------------------------------------------------------------------------------------
+
+class StemOp(Operator):
+    """Consumes the lists of ``Start``, ``Batch`` and ``End`` items of one ring (an ``RdmaRxOp``
+    with ``reduce=False``) on that ring's GPU ``device`` and emits, for each list, one tensor map
+    on ``frames`` and the order of things on ``index``.
+
+    ``frames`` (only if there are images): ``diffraction`` (k, 96, 96) uint16, ``positions``
+    (k, 2) int32 ``[row, column]`` in the raster ``scan``, and ``ids`` (k,) int64 image ids, all
+    CuPy arrays on ``device``. They are complete when emitted, so they can be read on any stream
+    (and handed to e.g. PyTorch with DLPack). Images outside the scan are left out.
+
+    ``index`` (always): a list in arrival order of ``Start``, ``Segment`` (rows of ``frames`` that
+    are images of one series) and ``End``. A port carries one message per tick, so this is how a
+    consumer tells the series in one ``frames`` apart and orders them with their start and end.
+    """
+
+    def __init__(self, fragment, *args, device: int, scan: ScanShape, **kwargs):
+        self.device = cp.cuda.Device(device)
+        self.scan = scan
+        self.warned = None  # series that was told about images outside the scan
+        super().__init__(fragment, *args, **kwargs)
+
+    def setup(self, spec: OperatorSpec):
+        spec.input("input")
+        spec.output("frames")
+        spec.output("index")
+
+    def initialize(self):
+        super().initialize()
+        with self.device:
+            self.stream = cp.cuda.Stream(non_blocking=True)
+
+    def _positioned(self, batch: Batch):
+        """(images, positions, ids) of the images of ``batch`` that are inside the scan."""
+        if batch.images is None:
+            raise RuntimeError("StemOp needs the images: an RdmaRxOp with reduce=False "
+                               "(receiver.keep_images: true)")
+        self.stream.wait_event(batch.ready)  # the images are copied on the dispatcher's stream
+        ids = np.asarray(batch.ids, dtype=np.int64)
+        positions, valid = scan_positions(ids, self.scan)
+        images = batch.images
+        if not valid.all():
+            if self.warned != batch.series.id:
+                self.warned = batch.series.id
+                print(f"series {batch.series.id}: images beyond the {self.scan.width}x"
+                      f"{self.scan.height} scan are left out (first id {ids[~valid][0]})",
+                      flush=True)
+            images = images[cp.asarray(np.flatnonzero(valid))]
+            ids = ids[valid]
+        return images, positions, ids
+
+    def compute(self, op_input, op_output, context):
+        index, images, positions, ids = [], [], [], []
+        rows = 0
+        with self.device, self.stream:
+            for item in op_input.receive("input"):
+                if not isinstance(item, Batch):
+                    index.append(item)
+                    continue
+                batch_images, batch_positions, batch_ids = self._positioned(item)
+                if not len(batch_ids):
+                    continue
+                index.append(Segment(item.series, rows, rows + len(batch_ids)))
+                rows += len(batch_ids)
+                images.append(batch_images)
+                positions.append(batch_positions)
+                ids.append(batch_ids)
+            if rows:
+                frames = {
+                    "diffraction": images[0] if len(images) == 1 else cp.concatenate(images),
+                    "positions": cp.asarray(np.concatenate(positions)),
+                    "ids": cp.asarray(np.concatenate(ids)),
+                }
+                # Complete before it leaves: consumers may read it on any stream.
+                self.stream.synchronize()
+                op_output.emit(frames, "frames")
+        op_output.emit(index, "index")

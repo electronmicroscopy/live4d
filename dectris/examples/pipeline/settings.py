@@ -21,8 +21,9 @@ DEFAULTS = {
         "keep_images": False,  # copy the images to GPU memory; False reduces them to pixel sums from the ring
         "max_batch": 512,  # most completions (frames) taken from the receive queue per poll
     },
-    "aggregate": {  # AggregateOp
-        "series_width": 0,  # images per series row; 0 = a single row
+    "scan": {  # 4D-STEM raster scan: image id i is at row i // width, column i % width
+        "width": 1000,  # probe positions per row; also the row width of the sums path
+        "height": 1000,  # rows
     },
 }
 
@@ -44,4 +45,7 @@ def resolve(sections: dict) -> dict:
         if missing:
             raise ValueError(f"'{name}' needs: {', '.join(missing)}")
         settings[name] = merged
+    for key, value in settings["scan"].items():
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"'scan.{key}' must be a positive integer, not {value!r}")
     return settings
