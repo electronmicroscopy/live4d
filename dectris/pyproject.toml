@@ -1,0 +1,25 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.10,<3"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "imx-receiver"
+version = "0.1.0"
+description = "Holoscan receiver for imagemux's RDMA transport (RoCE, GPUDirect), on plain libibverbs"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy", "cbor2"]
+
+[project.optional-dependencies]
+# The standalone Holoscan application needs these runtime packages in addition to the SDK.
+cuda12 = ["cupy-cuda12x", "PyYAML"]
+cuda13 = ["cupy-cuda13x", "PyYAML"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.source-dir = "native"
+cmake.define.IMXRX_BUILD_TESTS = "OFF"
+wheel.packages = ["src/dectris"]
+build-dir = "build/{wheel_tag}"
+# The wheel needs the system's libibverbs and its providers (rdma-core) at run time; it does
+# not bundle them.

@@ -1,0 +1,72 @@
+"""Defaults and validation of the pipeline example's YAML settings (no holoscan)."""
+
+import os
+import sys
+import unittest
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples",
+                             "pipeline"))
+
+from settings import DEFAULTS, resolve  # noqa: E402
+
+CONNECTION = {"remote_address": "10.0.0.1:31003", "local_address": "10.0.0.2"}
+
+
+class ResolveTest(unittest.TestCase):
+    def test_defaults(self):
+        s = resolve({"connection": CONNECTION})
+        self.assertEqual(s["connection"]["ring_mib"], 64)
+        self.assertEqual(s["connection"]["ring_gpu"], 0)
+        self.assertEqual(s["connection"]["ring_memory"], "gpu")
+        self.assertEqual(s["execute"], {"seconds": 10.0, "threads": 3})
+        self.assertEqual(s["receiver"], {"receive_only": False, "max_batch": 512})
+        self.assertEqual(s["scan"], {"width": 1000, "height": 1000})
+
+    def test_scan(self):
+        s = resolve({"connection": CONNECTION, "scan": {"width": 256}})
+        self.assertEqual(s["scan"], {"width": 256, "height": 1000})
+        for bad in (0, -1, 1.5, "256", True):
+            with self.assertRaisesRegex(ValueError, "scan.height"):
+                resolve({"connection": CONNECTION, "scan": {"height": bad}})
+
+    def test_override(self):
+        s = resolve({"connection": CONNECTION, "receiver": {"receive_only": True}})
+        self.assertTrue(s["receiver"]["receive_only"])
+        self.assertEqual(s["receiver"]["max_batch"], 512)
+
+    def test_ring_memory(self):
+        for value in ("gpu", "host_mapped"):
+            with self.subTest(value=value):
+                s = resolve({"connection": {**CONNECTION, "ring_memory": value}})
+                self.assertEqual(s["connection"]["ring_memory"], value)
+        for value in ("host", "GPU", "", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                        ValueError, "connection.ring_memory must be 'gpu' or 'host_mapped'"):
+                    resolve({"connection": {**CONNECTION, "ring_memory": value}})
+
+    def test_required(self):
+        with self.assertRaisesRegex(ValueError, "local_address"):
+            resolve({"connection": {"remote_address": "a:1"}})
+        with self.assertRaisesRegex(ValueError, "remote_address"):
+            resolve({})
+
+    def test_unknown(self):
+        with self.assertRaisesRegex(ValueError, "section"):
+            resolve({"connection": CONNECTION, "bogus": {}})
+        with self.assertRaisesRegex(ValueError, "gpuu"):
+            resolve({"connection": {**CONNECTION, "gpuu": 1}})
+
+    def test_shipped_yaml_keys_are_known(self):
+        import yaml
+        path = os.path.join(os.path.dirname(__file__), "..", "examples", "pipeline",
+                            "pipeline.yaml")
+        shipped = yaml.safe_load(open(path))
+        self.assertEqual(set(shipped), set(DEFAULTS))
+        resolve(shipped)
+        for name, keys in shipped.items():
+            self.assertLessEqual(set(keys), set(DEFAULTS[name]))
+
+
+if __name__ == "__main__":
+    unittest.main()
