@@ -1,7 +1,7 @@
 """Configuration tests for transport selection and independent batch settings."""
 from pathlib import Path
 import pytest
-from dectris_holoscan.config import PipelineConfig, load_config
+from live4d.config import PipelineConfig, load_config
 
 
 def test_defaults_and_transport_batch_settings():

@@ -1,4 +1,4 @@
-# DECTRIS Holoscan pipeline
+# Live4D Holoscan pipeline
 
 One Holoscan SDK 5 application accepts either BSLZ4-compressed ZMQ input or uncompressed
 imagemux RDMA input. Both routes support 96×96 uint16 images and feed the same raster scan
@@ -9,6 +9,27 @@ ZMQ → pinned compressed batches → GPU BSLZ4 decode ─┐
                                                  ├→ DecodedBatch → scan positions → BF/ADF
 RDMA → registered ingress ring → GPU tensor loan ─┘
 ```
+
+## Project structure and algorithms
+
+`live4d` is the application package under `holoscan_pipeline/python/`. It uses the reusable
+`dectris` transport package and separates numerical algorithms from Holoscan scheduling.
+
+| Source | Responsibility |
+| --- | --- |
+| `holoscan_pipeline/python/live4d/app.py` | Graph construction, transport selection, CLI, and application lifetime |
+| `holoscan_pipeline/python/live4d/config.py` | Shared configuration and validation |
+| `holoscan_pipeline/python/live4d/algorithms/virtual_detectors.py` | CuPy BF/ADF masks and per-frame integration |
+| `holoscan_pipeline/python/live4d/processing.py` | Scan placement and Holoscan processing operators, including CUDA synchronization and tensor lifetime |
+| `holoscan_pipeline/python/live4d/operators.py` | Python access to registered native ingest operators |
+| `holoscan_pipeline/cpp/` | ZMQ reception, GPU decompression, RDMA gathering, and bounded publication |
+| `holoscan_pipeline/schemas/` | Typed batch messages; CMake generates their Python and C++ bindings |
+| `dectris/` | Imagemux protocol, TCP handshake, native verbs backend, and registered-ring ownership |
+
+Add analysis methods such as ptychography or strain mapping under `live4d.algorithms` as
+they are implemented. Algorithm modules accept diffraction frames and their numerical
+parameters without importing Holoscan. Processing operators supply scan information,
+schedule streaming or accumulated work, and manage GPU buffer lifetime.
 
 ## Build and run
 
@@ -21,7 +42,7 @@ docker build -f docker/Dockerfile.holoscan \
 ```
 
 The image includes Holoscan SDK 5.0.0, CUDA 13, nvCOMP, ZMQ, CuPy, and the reusable
-`imx-receiver` native verbs package. Its entry point is `python3 -m dectris_holoscan`.
+`imx-receiver` native verbs package. Its entry point is `python3 -m live4d`.
 
 Copy either `holoscan_pipeline/config/basic_ingest.yaml` or
 `holoscan_pipeline/config/rdma.yaml` to `pipeline.yaml` and edit the transport settings.
@@ -135,6 +156,6 @@ recorded sender image counts, source acquisition duration, bstream drop deltas, 
 counters. NIC sampling measures transport traffic and includes protocol overhead; it is not
 a substitute for delivered image counts.
 
-For sample pixel validation, `python3 -m dectris_holoscan.validate` accepts an NPZ containing
+For sample pixel validation, `python3 -m live4d.validate` accepts an NPZ containing
 `ids` and CPU-reference `frames`, an expected image count, and a ZMQ endpoint. It exercises
 the same downstream processing and reports mismatched samples as failures.

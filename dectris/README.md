@@ -2,7 +2,7 @@
 
 `imx-receiver` provides the native libibverbs backend, imagemux wire protocol and TCP
 handshake, registered GPU or mapped-host rings, and GPU dispatch helpers. The shared
-[Holoscan pipeline](../docs/holoscan_basic_ingest.md) owns ZMQ/RDMA selection, runtime GPU
+[live4d application](../docs/holoscan_basic_ingest.md) owns ZMQ/RDMA selection, runtime GPU
 tensor allocation, raster placement, BF/ADF processing, configuration, and the container.
 
 ## Build the reusable wheel

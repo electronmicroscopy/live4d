@@ -3,7 +3,7 @@
 ``VerbsConn`` owns the native queue pair and a GPU or mapped-host ring.
 ``TcpConnector`` performs the imagemux handshake. Protocol and geometry modules
 can be imported without Holoscan or CuPy. The shared HSDK 5 application lives in
-``dectris_holoscan``; it owns graph construction and 4D-STEM processing.
+``live4d``; it owns graph construction and 4D-STEM processing.
 """
 
 import importlib

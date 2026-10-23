@@ -9,6 +9,7 @@ import holoscan as hs
 import numpy as np
 
 from dectris.messages import IMAGE_SHAPE, ScanShape, parse_start, scan_positions
+from .algorithms import virtual_detectors
 from .schemas.decoded_batch import DecodedBatch
 
 
@@ -97,20 +98,14 @@ class VirtualDetectorOp(hs.Operator):
         self.scan = ScanShape(self.scan_width, self.scan_height)
         self.series = self.image = None
         with self.device:
-            y, x = cp.mgrid[:96, :96].astype(cp.float32)
-            radius = cp.hypot(y - 47.5, x - 47.5)
-            self.masks = cp.stack([radius <= self.bf_radius,
-                                  (radius >= self.adf_inner) & (radius <= self.adf_outer)]
-                                 ).reshape(2, -1).T.astype(cp.float32)
+            self.masks = virtual_detectors.build_masks(
+                self.bf_radius, self.adf_inner, self.adf_outer)
             cp.cuda.get_current_stream().synchronize()
-
-    def _integrate(self, frames):
-        return frames.reshape(frames.shape[0], -1).astype(cp.float32) @ self.masks
 
     def _warm_up(self):
         # Run in the READY callback's thread and runtime CUDA stream, as image batches do.
         scratch = cp.ones((self.batch_size, *IMAGE_SHAPE), dtype=cp.uint16)
-        values = self._integrate(scratch)
+        values = virtual_detectors.integrate(scratch, self.masks)
         image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
         ids = np.arange(min(self.batch_size, self.scan.size), dtype=np.int64)
         positions = cp.asarray(np.stack(np.divmod(ids, self.scan.width), axis=1).astype(np.int32))
@@ -168,7 +163,7 @@ class VirtualDetectorOp(hs.Operator):
                     selected = positioned.selected
                     if len(selected) != count:
                         frames = frames[cp.asarray(selected)]
-                    values = self._integrate(frames)
+                    values = virtual_detectors.integrate(frames, self.masks)
                     positions = cp.asarray(positioned.positions)
                     self.image[:, positions[:, 0], positions[:, 1]] = values.T
                     self.placed += len(selected)

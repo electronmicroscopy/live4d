@@ -1,4 +1,4 @@
-"""DECTRIS transport selection and shared Holoscan 4D-STEM processing."""
+"""Live 4D-STEM acquisition and processing."""
 
 __all__ = ["PipelineApp", "PipelineConfig"]
 

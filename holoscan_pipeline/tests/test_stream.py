@@ -9,8 +9,31 @@ import numpy as np
 import pytest
 import zmq
 
-from dectris_holoscan.app import PipelineApp
-from dectris_holoscan.config import PipelineConfig
+from live4d.app import PipelineApp
+from live4d.config import PipelineConfig
+from live4d.algorithms.virtual_detectors import build_masks, integrate
+
+
+def test_virtual_detector_algorithms_match_independent_sums():
+    values = np.arange(3 * 96 * 96, dtype=np.uint32).reshape(3, 96, 96)
+    frames = ((values * 13 + values // 7) % 11).astype(np.uint16)
+    bf_radius, adf_inner, adf_outer = 16.0, 24.0, 48.0
+    masks = build_masks(bf_radius, adf_inner, adf_outer)
+    actual = cp.asnumpy(integrate(cp.asarray(frames), masks))
+
+    y, x = np.ogrid[:96, :96]
+    radius_squared = (y - 47.5) ** 2 + (x - 47.5) ** 2
+    bf_mask = radius_squared <= bf_radius ** 2
+    adf_mask = ((radius_squared >= adf_inner ** 2)
+                & (radius_squared <= adf_outer ** 2))
+    expected = np.stack([
+        frames[:, bf_mask].astype(np.uint64).sum(axis=1),
+        frames[:, adf_mask].astype(np.uint64).sum(axis=1),
+    ], axis=1).astype(np.float32)
+
+    assert masks.dtype == cp.float32
+    assert actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, expected)
 
 
 def start_message(series_id, count):

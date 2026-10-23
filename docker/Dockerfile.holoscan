@@ -22,5 +22,5 @@ RUN cmake -S holoscan_pipeline -B build/holoscan_pipeline -G Ninja \
       -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" \
     && cmake --build build/holoscan_pipeline --parallel 4
 ENV PYTHONPATH=/opt/dectris/stanford-dectris-nvidia-4d-stem/build/holoscan_pipeline/python:${PYTHONPATH}
-ENTRYPOINT ["python3", "-m", "dectris_holoscan"]
+ENTRYPOINT ["python3", "-m", "live4d"]
 CMD ["--config", "/opt/dectris/stanford-dectris-nvidia-4d-stem/holoscan_pipeline/config/basic_ingest.yaml"]

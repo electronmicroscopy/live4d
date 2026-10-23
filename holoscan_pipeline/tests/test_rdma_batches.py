@@ -56,7 +56,7 @@ class RingWriter:
 class BatchWindow:
     def __init__(self, capacity):
         import ctypes
-        from dectris_holoscan import operators
+        from live4d import operators
 
         library_path = Path(operators.__file__).with_name("libdectris_holoscan_ops.so")
         self.library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
@@ -238,8 +238,8 @@ def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
     import holoscan as hs
     import numpy as np
 
-    from dectris_holoscan.operators import RdmaRxOp
-    from dectris_holoscan.schemas.decoded_batch import DecodedBatch
+    from live4d.operators import RdmaRxOp
+    from live4d.schemas.decoded_batch import DecodedBatch
 
     records = []
     ready = threading.Event()
