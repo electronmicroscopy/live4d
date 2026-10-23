@@ -56,7 +56,7 @@ def image_message(image_id, value):
 
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
-               processing_delay=0, queue_depth=4):
+               processing_delay=0, queue_depth=4, defer_readback=False):
     observed, results, errors, starts = [], [], [], []
     context = zmq.Context()
     sender = context.socket(zmq.PUSH)
@@ -68,8 +68,12 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
         if batch.start_of_series:
             starts.append(bytes(batch.start_metadata))
         if len(batch.image_ids):
-            pixels = cp.asnumpy(positioned.images)
-            observed.append((int(batch.series_id), list(batch.image_ids), pixels))
+            if defer_readback:
+                pixels = cp.array(positioned.images, copy=True)
+                observed.append((int(batch.batch_id), int(batch.series_id), list(batch.image_ids), pixels))
+            else:
+                pixels = cp.asnumpy(positioned.images)
+                observed.append((int(batch.series_id), list(batch.image_ids), pixels))
             time.sleep(processing_delay)
         if batch.end_of_series:
             results.append(positioned.result)
@@ -102,6 +106,9 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
         assert not thread.is_alive()
         assert not errors, errors
         assert starts == [cbor2.dumps(cbor2.CBORTag(55799, start_message(sid, len(ids)))) for sid, ids in series]
+        if defer_readback:
+            observed[:] = [(batch_id, sid, ids, cp.asnumpy(pixels))
+                           for batch_id, sid, ids, pixels in observed]
     finally:
         stopping.set()
         thread.join(timeout=5)
@@ -134,6 +141,32 @@ def test_consecutive_empty_partial_series_and_scan_gaps():
     assert [result["positions"] for result in results] == [0, 3, 1]
     assert results[1]["bf_sum"] == 812 * (1 + 4 + 7)
     assert results[2]["adf_sum"] == 5428
+
+
+def test_deferred_readback_preserves_many_batches_and_totals():
+    count = 257
+    observed, results, _ = run_series(
+        [(8, list(range(count)))], batch_size=4, scan=(17, 16), queue_depth=2,
+        defer_readback=True)
+
+    assert len(observed) == 65
+    assert [len(ids) for _, _, ids, _ in observed] == [4] * 64 + [1]
+    batch_ids = [batch_id for batch_id, _, _, _ in observed]
+    assert all(current < following for current, following in zip(batch_ids, batch_ids[1:]))
+    assert [image_id for _, _, ids, _ in observed for image_id in ids] == list(range(count))
+    for _, sid, ids, pixels in observed:
+        assert sid == 8 and pixels.dtype == np.uint16
+        np.testing.assert_array_equal(
+            pixels, np.broadcast_to(np.array(ids)[:, None, None] + 1, pixels.shape))
+
+    result, = results
+    total = sum(range(1, count + 1))
+    assert result["images"] == count
+    assert result["positions"] == count
+    assert result["gap_events"] == 0 and result["missing_images"] == 0
+    assert result["batch_sizes"] == {4: 64, 1: 1}
+    assert result["bf_sum"] == 812 * total
+    assert result["adf_sum"] == 5428 * total
 
 
 def test_idle_sigterm(capsys):

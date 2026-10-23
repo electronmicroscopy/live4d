@@ -126,7 +126,12 @@ the configured scan are counted as received but omitted from BF/ADF placement. T
 output feeds both operators through typed inputs. The scan operator sends position metadata;
 the detector pairs it with the original batch using its event time and checks the batch ID.
 GPU tensors remain visible to runtime capacity and readiness tracking. CuPy views are created
-inside the typed detector callback, and CUDA work finishes before they are released.
+and consumed inside the typed detector callback's runtime stream scope. HSDK5 orders input
+readiness and release on that stream, so callbacks can return with GPU work pending while
+tensor storage remains protected from premature reuse. No separate owner queue is needed.
+See the SDK's [tensor ownership and stream contract](https://docs.nvidia.com/holoscan/sdk-user-guide/data-and-payloads/tensors-in-depth).
+Mask initialization and READY warm-up retain host waits. END copies totals to the CPU before
+publishing the result.
 BF/ADF values retain float32 processing. Reported totals use a
 float64 reduction of those stored values to avoid large-scan float32 reduction rounding.
 
@@ -149,10 +154,12 @@ readiness, credits, and shutdown. Protocol tests remain under `dectris/tests`; f
 probe tests currently reference the absent `tools.probe_imagemux` helper.
 
 At each completed series, `[series-result]` reports received/placed images, continuity gaps,
-batch sizes, BF/ADF totals, and delivered throughput. `delivered_fps` measures images between
-the first delivered batch and the last completed image batch, excluding the first batch
-from its numerator. It includes shared scan/BF/ADF processing. Compare it with separately
-recorded sender image counts, source acquisition duration, bstream drop deltas, and NIC
+batch sizes, BF/ADF totals, and delivered throughput. `delivered_fps` uses host timestamps at
+BF/ADF batch submission, from the first image batch to the last, excluding the first batch
+from its numerator. GPU work may still be queued at either timestamp, so this rate does not
+measure completed GPU processing throughput. Completed-series totals are copied to the CPU
+before reporting. Compare the rate with separately recorded sender image counts, source
+acquisition duration, bstream drop deltas, and NIC
 counters. NIC sampling measures transport traffic and includes protocol overhead; it is not
 a substitute for delivered image counts.
 

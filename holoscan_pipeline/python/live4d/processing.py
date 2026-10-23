@@ -65,7 +65,7 @@ class ScanTensorOp(hs.Operator):
 
 
 class VirtualDetectorOp(hs.Operator):
-    """Integrate float32 BF/ADF values while retaining each source tensor until CUDA finishes."""
+    """Integrate float32 BF/ADF values on the runtime-managed CUDA stream."""
     inp = hs.Input("input", DecodedBatch)
     positions = hs.Input("positions", hs.pyobject)
     device_id = hs.Param(0)
@@ -157,6 +157,7 @@ class VirtualDetectorOp(hs.Operator):
                 self.received += count
                 self.batches += 1
                 self.batch_sizes[count] = self.batch_sizes.get(count, 0) + 1
+                # The runtime orders input readiness and release on this activation's stream.
                 frames = cp.from_dlpack(batch.frames)[:count]
                 positioned.images = frames
                 if len(positioned.selected):
@@ -167,7 +168,7 @@ class VirtualDetectorOp(hs.Operator):
                     positions = cp.asarray(positioned.positions)
                     self.image[:, positions[:, 0], positions[:, 1]] = values.T
                     self.placed += len(selected)
-                stream.synchronize()
+                # Host timestamps measure batch submission, before GPU completion.
                 self.last_image = time.perf_counter()
                 if self.first is None:
                     self.first = self.last_image
@@ -177,7 +178,6 @@ class VirtualDetectorOp(hs.Operator):
             if batch.end_of_series:
                 # Preserve float32 processing and report a float64 aggregate of the stored values.
                 totals = cp.asnumpy(self.image.sum(axis=(1, 2), dtype=cp.float64)).tolist()
-                stream.synchronize()
                 elapsed = (self.last_image - self.first) if self.first is not None else 0.0
                 result = dict(series_id=int(batch.series_id), images=self.received,
                               announced_images=self.series.get("number_of_images"),
@@ -198,7 +198,5 @@ class VirtualDetectorOp(hs.Operator):
                 self.series = self.image = None
                 if self.finite:
                     ctx.request_completion()
-            if batch.start_of_series:
-                stream.synchronize()
             if self.release is not None:
                 self.release(int(batch.batch_id))
