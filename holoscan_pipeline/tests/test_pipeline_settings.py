@@ -10,6 +10,12 @@ def test_defaults_and_transport_batch_settings():
     assert config.execute["mode"] == "finite"
 
 
+def test_detector_radius_accepts_192_pixel_extent():
+    PipelineConfig(detector=dict(bf_radius=136, adf_inner=24, adf_outer=136))
+    with pytest.raises(ValueError):
+        PipelineConfig(detector=dict(bf_radius=137, adf_inner=24, adf_outer=136))
+
+
 @pytest.mark.parametrize("values", [dict(batch_size=0), dict(batch_size=1001), dict(batch_size=True),
     dict(queue_depth=17), dict(transport="udp"), dict(transport="rdma"),
     dict(rdma=dict(max_batch=0)), dict(rdma=dict(ring_memory="host")),

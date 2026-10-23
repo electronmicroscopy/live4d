@@ -39,6 +39,11 @@ class ParseStartTest(unittest.TestCase):
     def test_series(self):
         series = parse_start(start_message())
         self.assertEqual(series, Series(4, 1000))
+        self.assertEqual(series.shape, (96, 96))
+
+    def test_unbinned_series_shape(self):
+        self.assertEqual(parse_start(start_message(image_size_x=192, image_size_y=192)).shape,
+                         (192, 192))
 
     def test_announced_size_is_only_a_hint(self):
         self.assertEqual(parse_start(start_message(series_id=8, number_of_images=100)),
@@ -57,6 +62,8 @@ class ParseStartTest(unittest.TestCase):
     def test_rejects(self):
         for message in [
             start_message(image_size_x=128),
+            start_message(image_size_x=192, image_size_y=96),
+            start_message(image_size_x=192, image_size_y=192, image_dtype="uint32"),
             start_message(image_dtype="uint32"),
             cbor2.dumps({"type": "end", "series_id": 4}),
             cbor2.dumps({"type": "start"}),

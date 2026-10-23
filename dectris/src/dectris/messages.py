@@ -23,10 +23,9 @@ IMAGE_BYTES = IMAGE_SHAPE[0] * IMAGE_SHAPE[1] * np.dtype(IMAGE_DTYPE).itemsize  
 # Series of the imagemux bstream output: bookmarked by a start and an end frame.
 #
 # The start message (Stream2, CBOR) carries ``series_id``, ``image_size_x/y``, ``image_dtype`` and
-# ``number_of_images``. The series' shape is not known, and the number of images that actually
-# arrive between the start and the end frame is what counts, so a series is only described by its
-# id (and ``number_of_images`` as a size hint). Everything the pipeline passes along a series is
-# here: the marker that opens it, the images, and the marker that closes it.
+# ``number_of_images``. The image shape is fixed within each series. The number of images that
+# arrive between START and END is what counts; ``number_of_images`` is a size hint. The messages
+# below carry the series boundary markers and its images through the pipeline.
 #
 # Images are identified by their id within the series (it restarts at 0 with every series). Which
 # GPU an image is processed on is decided by the sender, which writes it into that GPU's ring.
@@ -37,6 +36,7 @@ class Series:
     id: int
     expected_images: int | None = None  # number_of_images of the start message; a hint only
     frame_time: float | None = None  # frame_time (s) of the start message: the announced rate
+    shape: tuple[int, int] = IMAGE_SHAPE
 
 
 @dataclass(frozen=True)
@@ -51,9 +51,8 @@ class Batch:
     """Consecutive images of one series from one ring, on the ring's GPU.
 
     ``ids`` are the (k,) host image ids within the series (they restart at 0 with every series),
-    ``images`` the (k, 96, 96) uint16 images. They are copied asynchronously: they are only
-    complete once the CUDA event ``ready`` has happened, so wait for it on the stream that reads
-    them.
+    ``images`` the (k, height, width) uint16 images described by ``series.shape``. The copy is
+    asynchronous: wait for the CUDA event ``ready`` on the stream that reads the images.
     """
 
     series: Series
@@ -124,15 +123,16 @@ def parse_start(data) -> Series:
         raise ValueError("not a start message")
     try:
         series_id = int(msg["series_id"])
-        shape = (int(msg["image_size_y"]), int(msg["image_size_x"]))
+        dimensions = (msg["image_size_y"], msg["image_size_x"])
         dtype = msg["image_dtype"]
     except KeyError as e:
         raise ValueError(f"start message has no {e.args[0]}") from e
-    if shape != IMAGE_SHAPE or dtype != IMAGE_DTYPE.__name__:
-        raise ValueError(f"series {series_id} has {shape[1]}x{shape[0]} {dtype} images, "
-                         f"expected {IMAGE_SHAPE[1]}x{IMAGE_SHAPE[0]} {IMAGE_DTYPE.__name__}")
+    if (any(not isinstance(value, int) or isinstance(value, bool) for value in dimensions)
+            or dimensions not in ((96, 96), (192, 192)) or dtype != IMAGE_DTYPE.__name__):
+        raise ValueError("Expected 96x96 or 192x192 uint16 images")
+    shape = dimensions
     expected = msg.get("number_of_images")
     frame_time = msg.get("frame_time")
     return Series(series_id, int(expected) if isinstance(expected, int) and expected > 0 else None,
                   float(frame_time) if isinstance(frame_time, (int, float)) and frame_time > 0
-                  else None)
+                  else None, shape=shape)

@@ -41,7 +41,7 @@ class PipelineConfig:
                 raise ValueError("scan dimensions must be positive int32 values")
         if self.execute["mode"] not in ("finite", "service") or self.execute["seconds"] < 0:
             raise ValueError("execute requires finite/service mode and nonnegative seconds")
-        if not 0 <= self.detector["bf_radius"] <= 68 or not 0 <= self.detector["adf_inner"] <= self.detector["adf_outer"] <= 68:
+        if not 0 <= self.detector["bf_radius"] <= 136 or not 0 <= self.detector["adf_inner"] <= self.detector["adf_outer"] <= 136:
             raise ValueError("Invalid BF/ADF radii")
         if not self.zmq["endpoint"]:
             raise ValueError("ZMQ endpoint must not be empty")

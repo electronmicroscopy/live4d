@@ -43,8 +43,10 @@ receiver requires matching ordered boundaries and rejects images outside a serie
     = multi-dim array (40) > typed array `<u2`/uint16 (69) > compression (56500, `bslz4`).
 - **`end`** -- `type='end'`.
 
-Live4D requires START fields `series_id`, `image_size_x=96`, `image_size_y=96`, and
-`image_dtype='uint16'`. `number_of_images` is announced metadata, not the scan shape;
+Live4D requires START fields `series_id`, `image_size_x`, `image_size_y`, and
+`image_dtype='uint16'`. Both dimensions must be 96 for 2×2-binned images or 192 for
+unbinned (1×1) images. START selects the dimensions for that series, and each IMAGE
+must match them. `number_of_images` is announced metadata, not the scan shape;
 configure scan width/height separately. START metadata is retained with a 16 KiB bound.
 The [stream tests](../../holoscan_pipeline/tests/test_stream.py) construct executable
 examples of the START/image envelopes, including an optional outer CBOR tag `55799`.
@@ -96,9 +98,10 @@ an unshuffle step after LZ4 decompression):
   `elem_size`.
 
 For the 96×96 uint16 test messages, the uncompressed size is 18,432 bytes, with an
-8,192-byte block size: two full blocks and a 2,048-byte remainder. Framing support in
-the Python parser should not be confused with arbitrary-geometry support in the GPU
-operators, which specialize for the current detector shape.
+8,192-byte block size: two full blocks and a 2,048-byte remainder. The 192×192 test
+messages contain 73,728 uncompressed bytes in nine full 8,192-byte blocks. Live4D's
+GPU operators support these two image sizes; the Python framing parser also serves
+as a reference for the earlier experiments.
 
 ### Historical GIL observation
 

@@ -41,7 +41,7 @@ class Dispatched:
     """What a dispatch launched. Nothing has necessarily finished: ``payload`` is only complete
     once ``event`` has happened (wait for it on the stream that reads it)."""
 
-    payload: Any  # (k, 96, 96) uint16 images
+    payload: Any  # (k, height, width) uint16 images
     ids: np.ndarray  # (k,) host image ids, in arrival order
     event: Any  # happened = the ring bytes the kernel reads are free
     keep: list  # host memory the kernel reads until then
@@ -49,8 +49,8 @@ class Dispatched:
 
 class Dispatcher:
     """Gets the images of one ring onto the ring's GPU: one kernel per batch, on its own stream,
-    copies them out of the ring into a (k, 96, 96) uint16 array. The ring is in pinned host memory
-    or in the memory of ``device``: a GPU only ever reads its own ring.
+    copies them out of the ring into a (k, height, width) uint16 array. The ring is in pinned
+    host memory or in the memory of ``device``: a GPU only ever reads its own ring.
     """
 
     def __init__(self, device: int):
@@ -60,31 +60,42 @@ class Dispatcher:
             # Load the module on this device now, not on the first (timed) batch.
             self.kernel = _KERNELS.get_function("dispatch_images")
 
-    def dispatch(self, addrs: np.ndarray, ids: np.ndarray) -> Dispatched:
-        """Launch the copy of the images at ``addrs`` (host array of ring addresses) with ids
-        ``ids`` (host array). Returns at once."""
+    def dispatch(self, addrs: np.ndarray, ids: np.ndarray, shape=IMAGE_SHAPE) -> Dispatched:
+        """Copy uint16 images at ring addresses ``addrs`` with host image IDs ``ids``.
+
+        ``shape`` is the series' (height, width), either (96, 96) or (192, 192).
+        Returns immediately; the returned event marks completion.
+        """
+        shape = tuple(shape)
+        if shape not in (IMAGE_SHAPE, (192, 192)):
+            raise ValueError("Expected 96x96 or 192x192 uint16 images")
+        image_bytes = shape[0] * shape[1] * np.dtype(np.uint16).itemsize
         k = len(addrs)
         keep = []
         with cp.cuda.Device(self.device), self.stream:
-            payload = cp.empty((k, *IMAGE_SHAPE), dtype=cp.uint16)
+            payload = cp.empty((k, *shape), dtype=cp.uint16)
             dst = np.uint64(payload.data.ptr) + np.arange(k, dtype=np.uint64) * np.uint64(
-                IMAGE_BYTES)
+                image_bytes)
             ptrs = _pointer_list(np.concatenate([addrs.astype(np.uint64), dst]))
             self.kernel((k,), (_THREADS,), (np.uint64(ptrs.ptr), np.int32(k),
-                                            np.int32(IMAGE_BYTES)))
+                                            np.int32(image_bytes)))
             keep.append(ptrs)
             event = cp.cuda.Event(block=False, disable_timing=True)
             event.record(self.stream)
         return Dispatched(payload, ids, event, keep)
 
-    def warm_up(self, k: int):
+    def warm_up(self, k: int, shape=IMAGE_SHAPE):
         """Dispatch ``k`` images from a scratch buffer and wait: the pinned pointer-list pool and
         the device memory pool grow to a full batch now, not on the first (timed) batches."""
+        shape = tuple(shape)
+        if shape not in (IMAGE_SHAPE, (192, 192)):
+            raise ValueError("Expected 96x96 or 192x192 uint16 images")
+        image_bytes = shape[0] * shape[1] * np.dtype(np.uint16).itemsize
         with cp.cuda.Device(self.device):
-            scratch = cp.zeros(k * IMAGE_BYTES, dtype=cp.uint8)
+            scratch = cp.zeros(k * image_bytes, dtype=cp.uint8)
             addrs = np.uint64(scratch.data.ptr) + np.arange(k, dtype=np.uint64) * np.uint64(
-                IMAGE_BYTES)
-            self.dispatch(addrs, np.arange(k, dtype=np.uint64)).event.synchronize()
+                image_bytes)
+            self.dispatch(addrs, np.arange(k, dtype=np.uint64), shape=shape).event.synchronize()
 
 
 def ring_location(addr: int):

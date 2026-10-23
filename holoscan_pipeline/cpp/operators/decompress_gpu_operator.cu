@@ -22,6 +22,7 @@
 
 #include "constants.h"
 #include "bitshuffle_kernel_gpu.cuh"
+#include "fast_cbor_parse.h"
 
 // Note: This operator uses the fast CBOR parser (10-50x faster than full parser).
 // The original full CBOR parser validation path has been removed.
@@ -275,7 +276,7 @@ void DecompressGpuOp::setup(OperatorSpec& spec) {
   spec.output(output, "output").produces_tensor(TensorOutputSpec{
       .representation = {.memory_kind = MemoryKind::kCudaDevice,
                          .dtype = DLDataType{kDLUInt, 16, 1}, .rank = 3U},
-      .bounds = tensor_bounds(BATCH_SIZE * DETECTOR_SIZE * sizeof(uint16_t)),
+      .bounds = tensor_bounds(BATCH_SIZE * MAX_DETECTOR_SIZE * sizeof(uint16_t)),
       .storage = TensorOutputStorage::kRuntimePool});
 }
 
@@ -289,8 +290,14 @@ void DecompressGpuOp::start() {
   publication_window_ = ::dectris::access(params().publication_window);
   input_window_ = ::dectris::access(params().input_window);
   last_capture_ns_ = -1;
-  const size_t uncompressed_size = DETECTOR_SIZE * sizeof(uint16_t);
-  max_compressed_size_per_image_ = 12 + uncompressed_size + uncompressed_size / 255 + 3 * (16 + 4);
+  active_width_ = DETECTOR_WIDTH;
+  active_height_ = DETECTOR_HEIGHT;
+  active_series_id_ = 0;
+  active_series_ = false;
+  const size_t uncompressed_size = MAX_DETECTOR_SIZE * sizeof(uint16_t);
+  const size_t max_blocks = (uncompressed_size + 8191) / 8192;
+  max_compressed_size_per_image_ = 12 + uncompressed_size + uncompressed_size / 255 +
+                                   max_blocks * (16 + 4);
   max_compressed_batch_size_ = max_compressed_size_per_image_ * BATCH_SIZE;
   allocate_gpu_resources();
 }
@@ -308,33 +315,62 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
     const size_t count = batch.image_ids.size();
     if (count > BATCH_SIZE || batch.sizes.size() != count || batch.offsets.size() != count)
       return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid compressed batch metadata"});
+    if (batch.start_of_series) {
+      dectris_start_metadata_t start_metadata{};
+      if (fast_extract_start_metadata(batch.start_metadata.data(), batch.start_metadata.size(),
+                                      &start_metadata) != 0 ||
+          start_metadata.series_id != batch.series_id)
+        return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid START image geometry"});
+      active_width_ = start_metadata.image_size_x;
+      active_height_ = start_metadata.image_size_y;
+      active_series_id_ = batch.series_id;
+      active_series_ = true;
+    } else if (!batch.pipeline_ready &&
+               (!active_series_ || batch.series_id != active_series_id_)) {
+      return make_unexpected(Error{ErrorCode::kProtocolError, "Image has no matching START"});
+    }
+    const size_t image_pixels = batch.pipeline_ready
+                                    ? static_cast<size_t>(DETECTOR_HEIGHT) * DETECTOR_WIDTH
+                                    : static_cast<size_t>(active_height_) * active_width_;
     const std::array<int64_t, 3> shape{static_cast<int64_t>(std::max(size_t{1}, count)),
-                                     DETECTOR_HEIGHT, DETECTOR_WIDTH};
+                                     static_cast<int64_t>(batch.pipeline_ready
+                                                              ? DETECTOR_HEIGHT : active_height_),
+                                     static_cast<int64_t>(batch.pipeline_ready
+                                                              ? DETECTOR_WIDTH : active_width_)};
     HOLOSCAN_TRY(auto loan, output.allocate_tensor(shape));
     stream_ = context.cuda_stream().get();  // Borrowed; Runtime owns this stream.
     HOLOSCAN_TRY(auto writer, loan.write(context.cuda_stream()));
     if (batch.pipeline_ready) {
-      // Literal LZ4 blocks of zeroed bitshuffled pixels exercise nvCOMP and CUDA before READY.
-      std::vector<uint8_t> image(12, 0);
-      for (size_t bytes : {size_t{8192}, size_t{8192}, size_t{2048}}) {
-        std::vector<uint8_t> block{0xf0};
-        size_t remaining = bytes - 15;
-        while (remaining >= 255) { block.push_back(255); remaining -= 255; }
-        block.push_back(static_cast<uint8_t>(remaining));
-        block.resize(block.size() + bytes, 0);
-        const auto n = static_cast<uint32_t>(block.size());
-        for (int shift : {24, 16, 8, 0}) image.push_back((n >> shift) & 255);
-        image.insert(image.end(), block.begin(), block.end());
-      }
-      std::vector<uint8_t> data;
-      data.reserve(image.size() * BATCH_SIZE);
-      for (size_t i = 0; i < BATCH_SIZE; ++i) data.insert(data.end(), image.begin(), image.end());
-      std::vector<const uint8_t*> pointers(BATCH_SIZE);
-      std::vector<size_t> sizes(BATCH_SIZE, image.size());
-      for (size_t i = 0; i < BATCH_SIZE; ++i) pointers[i] = data.data() + i * image.size();
-      DeviceAllocation scratch;
-      scratch.allocate(BATCH_SIZE * DETECTOR_SIZE * sizeof(uint16_t));
-      if (!decompress_batch_gpu(pointers, sizes, BATCH_SIZE, scratch.as<uint16_t>()))
+      auto warm_shape = [&](size_t height, size_t width) {
+        std::vector<uint8_t> image(12, 0);
+        size_t remaining_image = height * width * sizeof(uint16_t);
+        while (remaining_image > 0) {
+          const size_t bytes = std::min(size_t{8192}, remaining_image);
+          std::vector<uint8_t> block{0xf0};
+          size_t extension = bytes - 15;
+          while (extension >= 255) { block.push_back(255); extension -= 255; }
+          block.push_back(static_cast<uint8_t>(extension));
+          block.resize(block.size() + bytes, 0);
+          const auto n = static_cast<uint32_t>(block.size());
+          for (int shift : {24, 16, 8, 0}) image.push_back((n >> shift) & 255);
+          image.insert(image.end(), block.begin(), block.end());
+          remaining_image -= bytes;
+        }
+        std::vector<uint8_t> data;
+        data.reserve(image.size() * BATCH_SIZE);
+        for (size_t i = 0; i < BATCH_SIZE; ++i)
+          data.insert(data.end(), image.begin(), image.end());
+        std::vector<const uint8_t*> pointers(BATCH_SIZE);
+        std::vector<size_t> sizes(BATCH_SIZE, image.size());
+        for (size_t i = 0; i < BATCH_SIZE; ++i)
+          pointers[i] = data.data() + i * image.size();
+        DeviceAllocation scratch;
+        scratch.allocate(BATCH_SIZE * height * width * sizeof(uint16_t));
+        return decompress_batch_gpu(pointers, sizes, BATCH_SIZE, height * width,
+                                    scratch.as<uint16_t>());
+      };
+      if (!warm_shape(DETECTOR_HEIGHT, DETECTOR_WIDTH) ||
+          !warm_shape(MAX_DETECTOR_HEIGHT, MAX_DETECTOR_WIDTH))
         return make_unexpected(Error{ErrorCode::kFailure, "GPU decompression warm-up failed"});
     }
     if (count > 0) {
@@ -348,7 +384,7 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
         pointers[i] = data + batch.offsets[i];
         sizes[i] = batch.sizes[i];
       }
-      if (!decompress_batch_gpu(pointers, sizes, count, writer.data_as<uint16_t>()))
+      if (!decompress_batch_gpu(pointers, sizes, count, image_pixels, writer.data_as<uint16_t>()))
         return make_unexpected(Error{ErrorCode::kFailure, "GPU BSLZ4 decompression failed"});
     }
     HOLOSCAN_TRY(std::move(writer).commit());
@@ -370,6 +406,7 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
                                         EmitOptions{.capture_time = capture});
     if (!published) return make_unexpected(std::move(published).error());
     if (input_window_) input_window_->release(batch.batch_id);
+    if (batch.end_of_series) active_series_ = false;
     return {};
   } catch (const std::exception& error) {
     return make_unexpected(Error{ErrorCode::kFailure, error.what()});
@@ -403,7 +440,7 @@ void DecompressGpuOp::allocate_gpu_resources() {
   HOLOSCAN_LOG_INFO("    d_compressed_data_: {} MB", max_compressed_batch_size_ / (1024 * 1024));
 
   // Allocate device memory for intermediate (bitshuffled) data
-  size_t intermediate_size = BATCH_SIZE * DETECTOR_HEIGHT * DETECTOR_WIDTH * sizeof(uint16_t);
+  size_t intermediate_size = BATCH_SIZE * MAX_DETECTOR_HEIGHT * MAX_DETECTOR_WIDTH * sizeof(uint16_t);
   CUDA_CHECK(cudaMalloc(&d_intermediate_data_, intermediate_size));
   HOLOSCAN_LOG_INFO("    d_intermediate_data_: {} MB", intermediate_size / (1024 * 1024));
 
@@ -441,6 +478,7 @@ void DecompressGpuOp::free_gpu_resources() {
 bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& compressed_ptrs,
                                             const std::vector<size_t>& compressed_sizes,
                                             size_t num_images,
+                                            size_t image_pixels_per_frame,
                                             uint16_t* output_buffer) {
   nvtx3::scoped_range range("GPU Decompression Pipeline", nvtx3::rgb{0, 0, 255}); // Blue
 
@@ -519,7 +557,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
   // Step 3: GPU Header Parsing - Find Internal LZ4 Blocks
   // ============================================================================
 
-  size_t image_size = DETECTOR_HEIGHT * DETECTOR_WIDTH * sizeof(uint16_t);
+  size_t image_size = image_pixels_per_frame * sizeof(uint16_t);
 
   // Allocate temporary GPU arrays for header parsing results. RAII guards keep
   // all error paths and CUDA_CHECK exceptions from leaking device memory.

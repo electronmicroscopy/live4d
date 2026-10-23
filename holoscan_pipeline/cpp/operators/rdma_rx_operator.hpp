@@ -115,6 +115,9 @@ class RdmaRxOp final : public Operator<RdmaRxParams> {
   int device_{-1};
   size_t batch_size_{};
   size_t max_batch_{};
+  size_t active_image_bytes_{};
+  uint32_t active_width_{};
+  uint32_t active_height_{};
 
   uint64_t next_sequence_{};
   uint64_t reader_position_{};

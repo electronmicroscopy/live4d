@@ -10,8 +10,11 @@
 
 namespace holoscan::ops {
 namespace {
-constexpr size_t kImageBytes = dectris::kDetectorPixels * sizeof(uint16_t);
-constexpr size_t kMaxCompressedImage = 12 + kImageBytes + kImageBytes / 255 + 3 * (16 + 4);
+constexpr size_t kMaxImageBytes = dectris::kMaxDetectorPixels * sizeof(uint16_t);
+constexpr size_t kBslz4BlockBytes = 8192;
+constexpr size_t kMaxBslz4Blocks = (kMaxImageBytes + kBslz4BlockBytes - 1) / kBslz4BlockBytes;
+constexpr size_t kMaxCompressedImage =
+    12 + kMaxImageBytes + kMaxImageBytes / 255 + kMaxBslz4Blocks * (16 + 4);
 constexpr size_t kMaxCompressedBatch = kMaxCompressedImage * dectris::kMaxBatchSize;
 }
 ZmqRxOp::~ZmqRxOp() { cleanup_zmq(); }
@@ -35,6 +38,9 @@ Contract ZmqRxOp::contract() const {
 void ZmqRxOp::start() {
   publication_window_ = ::dectris::access(params().publication_window);
   ready_ = active_ = pending_end_ = false;
+  active_image_bytes_ = dectris::kDetectorPixels * sizeof(uint16_t);
+  active_width_ = static_cast<uint32_t>(dectris::kDetectorWidth);
+  active_height_ = static_cast<uint32_t>(dectris::kDetectorHeight);
   batch_id_ = 0;
   metadata_ = {};
   metadata_.image_ids.reserve(dectris::kMaxBatchSize);
@@ -78,8 +84,14 @@ expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
     const size_t bytes = zmq_msg_size(&msg_);
     const auto type = fast_detect_message_type(data, bytes);
     if (type == ZMQ_MSG_START) {
-      if (active_ || bytes > 16384 || fast_extract_series_id(data, bytes, &metadata_.series_id))
-        return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid START or missing END"});
+      dectris_start_metadata_t start_metadata{};
+      if (active_ || bytes > 16384 ||
+          fast_extract_start_metadata(data, bytes, &start_metadata) != 0)
+        return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid START image geometry"});
+      metadata_.series_id = start_metadata.series_id;
+      active_width_ = start_metadata.image_size_x;
+      active_height_ = start_metadata.image_size_y;
+      active_image_bytes_ = static_cast<size_t>(active_width_) * active_height_ * sizeof(uint16_t);
       active_ = true;
       series_images_ = 0;
       metadata_.start_metadata.assign(data, data + bytes);
@@ -100,12 +112,15 @@ expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
       return make_unexpected(Error{ErrorCode::kProtocolError, "Image has no matching START"});
     const uint8_t* compressed = nullptr;
     size_t size = 0, original_size = 0, elem_size = 0;
+    uint32_t image_width = 0, image_height = 0;
     uint64_t image_id = 0;
     if (fast_extract_compressed_bslz4(data, bytes, &compressed, &size,
-                                    &original_size, &elem_size, &image_id) != 0 ||
-        original_size != kImageBytes || elem_size != sizeof(uint16_t) ||
+                                    &original_size, &elem_size, &image_width, &image_height,
+                                    &image_id) != 0 ||
+        original_size != active_image_bytes_ || elem_size != sizeof(uint16_t) ||
+        image_width != active_width_ || image_height != active_height_ ||
         size > kMaxCompressedImage || size < 12)
-      return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid 96x96 uint16 BSLZ4 image"});
+      return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid BSLZ4 image"});
     metadata_.offsets.push_back(staging_.size());
     metadata_.sizes.push_back(size);
     metadata_.image_ids.push_back(image_id);

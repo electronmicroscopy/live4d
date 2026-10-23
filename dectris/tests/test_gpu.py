@@ -59,6 +59,16 @@ class GpuTest(unittest.TestCase):
         self.assertEqual(images.dtype, np.uint16)
         self.assert_images(images, ids)
 
+    def test_dispatch_copies_unbinned_images(self):
+        ids = np.arange(2, dtype=np.uint64)
+        values = cp.asarray(np.broadcast_to(
+            (ids + 9).astype(np.uint16)[:, None, None], (2, 192, 192)).copy())
+        addrs = np.uint64(values.data.ptr) + ids * np.uint64(192 * 192 * 2)
+        got_ids, images = self.copied(Dispatcher(0).dispatch(addrs, ids, shape=(192, 192)))
+        np.testing.assert_array_equal(got_ids, ids)
+        np.testing.assert_array_equal(images, np.broadcast_to(
+            (ids + 9).astype(np.uint16)[:, None, None], images.shape))
+
     def test_dispatch_does_not_wait_and_events_order_the_data(self):
         ids = np.arange(0, 512, dtype=np.uint64)
         dispatched = Dispatcher(0).dispatch(self.addrs(ids, self.pinned.ptr), ids)
