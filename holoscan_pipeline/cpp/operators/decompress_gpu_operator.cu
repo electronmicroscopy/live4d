@@ -737,17 +737,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
   }
 
   // ============================================================================
-  // Step 8: Synchronize Stream
-  // ============================================================================
-
-  {
-    nvtx3::scoped_range sync_range("Stream Synchronization", nvtx3::rgb{128, 128, 128}); // Gray
-
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
-  }
-
-  // ============================================================================
-  // Step 9: Verify nvcomp Decompression Status
+  // Step 8: Verify nvcomp Decompression Status
   // ============================================================================
 
   // OPTIMIZED: Make status verification async (optional for production)

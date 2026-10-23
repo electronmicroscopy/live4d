@@ -22,7 +22,7 @@ _library.dectris_batch_window_release.restype = None
 
 
 class _PublicationWindow:
-    """Keep native publications bounded until downstream GPU work finishes."""
+    """Bound native publications until the downstream callback releases each batch."""
 
     def __init__(self, capacity):
         self.handle = _library.dectris_batch_window_create(capacity)
