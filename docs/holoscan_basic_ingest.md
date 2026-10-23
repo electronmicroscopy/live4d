@@ -33,6 +33,11 @@ schedule streaming or accumulated work, and manage GPU buffer lifetime.
 
 ## Build and run
 
+The commands below use Bash on a Linux GPU host with Docker, NVIDIA GPU container access,
+and a driver compatible with the image's CUDA 13 runtime. RDMA also requires an active
+verbs/RoCE interface and working memory registration for the selected ring type. Installing
+the Python protocol package alone does not provide those host capabilities.
+
 Build from the repository root. Set the CUDA architecture for the target GPU (for example,
 `121` for DGX Spark or `89` for Ada):
 
@@ -50,6 +55,16 @@ The RDMA example uses documentation-only addresses; replace them with reachable 
 on the sender and receiver RoCE interfaces.
 
 ```bash
+# Choose one starting configuration:
+cp holoscan_pipeline/config/basic_ingest.yaml pipeline.yaml
+# For RDMA, use holoscan_pipeline/config/rdma.yaml instead.
+```
+
+For ZMQ, replace `tcp://127.0.0.1:5555` with the sender's Stream2 endpoint unless the sender
+actually runs on this host and port. For RDMA, start the sender's handshake service before
+launching the receiver, but wait for receiver readiness before triggering images.
+
+```bash
 docker run --rm --gpus all --network host \
   --ulimit memlock=-1:-1 --ulimit stack=33554432 \
   --device /dev/infiniband \
@@ -57,13 +72,35 @@ docker run --rm --gpus all --network host \
   dectris-holoscan:hsdk5 --config /etc/dectris.yaml
 ```
 
-For ZMQ, omit `--device /dev/infiniband` when the host has no verbs devices. Alternatively,
-`docker compose -f docker/compose.holoscan.yaml up --build` runs the supplied ZMQ configuration.
-The compose file grants verbs access so the same service can also run an RDMA configuration.
+For ZMQ, omit `--device /dev/infiniband` when the host has no verbs devices.
 
 Wait for `[holoscan] ready` before starting acquisition. This marker follows receiver
 initialization, GPU warm-up, and passage through the shared processing operators;
 return from `run_async` alone does not establish readiness.
+
+### Docker Compose alternative
+
+`docker compose -f docker/compose.holoscan.yaml up --build` uses the ZMQ YAML copied into
+the image. The supplied service sets CUDA architectures to `86;89`, requires
+`/dev/infiniband` even for ZMQ, and does not mount the root-level `pipeline.yaml` above.
+Before using Compose, edit its build architecture for your GPU, remove the `devices`
+entry on a host without verbs devices, and either edit the shipped YAML and rebuild or
+mount your configuration and change `command` to its container path. Selecting RDMA
+requires that configuration change; granting verbs access alone does not select it.
+
+### CLI overrides and development builds
+
+`--transport`, `--endpoint` (ZMQ only), `--batch-size`, `--queue-depth`, and `--device`
+override their YAML values. `--plan /path/plan.json` writes the compiled graph plan and
+then runs the application; it is not a dry run and RDMA still performs its handshake.
+Use a writable bind mount to retain a plan outside the container.
+
+The image runs the Python package, native library, and generated schema bindings from
+`build/holoscan_pipeline/python`. Mounting the repository at `/work` only changes the
+files under `/work`; it does not replace the installed application. Rebuild the image
+after source or schema edits before testing those changes. `python3 -m live4d` without
+`--config` uses the defaults in `live4d/config.py`; the image's default CMD supplies the
+shipped ZMQ YAML.
 
 ## Configuration and batching
 
@@ -93,10 +130,28 @@ Transport settings have separate meanings:
 | `zmq.endpoint` | Stream2 ZMQ PUSH endpoint consumed by the receiver's PULL socket |
 | `rdma.remote_address` | Sender's imagemux TCP handshake address, including port |
 | `rdma.local_address`, `rdma.device` | Receiver RoCE address and optional verbs device name |
+| `rdma.timeout` | TCP handshake timeout in seconds, positive; default 10 |
+
+Default downstream settings are 512 images/batch, queue depth 4, CUDA device 0, and a
+1000×1000 raster. Set the scan dimensions explicitly for each experiment: they are not
+inferred from acquisition metadata. The RDMA example selects `host_mapped`, while an
+omitted `rdma.ring_memory` defaults to `gpu`. An omitted `detector` section uses BF radius
+16 and ADF inner/outer radii 24/48.
+
+Detector radii are in detector pixels about `(47.5, 47.5)`. BF includes pixels at or inside
+its radius; ADF includes both annular boundaries. Radii must satisfy `0 <= bf_radius <= 68`
+and `0 <= adf_inner <= adf_outer <= 68`. Masks are built at startup; editing YAML while
+running does not change them.
 
 For simulator RDMA batching above one, select uncompressed output (`compression=none`),
 set bstream mode to `cbor-rdma`, and set `rdma_batch_size` explicitly after initialization.
 ZMQ input requires `bslz4`. This application does not configure the sender.
+
+One decoded frame occupies 18,432 bytes; a full default batch occupies 9 MiB. The two
+float32 scan maps use `8 * scan.width * scan.height` bytes, before temporary arrays,
+retained prior-series results, runtime tensors, and decoder scratch. The RDMA ring is
+additional storage. Increasing
+scan size, batch size, or queue depth therefore increases memory demand.
 
 ## Shared messages and GPU ownership
 
@@ -135,23 +190,49 @@ publishing the result.
 BF/ADF values retain float32 processing. Reported totals use a
 float64 reduction of those stored values to avoid large-scan float32 reduction rounding.
 
+Maps are cleared at START. Unacquired positions remain zero, so a zero alone does not
+distinguish missing data from measured zero intensity. `gap_events` reports discontinuities
+in the received ID sequence; `missing_images` counts forward skips, not an unreceived tail
+after the final ID. Compare `images` with the sender's count and `announced_images` as well.
+A successful END validates the receiver's internal count but does not require it to equal
+the announced count. Maps stay in GPU memory; the CLI reports totals, not image files.
+
 ## Validation and measurements
 
-Run focused tests in the built image, mounting the repository tests:
+### Configuration checks without GPU libraries
+
+From the repository root, in a Python 3.12+ environment:
+
+```bash
+python3 -m pip install pytest pyyaml
+PYTHONPATH=holoscan_pipeline/python python3 -m pytest -q \
+  holoscan_pipeline/tests/test_pipeline_settings.py
+```
+
+See the [transport package tests](../dectris/README.md#tests) for CPU protocol checks.
+
+### GPU and RDMA integration checks
+
+Rebuild the image from the source being tested, then mount the repository tests:
 
 ```bash
 docker run --rm --gpus all --network host --device /dev/infiniband \
   --ulimit memlock=-1:-1 -v "$PWD:/work:ro" \
   --entrypoint python3 dectris-holoscan:hsdk5 \
-  -m pytest -q -p no:cacheprovider /work/holoscan_pipeline/tests
+  -B -m pytest -q -p no:cacheprovider /work/holoscan_pipeline/tests
 ```
 
 RDMA loopback tests require `IMXRDMA_LOCAL_ADDR` set to an active receiver RoCE address and
 passed into the container with `-e IMXRDMA_LOCAL_ADDR`; also pass `-e RDMA_TEST_IN_IMAGE=1`
 to enable them in the HSDK image. Tests cover fixed batching, partial
 and empty acquisitions, consecutive series, pixel values, scan clipping, BF/ADF results,
-readiness, credits, and shutdown. Protocol tests remain under `dectris/tests`; five existing
-probe tests currently reference the absent `tools.probe_imagemux` helper.
+readiness, credits, and shutdown. For ZMQ-only checks, omit the verbs device argument;
+RDMA tests will skip without their two opt-in variables. The ZMQ tests generate their own
+messages and do not require a detector or reference dataset. A green run with skipped RDMA
+tests is not RDMA acceptance. These application tests require the built image and GPU;
+running the whole suite on a CPU-only host does not automatically skip every GPU import.
+
+### Interpreting results
 
 At each completed series, `[series-result]` reports received/placed images, continuity gaps,
 batch sizes, BF/ADF totals, and delivered throughput. `delivered_fps` uses host timestamps at
@@ -164,5 +245,39 @@ counters. NIC sampling measures transport traffic and includes protocol overhead
 a substitute for delivered image counts.
 
 For sample pixel validation, `python3 -m live4d.validate` accepts an NPZ containing
-`ids` and CPU-reference `frames`, an expected image count, and a ZMQ endpoint. It exercises
-the same downstream processing and reports mismatched samples as failures.
+`ids` (unique zero-based sample IDs, shape `(N,)`) and CPU-reference `frames` (uint16,
+shape `(N, 96, 96)`). `--expected-frames` is the total acquisition count, which may be larger
+than the number of reference samples. The validator is ZMQ-only and forces finite mode:
+
+```bash
+docker run --rm --gpus all --network host --ulimit memlock=-1:-1 \
+  -v "$PWD/pipeline.yaml:/etc/dectris.yaml:ro" \
+  -v "$PWD/reference.npz:/data/reference.npz:ro" \
+  --entrypoint python3 dectris-holoscan:hsdk5 \
+  -m live4d.validate --config /etc/dectris.yaml \
+  --reference /data/reference.npz --expected-frames 1000000
+```
+
+Use a ZMQ configuration and replace the count with your acquisition's count. Start the
+sender acquisition after `[holoscan] ready`. Exit status 0 requires the expected received
+count, no continuity gaps, all supplied samples seen and pixel-exact, and completed
+termination. It does not compare every pixel unless the reference includes every frame,
+or independently validate BF/ADF sums. `--report` can save its JSON to a writable mount.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| Docker cannot map `/dev/infiniband` | For ZMQ, remove the device argument or Compose device entry. For RDMA, verify host verbs devices first. |
+| RDMA fails before readiness | Verify the sender handshake service, remote host/port, receiver RoCE address/device, locked-memory limit, and ring registration support. `host_mapped` is an alternative when GPU registration is unavailable. |
+| Ready, but no series result | Confirm sender transport/compression and endpoint, trigger acquisition after readiness, and check that the sender emits END. `seconds: 0` allows an indefinite wait. |
+| Unsupported image or START error | Both routes require 96×96 uint16 metadata; ZMQ additionally requires BSLZ4. START metadata must fit within 16 KiB. |
+| Fewer placed images than received | Check `scan.width * scan.height` against image IDs; out-of-scan IDs are intentionally excluded from maps. |
+| Missing modules or old behavior after edits | Build the unified image again; source-only `PYTHONPATH` does not supply native operators or generated schemas. |
+
+When recording a benchmark, retain the Git revision, image identity, GPU/NIC and topology,
+sender version and settings, receiver YAML, run duration, count checks, and raw counters.
+Keep historical measurements tied to their tested revision: the tensor-retirement change
+in `4b4b12f` changed `delivered_fps` from per-batch GPU-completion timing to host-submission
+timing. Older and newer rates need that distinction when compared. Transport-only RDMA
+WRITE or NIC-loopback measurements do not establish Live4D processing capacity.

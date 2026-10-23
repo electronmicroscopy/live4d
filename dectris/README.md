@@ -14,10 +14,16 @@ python3 -m pip wheel --no-deps . -w dist
 python3 -m pip install dist/imx_receiver-*.whl
 ```
 
-Building requires Python 3.12 or later, CMake, a C/C++ compiler, and `libibverbs-dev`.
+Building on Linux requires Python 3.12 or later with development headers, CMake 3.18 or
+later, a C++20-capable C/C++ compiler, `pkg-config`, and `libibverbs-dev`.
 At runtime, install `libibverbs1` and `ibverbs-providers`; the wheel does not bundle them.
 Protocol modules need NumPy and cbor2. GPU ring and dispatch helpers additionally need a
 compatible CuPy installation. The unified CUDA 13 image installs these dependencies.
+
+The distribution is named `imx-receiver`, but its Python import is `dectris`.
+`dectris-compression`, used by the earlier Python experiments, is a separate distribution;
+it does not supply this package's RDMA backend. Building this wheel does not build the
+Live4D operators or generated schemas; use the unified container for the application.
 
 ## Components
 
@@ -64,8 +70,23 @@ for the supported 96×96 uint16 application.
 
 ## Tests
 
-`tests/test_imagemux.py` and `tests/test_messages.py` cover the protocol and geometry
-without a GPU. GPU utility tests
-are in `tests/test_gpu.py`; the shared application tests, including native RDMA loopback,
-are under `holoscan_pipeline/tests`. Five existing probe tests reference the absent
-`tools.probe_imagemux` helper and remain a separate pre-existing failure.
+From the repository root, protocol and geometry tests can run directly from source with
+NumPy, cbor2, and pytest, without building the native wheel or installing GPU libraries:
+
+```bash
+python3 -m pip install numpy cbor2 pytest
+PYTHONPATH=dectris/src python3 -m pytest -q \
+  dectris/tests/test_imagemux.py dectris/tests/test_messages.py -k 'not ProbeTest'
+```
+
+The explicit exclusion covers five `ProbeTest` cases importing the absent
+`tools.probe_imagemux` helper. The unfiltered protocol suite therefore has a known failure;
+this command validates the remaining protocol/geometry coverage only. Restore that helper
+or retire its tests in a separate code change rather than treating them as passing.
+
+`tests/test_gpu.py` requires CUDA and CuPy. `tests/test_imxrdma.py` exercises the native
+verbs backend and requires the built extension plus `IMXRDMA_LOCAL_ADDR` set to an active
+RoCE address; its GPU case also requires CUDA. Shared application tests, including RDMA
+batching loopback, are under `holoscan_pipeline/tests`; follow the
+[integration-test instructions](../docs/holoscan_basic_ingest.md#gpu-and-rdma-integration-checks)
+for their additional `RDMA_TEST_IN_IMAGE=1` opt-in.

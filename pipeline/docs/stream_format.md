@@ -1,17 +1,21 @@
-# DECTRIS Stream Decoding & Decompression
+# DECTRIS Stream2 ZMQ format and decoding reference
 
-Reference notes on how frames arrive from the DECTRIS DCU and how they are decoded
-and decompressed. Relevant to any real-time pipeline that consumes the stream.
+These notes describe the CBOR image envelope and compression framing used by the
+repository's ZMQ decoders. The current application already implements GPU BSLZ4 decoding;
+use the [Live4D guide](../../docs/holoscan_basic_ingest.md) for running it and for supported
+geometry. The broader tag support in the earlier Python decoder is not a promise that
+Live4D accepts every dtype, channel layout, or compression mode.
 
-Established by inspecting the installed `dectris-compression` package and its
-public source (`https://github.com/dectris/compression`).
+Imagemux RDMA uses a separate framing and credit protocol, described in the
+[transport package guide](../../dectris/README.md#protocol-and-flow-control).
 
 ## Transport
 
-- The stream listener (the live source; e.g. `ingest/pipeline.py`) connects a **ZMQ `PULL`**
+- The receiver connects a **ZMQ `PULL`**
   socket to the DCU (`tcp://<dcu_ip>:<zmq_port>`); the DCU is the `PUSH` side.
-- Each `socket.recv()` returns one CBOR-encoded message. `cbor2.loads(message, tag_hook=...)`
-  parses it **and** decompresses any image payload via the tag hook (tag `56500`).
+- Each receive yields one CBOR-encoded message. In the earlier CPU decoder,
+  `cbor2.loads(message, tag_hook=...)` parses it **and** decompresses the image through
+  tag `56500`. Live4D instead extracts compressed bytes in C++ and decompresses on the GPU.
 - Messages carry a `type` field (`image`, plus series-level start/end). **Frame messages
   carry a message/image id** -- use it for scan-position mapping rather than relying on
   arrival order (important once decode is parallelized and can reorder).
@@ -23,12 +27,13 @@ public source (`https://github.com/dectris/compression`).
 - Tag `56500` -- **DECTRIS compression**: value is `(algorithm, elem_size, encoded)`, decoded
   by calling `dectris.compression.decompress(encoded, algorithm, elem_size=elem_size)`.
 
-### Message schema (real QUADRO capture)
+### Message envelope
 
-From a 32x32 QUADRO capture (1 `start` + 1024 `image` + 1 `end`):
+An acquisition consists of START, zero or more IMAGE messages, and END. The current
+receiver requires matching ordered boundaries and rejects images outside a series.
 
 - **`start`** -- `type='start'` + series metadata: `series_id`, `series_unique_id`,
-  `image_size_x` / `image_size_y` (detector shape), `number_of_images`, `frame_time`,
+  `image_size_x` / `image_size_y` (detector shape), `image_dtype`, `number_of_images`, `frame_time`,
   `count_time`, `channels` (e.g. `('threshold_1',)`), `saturation_value`, ...
 - **`image`** -- `type='image'`, **`image_id`** (0-based, contiguous -> scan position),
   `series_id`, `real_time` / `start_time` / `stop_time`, and **`data`**.
@@ -38,35 +43,41 @@ From a 32x32 QUADRO capture (1 `start` + 1024 `image` + 1 `end`):
     = multi-dim array (40) > typed array `<u2`/uint16 (69) > compression (56500, `bslz4`).
 - **`end`** -- `type='end'`.
 
-### Two cbor2 decoding notes (both handled in `dectris_decode.py` / `pipeline.py`)
+Live4D requires START fields `series_id`, `image_size_x=96`, `image_size_y=96`, and
+`image_dtype='uint16'`. `number_of_images` is announced metadata, not the scan shape;
+configure scan width/height separately. START metadata is retained with a 16 KiB bound.
+The [stream tests](../../holoscan_pipeline/tests/test_stream.py) construct executable
+examples of the START/image envelopes, including an optional outer CBOR tag `55799`.
 
-1. **`tag_hook` signature changed in cbor2 >=6.** It calls `tag_hook(tag, immutable_flag)` --
-   the `CBORTag` is the **first** argument (older cbor2 used `(decoder, tag)`). `tag_hook`
-   locates the `CBORTag` among its args instead of assuming a position.
-2. **cbor2 returns an immutable `frozendict`, not `dict`.** `isinstance(x, dict)` is `False`
-   for decoded messages and for `data`. Use duck typing (`hasattr(x, 'get')` / `.values`) or
-   `collections.abc.Mapping`.
+### Python decoder compatibility
 
-## The compression library: `dectris-compression`
+The compatibility hook in [dectris_decode.py](../ingest/dectris_decode.py) locates a
+`CBORTag` among its arguments rather than assuming `(decoder, tag)` or
+`(tag, immutable_flag)`. Decoded mappings can be immutable; accept
+`collections.abc.Mapping` or the required mapping methods rather than assuming `dict`.
+These Python details do not describe Live4D's native fast CBOR parser.
 
-- Installed as a compiled CPython C-extension (no Python source); v0.3.1 here.
-- A **raw CPython C-API** binding (`python/dectris/compression.c`) over a C core
-  (`src/compression.c`), bundling **LZ4** and **bitshuffle** as submodules. LZ4-only build
-  (no zstd in this version).
-- Public API used by the pipeline: `decompress(buffer, algorithm, elem_size=...) -> bytes`.
+## Historical CPU library inspection
 
-### Supported algorithms (exactly two)
+The original notes inspected `dectris-compression` v0.3.1. That version's reported
+algorithm set and GIL behavior are historical observations, not a check of whichever
+version is installed today. The earlier CPU decoder calls
+`decompress(buffer, algorithm, elem_size=...) -> bytes`; the unified container does not
+depend on this library.
+
+### Algorithms described by those notes
 
 | Name     | Meaning                  | `elem_size` |
 |----------|--------------------------|-------------|
 | `lz4`    | plain LZ4 block stream   | not needed  |
 | `bslz4`  | **bitshuffle + LZ4**     | required    |
 
-ARINA frames use **`bslz4`**.
+Live4D's ZMQ route requires **`bslz4`**; plain `lz4` is not a supported Live4D input mode.
 
-### `bslz4` / `lz4` container layout (`src/compression.c`)
+### Compression container layout
 
-Simple, regular, and the same framing for both (bslz4 just adds an unshuffle step):
+The local [framing parser](../ingest/bslz4.py) describes the following layout (BSLZ4 adds
+an unshuffle step after LZ4 decompression):
 
 ```
 [ 12-byte header ]
@@ -79,14 +90,19 @@ Simple, regular, and the same framing for both (bslz4 just adds an unshuffle ste
     ...
 ```
 
-- Number of full blocks = `uncompressed_size / block_size`; a final short block holds the
+- Number of full blocks = `uncompressed_size // block_size`; a final short block holds the
   remainder.
 - Per block: LZ4-decompress, then (for `bslz4`) **bit-unshuffle** within the block using
-  `elem_size` (temp buffer sized `block_size * 2`).
+  `elem_size`.
 
-## GIL behavior -- decode threads scale
+For the 96×96 uint16 test messages, the uncompressed size is 18,432 bytes, with an
+8,192-byte block size: two full blocks and a 2,048-byte remainder. Framing support in
+the Python parser should not be confused with arbitrary-geometry support in the GPU
+operators, which specialize for the current detector shape.
 
-The binding releases the GIL around the decompress call:
+### Historical GIL observation
+
+The v0.3.1 binding inspection reported a GIL release around decompression:
 
 ```c
 Py_BEGIN_ALLOW_THREADS
@@ -94,30 +110,26 @@ n = compression_decompress_buffer(algorithm, ...);
 Py_END_ALLOW_THREADS
 ```
 
-**Implication:** a *thread* pool of decoders gives real CPU parallelism -- no need for a
-process pool (which would otherwise be forced by the GIL but would cost IPC to move frames).
-The remaining ceiling on a Python pipeline is per-frame **Python dispatch overhead**, not the
-decode work itself. ZMQ sockets are not thread-safe, so exactly one thread may own `recv()`;
-that thread should do nothing but `recv()` and hand raw bytes to decode workers.
+This motivated the earlier threaded CPU decoder. It does not establish decoder scaling
+or identify the bottleneck for another library version, detector, or machine. Measure
+those separately if reviving the experiment. Keep receive ownership on one thread.
 
-## GPU decompression is feasible (the path to full frame rate)
+## Implemented GPU decoding
 
-ARINA targets ~**30 kHz @ 192x192** (and ~**120 kHz @ 96x96 binned**) -- rates at which any
-per-frame Python work is infeasible and CPU decompression becomes a bottleneck. The `bslz4`
-format maps cleanly onto a GPU decode path:
+The former GPU feasibility proposal is implemented in Live4D:
 
-- The container is **N independent LZ4 blocks** -> maps directly onto **nvCOMP's batched
-  low-level LZ4 decompress** (arrays of input/output pointers + sizes).
-- **Bitshuffle unshuffle** is an embarrassingly-parallel bit-transpose -> a small CUDA kernel.
-- Flow: ship the *compressed* bytes to the GPU (small), parse block offsets, nvCOMP
-  batched-LZ4, then the unshuffle kernel -> frames live on the GPU and **the CPU never touches
-  a pixel**. A thin glue layer parses the DECTRIS block framing; no algorithmic blocker.
+- `ZmqRxOp` extracts and batches compressed image payloads into pinned storage.
+- `DecompressGpuOp` parses block metadata on the GPU, calls nvCOMP batched LZ4
+  decompression, and runs the CUDA bit-unshuffle kernel.
+- Runtime-owned GPU tensors feed the shared scan and BF/ADF processing operators.
 
-This is the natural home for an NVIDIA **Holoscan** operator and is what makes the full-rate
-target reachable.
+Use the [measurement guidance](../../docs/holoscan_basic_ingest.md#interpreting-results)
+to distinguish source rate, batch submission rate, completed results, and NIC traffic.
+The format alone does not establish an achievable frame rate.
 
 ## Source pointers
 
-- `dectris/compression` (GitHub): `python/dectris/compression.c` (binding + GIL release),
-  `src/compression.c` (container parsing + block loop), `third_party/{lz4,bitshuffle}`.
-- Local install: `dectris/compression.cpython-312-*.so` (LZ4 symbols statically linked).
+- [Native Stream2 parser](../../holoscan_pipeline/cpp/common/fast_cbor_parse.c)
+- [GPU decoder](../../holoscan_pipeline/cpp/operators/decompress_gpu_operator.cu)
+- [CUDA bit-unshuffle kernel](../../holoscan_pipeline/cpp/common/bitshuffle_kernel_gpu.cu)
+- [START validation and raster geometry](../../dectris/src/dectris/messages.py)

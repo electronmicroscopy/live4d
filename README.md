@@ -9,10 +9,25 @@ scan and build bright-field and annular dark-field images.
 See the [pipeline guide](docs/holoscan_basic_ingest.md) for the single container, application,
 configuration, batching/ownership contracts, and validation commands.
 
+The application currently supports **96×96 uint16** detector frames, a configured raster
+scan, and BF/ADF integration. It prints per-series JSON summaries; it does not yet provide
+a live image viewer, save diffraction datasets, or export BF/ADF maps from the CLI.
+
+## Documentation
+
+- [Build, configure, run, and troubleshoot Live4D](docs/holoscan_basic_ingest.md)
+- [Reusable imagemux RDMA package and protocol tests](dectris/README.md)
+- [Stream2 wire-format reference](pipeline/docs/stream_format.md)
+- [Earlier Python experiments and migration notes](pipeline/README.md)
+
+The container workflow targets a Linux GPU host. RDMA additionally requires an active
+verbs/RoCE interface; the ZMQ route can run without an RDMA device. Start with the pipeline
+guide to select a transport and configure the sender endpoint before acquisition.
+
 | Directory | Purpose |
 | --- | --- |
 | `holoscan_pipeline/` | The `live4d` application, numerical algorithms, typed ingest operators, and tests |
 | `docker/` | Unified HSDK 5/CUDA 13 container and compose service |
 | `dectris/` | Reusable imagemux protocol, handshake, native verbs backend, and ring ownership |
-| `pipeline/` | Earlier Python processing experiments and Stream2 format notes |
-| `simple_listener/` | Small Stream2 protocol reference |
+| `pipeline/` | Earlier Python/PyTorch experiments; separate dependencies and configuration from Live4D |
+| `simple_listener/` | Historical Stream2 decoding example with a hard-coded endpoint and older CBOR callback |
