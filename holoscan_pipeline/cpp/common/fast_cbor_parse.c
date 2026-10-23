@@ -110,6 +110,89 @@ int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id
     return -1;
 }
 
+int fast_extract_start_metadata(const uint8_t* data, size_t size,
+                                dectris_start_metadata_t* metadata) {
+    if (data == NULL || metadata == NULL || size == 0 ||
+        fast_detect_message_type(data, size) != ZMQ_MSG_START) return -1;
+
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
+    uint64_t n;
+    while (ptr < end && (*ptr & CBOR_MAJOR_TYPE_MASK) == CBOR_MAJOR_TAG)
+        if (read_cbor_uint(&ptr, end, &n)) return -1;
+    if (ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_MAP ||
+        read_cbor_uint(&ptr, end, &n))
+        return -1;
+
+    unsigned found = 0;
+    for (uint64_t i = 0; i < n; ++i) {
+        if (ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_TEXT) return -1;
+        uint64_t key_size;
+        if (read_cbor_uint(&ptr, end, &key_size) || key_size > (uint64_t)(end - ptr)) return -1;
+        const uint8_t* key = ptr;
+        ptr += key_size;
+
+        if (key_size == 9 && memcmp(key, "series_id", 9) == 0) {
+            if ((found & 1) || ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
+                read_cbor_uint(&ptr, end, &metadata->series_id)) return -1;
+            found |= 1;
+        } else if (key_size == 12 && memcmp(key, "image_size_x", 12) == 0) {
+            uint64_t value;
+            if ((found & 2) || ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
+                read_cbor_uint(&ptr, end, &value) || value > UINT32_MAX) return -1;
+            metadata->image_size_x = (uint32_t)value;
+            found |= 2;
+        } else if (key_size == 12 && memcmp(key, "image_size_y", 12) == 0) {
+            uint64_t value;
+            if ((found & 4) || ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
+                read_cbor_uint(&ptr, end, &value) || value > UINT32_MAX) return -1;
+            metadata->image_size_y = (uint32_t)value;
+            found |= 4;
+        } else if (key_size == 11 && memcmp(key, "image_dtype", 11) == 0) {
+            if ((found & 8) || ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_TEXT) return -1;
+            uint64_t value_size;
+            if (read_cbor_uint(&ptr, end, &value_size) || value_size > (uint64_t)(end - ptr) ||
+                value_size != 6 || memcmp(ptr, "uint16", 6) != 0) return -1;
+            ptr += value_size;
+            found |= 8;
+        } else if (skip_cbor(&ptr, end, 0)) {
+            return -1;
+        }
+    }
+
+    if (ptr != end || found != 15) return -1;
+    const uint32_t dim = metadata->image_size_x;
+    if (metadata->image_size_y != dim || (dim != 96 && dim != 192)) return -1;
+    return 0;
+}
+
+static int extract_image_shape(const uint8_t* data, size_t size,
+                               uint32_t* width_out, uint32_t* height_out) {
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
+    while (ptr + 2 <= end) {
+        if (ptr[0] == 0xD8 && ptr[1] == 0x28) {
+            const uint8_t* candidate = ptr + 2;
+            uint64_t wrapper_size;
+            if (candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY ||
+                read_cbor_uint(&candidate, end, &wrapper_size) || wrapper_size != 2 ||
+                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY) return -1;
+            uint64_t shape_size, width, height;
+            if (read_cbor_uint(&candidate, end, &shape_size) || shape_size != 2 ||
+                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
+                read_cbor_uint(&candidate, end, &width) || width > UINT32_MAX ||
+                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
+                read_cbor_uint(&candidate, end, &height) || height > UINT32_MAX ||
+                skip_cbor(&candidate, end, 0)) return -1;
+            *width_out = (uint32_t)width;
+            *height_out = (uint32_t)height;
+            return 0;
+        }
+        ++ptr;
+    }
+    return -1;
+}
+
 /**
  * Read CBOR byte string length and get pointer to data.
  */
@@ -290,10 +373,16 @@ int fast_extract_compressed_bslz4(
     size_t* compressed_size_out,
     size_t* original_size_out,
     size_t* elem_size_out,
+    uint32_t* image_size_x_out,
+    uint32_t* image_size_y_out,
     uint64_t* image_id_out)
 {
     const uint8_t* end = msg_data + msg_size;
     const uint8_t* ptr = msg_data;
+
+    if (image_size_x_out == NULL || image_size_y_out == NULL ||
+        extract_image_shape(msg_data, msg_size, image_size_x_out, image_size_y_out) != 0)
+        return -1;
 
     // Extract image_id if requested
     if (image_id_out != NULL) {

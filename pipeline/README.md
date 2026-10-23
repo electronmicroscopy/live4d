@@ -14,8 +14,9 @@ For the current ZMQ/RDMA application, use the
 
 The old `requirements.txt` includes PyTorch, CUDA 12 nvCOMP, and `dectris-compression`.
 It is not the dependency list for the HSDK 5/CUDA 13 container. Old presets, masks,
-geometry, and CLI flags are not automatically portable to Live4D, which currently
-accepts only 96×96 uint16 frames. Keep any experiment environment separate from the
+geometry, and CLI flags are not automatically portable to Live4D. Live4D accepts
+96×96 (2×2 binned) and 192×192 (unbinned, 1×1) uint16 frames and selects dimensions
+from each series' START metadata. Keep any experiment environment separate from the
 unified application environment.
 
 The [Stream2 notes](docs/stream_format.md) remain useful as a wire-format reference.

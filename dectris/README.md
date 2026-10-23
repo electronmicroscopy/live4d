@@ -66,7 +66,10 @@ The ingress ring and the downstream tensor pool are separate allocations. `gpu` 
 require working GPUDirect RDMA support; `host_mapped` rings use registered mapped pinned
 host memory. Both paths require sufficient locked-memory limits and verbs device access.
 Use the [shared build and run instructions](../docs/holoscan_basic_ingest.md#build-and-run)
-for the supported 96×96 uint16 application.
+for the application, which supports 96×96 (2×2 binned) and 192×192 (unbinned, 1×1)
+uint16 images. START metadata supplies the series dimensions; RDMA IMAGE headers must
+match them. The standalone `Dispatcher.dispatch()` accepts the series shape through
+its `shape` argument and defaults to `(96, 96)`.
 
 ## Tests
 

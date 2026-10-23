@@ -1,17 +1,19 @@
 # Live 4D-STEM with DECTRIS and Holoscan
 
-The `live4d` application receives DECTRIS 96×96 uint16 images over ZMQ or imagemux RDMA
-and processes both routes through one Holoscan SDK 5 pipeline. ZMQ input uses GPU BSLZ4
-decompression. Uncompressed RDMA input is gathered directly from a registered GPU or
-mapped-host ring into runtime-owned GPU tensors. Shared operators place images in a raster
-scan and build bright-field and annular dark-field images.
+The `live4d` application receives DECTRIS 96×96 (2×2 binned) or 192×192 (unbinned, 1×1) uint16
+images over ZMQ or imagemux RDMA and processes both routes through one Holoscan SDK 5
+pipeline. ZMQ input uses GPU BSLZ4 decompression. Uncompressed RDMA input is gathered
+directly from a registered GPU or mapped-host ring into runtime-owned GPU tensors.
+Shared operators place images in a raster scan and build bright-field and annular
+dark-field images.
 
 See the [pipeline guide](docs/holoscan_basic_ingest.md) for the single container, application,
 configuration, batching/ownership contracts, and validation commands.
 
-The application currently supports **96×96 uint16** detector frames, a configured raster
-scan, and BF/ADF integration. It prints per-series JSON summaries; it does not yet provide
-a live image viewer, save diffraction datasets, or export BF/ADF maps from the CLI.
+The application selects image dimensions from each series' START metadata and supports
+a configured raster scan and BF/ADF integration. It prints per-series JSON summaries;
+it does not yet provide a live image viewer, save diffraction datasets, or export BF/ADF
+maps from the CLI.
 
 ## Documentation
 

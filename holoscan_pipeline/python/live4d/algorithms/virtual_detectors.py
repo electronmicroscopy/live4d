@@ -3,10 +3,11 @@
 import cupy as cp
 
 
-def build_masks(bf_radius, adf_inner, adf_outer):
-    """Build float32 BF and ADF masks for 96 by 96 diffraction frames."""
-    y, x = cp.mgrid[:96, :96].astype(cp.float32)
-    radius = cp.hypot(y - 47.5, x - 47.5)
+def build_masks(bf_radius, adf_inner, adf_outer, shape=(96, 96)):
+    """Build float32 BF and ADF masks centered on the supplied image shape."""
+    height, width = shape
+    y, x = cp.mgrid[:height, :width].astype(cp.float32)
+    radius = cp.hypot(y - (height - 1) / 2, x - (width - 1) / 2)
     return cp.stack([radius <= bf_radius,
                      (radius >= adf_inner) & (radius <= adf_outer)]
                     ).reshape(2, -1).T.astype(cp.float32)

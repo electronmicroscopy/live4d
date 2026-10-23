@@ -14,15 +14,17 @@ from live4d.config import PipelineConfig
 from live4d.algorithms.virtual_detectors import build_masks, integrate
 
 
-def test_virtual_detector_algorithms_match_independent_sums():
-    values = np.arange(3 * 96 * 96, dtype=np.uint32).reshape(3, 96, 96)
+@pytest.mark.parametrize("shape", [(96, 96), (192, 192)])
+def test_virtual_detector_algorithms_match_independent_sums(shape):
+    height, width = shape
+    values = np.arange(3 * height * width, dtype=np.uint32).reshape(3, height, width)
     frames = ((values * 13 + values // 7) % 11).astype(np.uint16)
     bf_radius, adf_inner, adf_outer = 16.0, 24.0, 48.0
-    masks = build_masks(bf_radius, adf_inner, adf_outer)
+    masks = build_masks(bf_radius, adf_inner, adf_outer, shape=shape)
     actual = cp.asnumpy(integrate(cp.asarray(frames), masks))
 
-    y, x = np.ogrid[:96, :96]
-    radius_squared = (y - 47.5) ** 2 + (x - 47.5) ** 2
+    y, x = np.ogrid[:height, :width]
+    radius_squared = (y - (height - 1) / 2) ** 2 + (x - (width - 1) / 2) ** 2
     bf_mask = radius_squared <= bf_radius ** 2
     adf_mask = ((radius_squared >= adf_inner ** 2)
                 & (radius_squared <= adf_outer ** 2))
@@ -36,28 +38,32 @@ def test_virtual_detector_algorithms_match_independent_sums():
     np.testing.assert_array_equal(actual, expected)
 
 
-def start_message(series_id, count):
-    return dict(type="start", series_id=series_id, image_size_x=96, image_size_y=96,
-                image_dtype="uint16", number_of_images=count, frame_time=0.001,
+def start_message(series_id, count, shape=(96, 96), dtype="uint16"):
+    return dict(type="start", series_id=series_id, image_size_x=shape[1], image_size_y=shape[0],
+                image_dtype=dtype, number_of_images=count, frame_time=0.001,
                 channels=["threshold_1"], acquisition_note="preserved")
 
 
-def image_message(image_id, value):
-    data = bytearray((18432).to_bytes(8, "big") + (8192).to_bytes(4, "big"))
-    for elements in (4096, 4096, 1024):
+def image_message(image_id, value, shape=(96, 96)):
+    height, width = shape
+    elements_left = height * width
+    data = bytearray((height * width * 2).to_bytes(8, "big") + (8192).to_bytes(4, "big"))
+    while elements_left:
+        elements = min(4096, elements_left)
         shuffled = b"".join(bytes([255 if (value >> bit) & 1 else 0]) * (elements // 8)
                              for bit in range(16))
         length = len(shuffled) - 15
         block = bytes([0xf0]) + bytes([255]) * (length // 255) + bytes([length % 255]) + shuffled
         data += len(block).to_bytes(4, "big") + block
-    payload = cbor2.CBORTag(40, [[96, 96], cbor2.CBORTag(69,
+        elements_left -= elements
+    payload = cbor2.CBORTag(40, [[height, width], cbor2.CBORTag(69,
                cbor2.CBORTag(56500, ["bslz4", 2, bytes(data)]))])
     return dict(type="image", image_id=image_id, data={"threshold_1": payload})
 
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
-               processing_delay=0, queue_depth=4, defer_readback=False):
-    observed, results, errors, starts = [], [], [], []
+               processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False):
+    observed, results, errors, starts, batch_shapes = [], [], [], [], []
     context = zmq.Context()
     sender = context.socket(zmq.PUSH)
     sender.setsockopt(zmq.LINGER, 0)
@@ -65,6 +71,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
     port = sender.bind_to_random_port("tcp://127.0.0.1")
 
     def observer(batch, positioned):
+        batch_shapes.append((int(batch.series_id), bool(batch.start_of_series),
+                             bool(batch.end_of_series), tuple(batch.frames.shape)))
         if batch.start_of_series:
             starts.append(bytes(batch.start_metadata))
         if len(batch.image_ids):
@@ -95,17 +103,29 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
     thread.start()
     try:
         assert app.ready.wait(20), errors
-        for sid, ids in series:
-            sender.send(cbor2.dumps(cbor2.CBORTag(55799, start_message(sid, len(ids)))))
+        for entry in series:
+            sid, ids = entry[:2]
+            shape = entry[2] if len(entry) > 2 else (96, 96)
+            image_shape = entry[3] if len(entry) > 3 else shape
+            dtype = entry[4] if len(entry) > 4 else "uint16"
+            sender.send(cbor2.dumps(cbor2.CBORTag(
+                55799, start_message(sid, len(ids), shape, dtype))))
             for image_id in ids:
-                sender.send(cbor2.dumps(image_message(image_id, image_id + 1)))
+                sender.send(cbor2.dumps(image_message(image_id, image_id + 1, image_shape)))
                 if delay:
                     time.sleep(0.005)
             sender.send(cbor2.dumps(dict(type="end", series_id=sid)))
         thread.join(timeout=15)
         assert not thread.is_alive()
+        if expect_error:
+            assert errors, errors
+            return observed, results, app.plan, batch_shapes
         assert not errors, errors
-        assert starts == [cbor2.dumps(cbor2.CBORTag(55799, start_message(sid, len(ids)))) for sid, ids in series]
+        assert starts == [cbor2.dumps(cbor2.CBORTag(
+            55799, start_message(entry[0], len(entry[1]),
+                                 entry[2] if len(entry) > 2 else (96, 96),
+                                 entry[4] if len(entry) > 4 else "uint16")))
+                          for entry in series]
         if defer_readback:
             observed[:] = [(batch_id, sid, ids, cp.asnumpy(pixels))
                            for batch_id, sid, ids, pixels in observed]
@@ -114,14 +134,14 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
         thread.join(timeout=5)
         sender.close()
         context.term()
-    return observed, results, app.plan
+    return observed, results, app.plan, batch_shapes
 
 
 @pytest.mark.parametrize("count", [0, 1, 4, 9, 33])
 def test_order_pixels_and_end_of_series(count):
-    observed, results, _ = run_series([(7, list(range(count)))], delay=count != 33,
-                                     processing_delay=0.02 if count == 33 else 0,
-                                     queue_depth=2 if count == 33 else 4)
+    observed, results, _, _ = run_series([(7, list(range(count)))], delay=count != 33,
+                                        processing_delay=0.02 if count == 33 else 0,
+                                        queue_depth=2 if count == 33 else 4)
     assert [len(ids) for _, ids, _ in observed] == [4] * (count // 4) + ([count % 4] if count % 4 else [])
     for sid, ids, pixels in observed:
         assert sid == 7 and pixels.dtype == np.uint16
@@ -135,17 +155,35 @@ def test_order_pixels_and_end_of_series(count):
 
 
 def test_consecutive_empty_partial_series_and_scan_gaps():
-    observed, results, _ = run_series([(1, []), (2, [0, 3, 6, 9, 10]), (3, [0])], service=True)
-    assert [(sid, ids) for sid, ids, _ in observed] == [(2, [0, 3, 6, 9]), (2, [10]), (3, [0])]
-    assert [result["series_id"] for result in results] == [1, 2, 3]
-    assert [result["positions"] for result in results] == [0, 3, 1]
+    observed, results, _, batch_shapes = run_series(
+        [(1, []), (2, [0, 3, 6, 9, 10], (192, 192)), (3, [0]),
+         (4, [], (192, 192)), (5, [0, 1])], service=True)
+    assert [(sid, ids) for sid, ids, _ in observed] == [
+        (2, [0, 3, 6, 9]), (2, [10]), (3, [0]), (5, [0, 1])]
+    assert [result["series_id"] for result in results] == [1, 2, 3, 4, 5]
+    assert [result["positions"] for result in results] == [0, 3, 1, 0, 2]
+    assert [result["announced_images"] for result in results] == [0, 5, 1, 0, 2]
+    assert [pixels.shape[1:] for _, _, pixels in observed] == [
+        (192, 192), (192, 192), (96, 96), (96, 96)]
+    for _, ids, pixels in observed:
+        expected = np.broadcast_to(np.asarray(ids, dtype=np.uint16)[:, None, None] + 1,
+                                   pixels.shape)
+        np.testing.assert_array_equal(pixels, expected)
+    for sid, is_start, is_end, shape in batch_shapes:
+        expected = (192, 192) if sid in (2, 4) else (96, 96)
+        if is_start or is_end:
+            assert shape == (1, *expected)
     assert results[1]["bf_sum"] == 812 * (1 + 4 + 7)
+    y, x = np.ogrid[:192, :192]
+    radius_squared = (y - 95.5) ** 2 + (x - 95.5) ** 2
+    adf_pixels = ((radius_squared >= 24 ** 2) & (radius_squared <= 48 ** 2)).sum()
+    assert results[1]["adf_sum"] == adf_pixels * (1 + 4 + 7)
     assert results[2]["adf_sum"] == 5428
 
 
 def test_deferred_readback_preserves_many_batches_and_totals():
     count = 257
-    observed, results, _ = run_series(
+    observed, results, _, _ = run_series(
         [(8, list(range(count)))], batch_size=4, scan=(17, 16), queue_depth=2,
         defer_readback=True)
 
@@ -180,3 +218,17 @@ def test_idle_sigterm(capsys):
     thread.join(timeout=5)
     assert termination.name == "STOPPED"
     assert "[holoscan] ready" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("shape,dtype", [((128, 128), "uint16"), ((96, 192), "uint16"),
+                                          ((96, 96), "uint32")])
+def test_unsupported_start_geometry_is_rejected(shape, dtype):
+    run_series([(9, [], shape, shape, dtype)], expect_error=True)
+
+
+@pytest.mark.parametrize("start_shape,image_shape", [
+    ((192, 192), (96, 96)),
+    ((96, 96), (192, 48)),
+])
+def test_image_geometry_must_match_start(start_shape, image_shape):
+    run_series([(10, [0], start_shape, image_shape)], expect_error=True)

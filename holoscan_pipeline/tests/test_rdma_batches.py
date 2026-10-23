@@ -99,28 +99,28 @@ def _join_sender(thread, errors, timeout):
     assert not errors, errors
 
 
-def _start(writer, series_id, announced):
+def _start(writer, series_id, announced, shape=(96, 96), dtype="uint16"):
     import cbor2
     from dectris.imagemux import FrameKind
 
     metadata = cbor2.dumps(cbor2.CBORTag(55799, {
-        "type": "start", "series_id": series_id, "image_size_x": 96,
-        "image_size_y": 96, "image_dtype": "uint16", "number_of_images": announced,
+        "type": "start", "series_id": series_id, "image_size_x": shape[1],
+        "image_size_y": shape[0], "image_dtype": dtype, "number_of_images": announced,
     }))
     record = writer.write(FrameKind.START, metadata, series_id=series_id)
     return record, metadata
 
 
-def _image(writer, series_id, image_ids, values):
+def _image(writer, series_id, image_ids, values, shape=(96, 96)):
     import numpy as np
     from dectris.imagemux import Compression, DataType, FrameKind, ImageHeader
 
     frames = np.stack([
-        np.full((96, 96), value, dtype=np.uint16) for value in values
+        np.full(shape, value, dtype=np.uint16) for value in values
     ])
     payload = frames.tobytes()
     image = ImageHeader(
-        image_id=image_ids[0], batch_id=0, batch_size=len(image_ids), dim_x=96, dim_y=96,
+        image_id=image_ids[0], batch_id=0, batch_size=len(image_ids), dim_x=shape[1], dim_y=shape[0],
         dtype=DataType.UINT16, compression=Compression.NONE,
         uncompressed_size=len(payload), channel=0, channel_count=1,
     )
@@ -273,6 +273,7 @@ def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
                 "series_images": int(batch.series_images),
                 "start_metadata": bytes(batch.start_metadata),
                 "image_ids": [int(value) for value in batch.image_ids],
+                "frame_shape": tuple(batch.frames.shape),
                 "pixels": pixels,
             }
             records.append(item)
@@ -493,8 +494,8 @@ def test_consecutive_empty_and_partial_series_keep_service_source_active():
         starts = {}
         starts[10] = _start(writer, 10, 0)
         _end(writer, 10)
-        starts[11] = _start(writer, 11, 3)
-        _image(writer, 11, [40, 41, 42], [3, 11, 29])
+        starts[11] = _start(writer, 11, 3, (192, 192))
+        _image(writer, 11, [40, 41, 42], [3, 11, 29], (192, 192))
         _end(writer, 11)
         starts[12] = _start(writer, 12, 0)
         _end(writer, 12)
@@ -518,8 +519,44 @@ def test_consecutive_empty_and_partial_series_keep_service_source_active():
         data = [item for item in received if item["image_ids"]]
         assert [item["image_ids"] for item in data] == [[40, 41], [42]]
         _assert_pixels(received, [([40, 41], [3, 11]), ([42], [29])])
+        assert [item["frame_shape"] for item in received] == [
+            (1, 96, 96), (1, 96, 96), (1, 96, 96), (1, 192, 192),
+            (2, 192, 192), (2, 192, 192), (1, 192, 192), (1, 96, 96), (1, 96, 96),
+        ]
         assert [item["series_images"] for item in received if item["end"]] == [0, 3, 0]
         assert loopback.credit_position >= writer.position
+    finally:
+        loopback.close()
+
+
+@pytest.mark.parametrize("start_shape,image_shape,dtype,expected", [
+    ((128, 128), (128, 128), "uint16", "Invalid START image geometry"),
+    ((96, 96), (192, 192), "uint16", "RDMA image geometry does not match START"),
+    ((96, 96), (192, 48), "uint16", "RDMA image geometry does not match START"),
+    ((96, 96), (96, 96), "uint32", "Invalid START image geometry"),
+])
+def test_rdma_rejects_invalid_start_or_image_geometry(start_shape, image_shape, dtype, expected):
+    loopback = Loopback(1 << 20)
+    try:
+        writer = RingWriter(loopback.ring_bytes)
+        _start(writer, 99, 1, start_shape, dtype)
+        if image_shape is not None:
+            _image(writer, 99, [0], [7], image_shape)
+        plan, _, ready, _, _ = _build_receiver(loopback, batch_size=2, max_batch=8)
+        import holoscan as hs
+
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 20, "READY")
+            sender, sender_errors = _start_sender(loopback, writer.records)
+            deadline = time.monotonic() + 20
+            while not session.wait(timeout=0.02) and time.monotonic() < deadline:
+                pass
+            _join_sender(sender, sender_errors, timeout=20)
+            assert session.termination not in (
+                hs.RunTermination.REQUESTED_COMPLETED, hs.RunTermination.COMPLETED,
+                hs.RunTermination.STOPPED,
+            ), session.summary()
+            assert expected in session.summary()
     finally:
         loopback.close()
 

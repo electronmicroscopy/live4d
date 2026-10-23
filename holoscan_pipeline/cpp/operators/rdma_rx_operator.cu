@@ -97,7 +97,7 @@ void RdmaRxOp::setup(OperatorSpec& spec) {
   spec.output(output, "output").produces_tensor(TensorOutputSpec{
       .representation = {.memory_kind = MemoryKind::kCudaDevice,
                          .dtype = DLDataType{kDLUInt, 16, 1}, .rank = 3U},
-      .bounds = tensor_bounds(dectris::kMaxBatchSize * kImageBytes),
+      .bounds = tensor_bounds(dectris::kMaxBatchSize * dectris::kMaxDetectorPixels * sizeof(uint16_t)),
       .storage = TensorOutputStorage::kRuntimePool});
 }
 
@@ -130,6 +130,9 @@ void RdmaRxOp::start() {
   device_ = static_cast<int>(config.device);
   batch_size_ = static_cast<size_t>(config.batch_size);
   max_batch_ = static_cast<size_t>(config.max_batch);
+  active_width_ = static_cast<uint32_t>(dectris::kDetectorWidth);
+  active_height_ = static_cast<uint32_t>(dectris::kDetectorHeight);
+  active_image_bytes_ = kImageBytes;
 
   const cudaError_t set_device_status = cudaSetDevice(device_);
   if (set_device_status != cudaSuccess) {
@@ -221,22 +224,20 @@ expected<void, Error> RdmaRxOp::compute(ExecutionContext& context) {
   auto open_writer = [&]() -> expected<void, Error> {
     if (writer) return {};
     const std::array<int64_t, 3> shape{static_cast<int64_t>(batch_size_),
-                                       static_cast<int64_t>(dectris::kDetectorHeight),
-                                       static_cast<int64_t>(dectris::kDetectorWidth)};
+                                       static_cast<int64_t>(active_height_),
+                                       static_cast<int64_t>(active_width_)};
     auto allocated = output.allocate_tensor(shape);
     if (!allocated) {
       return make_unexpected(make_error(
-          ErrorCode::kFailure, "RDMA tensor allocation failed: allocate_tensor data shape [" +
-                                   std::to_string(batch_size_) + ",96,96]: " +
+          ErrorCode::kFailure, "RDMA data tensor allocation failed: " +
                                    sdk_detail(allocated.error())));
     }
     loan.emplace(std::move(*allocated));
     auto result = loan->write(producer_stream);
     if (!result) {
       return make_unexpected(make_error(
-          ErrorCode::kFailure, "RDMA tensor allocation failed: loan.write data shape [" +
-                                   std::to_string(batch_size_) + ",96,96]: " +
-                                   sdk_detail(result.error()) + " (" + loan_detail(*loan) + ")"));
+          ErrorCode::kFailure, "RDMA data tensor write failed: " + sdk_detail(result.error()) +
+                                   " (" + loan_detail(*loan) + ")"));
     }
     writer.emplace(std::move(*result));
     return {};
@@ -269,9 +270,9 @@ expected<void, Error> RdmaRxOp::compute(ExecutionContext& context) {
       }
 
       const size_t source_offset = frame.offset + kFrameHeaderBytes +
-                                   static_cast<size_t>(frame.images_consumed) * kImageBytes;
-      const size_t destination_offset = image_count * kImageBytes;
-      const size_t copy_bytes = take * kImageBytes;
+                                   static_cast<size_t>(frame.images_consumed) * active_image_bytes_;
+      const size_t destination_offset = image_count * active_image_bytes_;
+      const size_t copy_bytes = take * active_image_bytes_;
       const auto* source = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(
           ring_device_address_ + source_offset));
       auto* destination = static_cast<uint8_t*>(writer->data()) + destination_offset;
@@ -560,13 +561,16 @@ expected<void, Error> RdmaRxOp::read_next_frame(uint32_t immediate) {
                     pending_start_metadata_.size());
       }
     }
-    uint64_t metadata_series_id = 0;
+    dectris_start_metadata_t start_metadata{};
     if (pending_start_metadata_.empty() ||
-        fast_extract_series_id(pending_start_metadata_.data(), pending_start_metadata_.size(),
-                               &metadata_series_id) != 0 ||
-        metadata_series_id != header.series_id) {
-      return make_unexpected(make_error(ErrorCode::kProtocolError, "Invalid RDMA stream"));
+        fast_extract_start_metadata(pending_start_metadata_.data(), pending_start_metadata_.size(),
+                                    &start_metadata) != 0 ||
+        start_metadata.series_id != header.series_id) {
+      return make_unexpected(make_error(ErrorCode::kProtocolError, "Invalid START image geometry"));
     }
+    active_width_ = start_metadata.image_size_x;
+    active_height_ = start_metadata.image_size_y;
+    active_image_bytes_ = static_cast<size_t>(active_width_) * active_height_ * sizeof(uint16_t);
     active_series_ = true;
     active_series_id_ = header.series_id;
     active_series_images_ = 0;
@@ -593,14 +597,18 @@ expected<void, Error> RdmaRxOp::read_next_frame(uint32_t immediate) {
 
   if (!active_series_ || header.series_id != active_series_id_ || header.image_count == 0 ||
       header.dtype != kDataTypeUint16 || header.compression != kCompressionNone ||
-      header.dim_x != dectris::kDetectorWidth || header.dim_y != dectris::kDetectorHeight ||
-      header.channel != 0 || header.image_count > UINT64_MAX / kImageBytes ||
-      header.data_size != static_cast<uint64_t>(header.image_count) * kImageBytes ||
-      header.image_id > UINT64_MAX - header.image_count ||
+      header.channel != 0 || header.image_id > UINT64_MAX - header.image_count ||
       active_series_images_ > UINT64_MAX - header.image_count) {
     return make_unexpected(make_error(
-        ErrorCode::kProtocolError,
-        "RDMA image is outside the supported 96x96 uint16 scope"));
+        ErrorCode::kProtocolError, "Invalid RDMA stream"));
+  }
+  if (header.dim_x != active_width_ || header.dim_y != active_height_ ||
+      header.image_count > UINT64_MAX / active_image_bytes_ ||
+      header.data_size != static_cast<uint64_t>(header.image_count) * active_image_bytes_ ||
+      header.uncompressed_size !=
+          static_cast<uint64_t>(header.image_count) * active_image_bytes_) {
+    return make_unexpected(make_error(
+        ErrorCode::kProtocolError, "RDMA image geometry does not match START"));
   }
   active_series_images_ += header.image_count;
   reader_position_ = frame_end;
@@ -631,21 +639,24 @@ expected<void, Error> RdmaRxOp::flush_gpudirect_writes() {
 }
 
 expected<void, Error> RdmaRxOp::emit_control(ExecutionContext& context, ControlKind kind) {
-  const std::array<int64_t, 3> shape{1, static_cast<int64_t>(dectris::kDetectorHeight),
-                                     static_cast<int64_t>(dectris::kDetectorWidth)};
+  const uint32_t width = kind == ControlKind::kReady
+                             ? static_cast<uint32_t>(dectris::kDetectorWidth) : active_width_;
+  const uint32_t height = kind == ControlKind::kReady
+                              ? static_cast<uint32_t>(dectris::kDetectorHeight) : active_height_;
+  const size_t image_bytes = static_cast<size_t>(width) * height * sizeof(uint16_t);
+  const std::array<int64_t, 3> shape{1, static_cast<int64_t>(height), static_cast<int64_t>(width)};
   auto allocated = output.allocate_tensor(shape);
   if (!allocated) {
     return make_unexpected(make_error(
-        ErrorCode::kFailure, "RDMA tensor allocation failed: allocate_tensor control shape "
-                             "[1,96,96]: " + sdk_detail(allocated.error())));
+        ErrorCode::kFailure, "RDMA control tensor allocation failed: " +
+                                 sdk_detail(allocated.error())));
   }
   auto loan = std::move(*allocated);
   auto producer_stream = context.cuda_stream();
   auto writer_result = loan.write(producer_stream);
   if (!writer_result) {
     return make_unexpected(make_error(ErrorCode::kFailure,
-                                      "RDMA tensor allocation failed: loan.write control shape "
-                                      "[1,96,96]: " +
+                                      "RDMA control tensor write failed: " +
                                           sdk_detail(writer_result.error()) + " (" +
                                           loan_detail(loan) + ")"));
   }
@@ -667,7 +678,7 @@ expected<void, Error> RdmaRxOp::emit_control(ExecutionContext& context, ControlK
     if (status == cudaSuccess) work_enqueued = true;
   }
   if (status == cudaSuccess) {
-    status = cudaMemsetAsync(destination, 0, kImageBytes, producer_stream.get());
+    status = cudaMemsetAsync(destination, 0, image_bytes, producer_stream.get());
     if (status == cudaSuccess) work_enqueued = true;
   }
   if (status != cudaSuccess) {

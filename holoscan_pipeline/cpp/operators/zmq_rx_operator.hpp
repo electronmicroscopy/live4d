@@ -44,6 +44,9 @@ class ZmqRxOp final : public Operator<ZmqRxParams> {
   bool active_ = false;
   bool pending_end_ = false;
   uint64_t series_images_ = 0;
+  size_t active_image_bytes_ = dectris::kDetectorPixels * sizeof(uint16_t);
+  uint32_t active_width_ = static_cast<uint32_t>(dectris::kDetectorWidth);
+  uint32_t active_height_ = static_cast<uint32_t>(dectris::kDetectorHeight);
   std::vector<uint8_t> staging_;
   CompressedBatch metadata_;
   uint64_t batch_id_ = 0;

@@ -1,9 +1,9 @@
 """Place decoded GPU images in a raster scan and integrate virtual detectors."""
 from dataclasses import dataclass
+import cbor2
 import json
 import time
 
-import cbor2
 import cupy as cp
 import holoscan as hs
 import numpy as np
@@ -97,19 +97,24 @@ class VirtualDetectorOp(hs.Operator):
         self.device = cp.cuda.Device(self.device_id)
         self.scan = ScanShape(self.scan_width, self.scan_height)
         self.series = self.image = None
+        self.announced_images = None
         with self.device:
-            self.masks = virtual_detectors.build_masks(
-                self.bf_radius, self.adf_inner, self.adf_outer)
+            self.masks_by_shape = {
+                shape: virtual_detectors.build_masks(
+                    self.bf_radius, self.adf_inner, self.adf_outer, shape=shape)
+                for shape in (IMAGE_SHAPE, (192, 192))
+            }
             cp.cuda.get_current_stream().synchronize()
 
     def _warm_up(self):
         # Run in the READY callback's thread and runtime CUDA stream, as image batches do.
-        scratch = cp.ones((self.batch_size, *IMAGE_SHAPE), dtype=cp.uint16)
-        values = virtual_detectors.integrate(scratch, self.masks)
         image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
         ids = np.arange(min(self.batch_size, self.scan.size), dtype=np.int64)
         positions = cp.asarray(np.stack(np.divmod(ids, self.scan.width), axis=1).astype(np.int32))
-        image[:, positions[:, 0], positions[:, 1]] = values[:len(ids)].T
+        for shape, masks in self.masks_by_shape.items():
+            scratch = cp.ones((self.batch_size, *shape), dtype=cp.uint16)
+            values = virtual_detectors.integrate(scratch, masks)
+            image[:, positions[:, 0], positions[:, 1]] = values[:len(ids)].T
         image.sum(axis=(1, 2), dtype=cp.float64).get()
 
     def compute(self, ctx):
@@ -136,7 +141,17 @@ class VirtualDetectorOp(hs.Operator):
                     self.release(int(batch.batch_id))
                 return
             if batch.start_of_series:
-                self.series = cbor2.loads(bytes(batch.start_metadata))
+                start_metadata = bytes(batch.start_metadata)
+                self.series = parse_start(start_metadata)
+                self.announced_images = cbor2.loads(start_metadata).get("number_of_images")
+                if self.series.id != batch.series_id:
+                    raise ValueError("Invalid ordered series boundary")
+            if self.series is None or self.series.id != batch.series_id:
+                raise ValueError("Image batch has no matching START")
+            if tuple(batch.frames.shape[1:]) != self.series.shape:
+                raise ValueError("Image geometry does not match START")
+            self.masks = self.masks_by_shape[self.series.shape]
+            if batch.start_of_series:
                 self.image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
                 self.received = self.placed = self.gaps = self.missing = 0
                 self.next_id = 0
@@ -180,7 +195,7 @@ class VirtualDetectorOp(hs.Operator):
                 totals = cp.asnumpy(self.image.sum(axis=(1, 2), dtype=cp.float64)).tolist()
                 elapsed = (self.last_image - self.first) if self.first is not None else 0.0
                 result = dict(series_id=int(batch.series_id), images=self.received,
-                              announced_images=self.series.get("number_of_images"),
+                              announced_images=self.announced_images,
                               positions=self.placed, scan_positions=self.scan.size,
                               gap_events=self.gaps, missing_images=self.missing, batches=self.batches,
                               batch_sizes=self.batch_sizes, bf_sum=totals[0], adf_sum=totals[1],
@@ -196,6 +211,7 @@ class VirtualDetectorOp(hs.Operator):
                 if self.observer is not None:
                     self.observer(batch, positioned)
                 self.series = self.image = None
+                self.announced_images = None
                 if self.finite:
                     ctx.request_completion()
             if self.release is not None:

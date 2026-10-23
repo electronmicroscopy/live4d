@@ -18,6 +18,12 @@ typedef enum {
     ZMQ_MSG_UNKNOWN = 3
 } zmq_message_type_t;
 
+typedef struct {
+    uint64_t series_id;
+    uint32_t image_size_x;
+    uint32_t image_size_y;
+} dectris_start_metadata_t;
+
 /**
  * Fast-path CBOR parser for Dectris IMAGE messages.
  *
@@ -52,6 +58,10 @@ zmq_message_type_t fast_detect_message_type(
 // Read the unsigned series_id from a tagged or bare Stream2 map.
 int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id);
 
+// Validate a START map for 96x96 or 192x192 uint16 images and extract its ID and dimensions.
+int fast_extract_start_metadata(const uint8_t* data, size_t size,
+                                dectris_start_metadata_t* metadata);
+
 /**
  * Fast extraction of compressed BSLZ4 data from Dectris IMAGE message.
  *
@@ -65,6 +75,8 @@ int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id
  * @param compressed_size_out Output: Size of compressed data
  * @param original_size_out   Output: Original uncompressed size
  * @param elem_size_out       Output: Element size (2 for uint16)
+ * @param image_size_x_out    Output: Image width from the multidimensional array tag
+ * @param image_size_y_out    Output: Image height from the multidimensional array tag
  * @param image_id_out        Output: Image ID from CBOR (can be NULL if not needed)
  * @return 0 on success, -1 on error
  */
@@ -75,6 +87,8 @@ int fast_extract_compressed_bslz4(
     size_t* compressed_size_out,
     size_t* original_size_out,
     size_t* elem_size_out,
+    uint32_t* image_size_x_out,
+    uint32_t* image_size_y_out,
     uint64_t* image_id_out);
 
 #if defined(__cplusplus)

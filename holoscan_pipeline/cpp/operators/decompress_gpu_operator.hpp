@@ -48,10 +48,15 @@ class DecompressGpuOp final : public Operator<DecompressGpuParams> {
   ::dectris::BatchWindow* input_window_{};
   size_t max_compressed_size_per_image_ = 0;
   size_t max_compressed_batch_size_ = 0;
+  uint32_t active_width_{static_cast<uint32_t>(DETECTOR_WIDTH)};
+  uint32_t active_height_{static_cast<uint32_t>(DETECTOR_HEIGHT)};
+  uint64_t active_series_id_{};
+  bool active_series_{};
   void allocate_gpu_resources();
   void free_gpu_resources();
   bool decompress_batch_gpu(const std::vector<const uint8_t*>& compressed_ptrs,
                             const std::vector<size_t>& compressed_sizes,
-                            size_t num_images, uint16_t* output_buffer);
+                            size_t num_images, size_t image_pixels_per_frame,
+                            uint16_t* output_buffer);
 };
 }  // namespace holoscan::ops

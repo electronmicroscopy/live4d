@@ -1,8 +1,11 @@
 # Live4D Holoscan pipeline
 
 One Holoscan SDK 5 application accepts either BSLZ4-compressed ZMQ input or uncompressed
-imagemux RDMA input. Both routes support 96×96 uint16 images and feed the same raster scan
-and bright-field/annular dark-field operators.
+imagemux RDMA input. Both routes support ARINA 96×96 (2×2 binned) and 192×192 (unbinned, 1×1)
+uint16 images and feed the same raster scan and bright-field/annular dark-field operators.
+Each series' START metadata selects the image dimensions automatically. Service mode can
+process consecutive series with different dimensions. Image dimensions and type must match
+the series metadata.
 
 ```text
 ZMQ → pinned compressed batches → GPU BSLZ4 decode ─┐
@@ -138,20 +141,27 @@ inferred from acquisition metadata. The RDMA example selects `host_mapped`, whil
 omitted `rdma.ring_memory` defaults to `gpu`. An omitted `detector` section uses BF radius
 16 and ADF inner/outer radii 24/48.
 
-Detector radii are in detector pixels about `(47.5, 47.5)`. BF includes pixels at or inside
-its radius; ADF includes both annular boundaries. Radii must satisfy `0 <= bf_radius <= 68`
-and `0 <= adf_inner <= adf_outer <= 68`. Masks are built at startup; editing YAML while
-running does not change them.
+Detector radii are in input-image pixels about the image center: `(47.5, 47.5)` for
+96×96 and `(95.5, 95.5)` for 192×192. BF includes pixels at or inside its radius; ADF
+includes both annular boundaries. Radii must satisfy `0 <= bf_radius <= 136` and
+`0 <= adf_inner <= adf_outer <= 136`. Defaults remain 16/24/48 for both sizes;
+to cover the same detector area after switching from 96×96 to 192×192, double the
+radii (for example, 32/48/96). Masks for both sizes are built at startup and selected
+for each series. Editing YAML while running does not change the radii.
 
 For simulator RDMA batching above one, select uncompressed output (`compression=none`),
 set bstream mode to `cbor-rdma`, and set `rdma_batch_size` explicitly after initialization.
 ZMQ input requires `bslz4`. This application does not configure the sender.
 
-One decoded frame occupies 18,432 bytes; a full default batch occupies 9 MiB. The two
-float32 scan maps use `8 * scan.width * scan.height` bytes, before temporary arrays,
-retained prior-series results, runtime tensors, and decoder scratch. The RDMA ring is
-additional storage. Increasing
-scan size, batch size, or queue depth therefore increases memory demand.
+A decoded uint16 frame occupies 18,432 bytes at 96×96 or 73,728 bytes at 192×192;
+a full default batch of 512 images occupies 9 MiB or 36 MiB, respectively. HSDK decoded
+tensor pools reserve 70.3 MiB per slot for the maximum supported 1000×192×192 uint16
+batch. The compiled graph determines the slot count. Smaller tensors use the same slots;
+switching to binned images does not shrink the pool allocation.
+
+The two float32 scan maps use `8 * scan.width * scan.height` bytes, before temporary
+arrays, retained prior-series results, runtime tensors, and decoder scratch. The RDMA
+ring is additional storage. Scan size, batch size, and queue depth affect memory demand.
 
 ## Shared messages and GPU ownership
 
@@ -225,8 +235,9 @@ docker run --rm --gpus all --network host --device /dev/infiniband \
 RDMA loopback tests require `IMXRDMA_LOCAL_ADDR` set to an active receiver RoCE address and
 passed into the container with `-e IMXRDMA_LOCAL_ADDR`; also pass `-e RDMA_TEST_IN_IMAGE=1`
 to enable them in the HSDK image. Tests cover fixed batching, partial
-and empty acquisitions, consecutive series, pixel values, scan clipping, BF/ADF results,
-readiness, credits, and shutdown. For ZMQ-only checks, omit the verbs device argument;
+and empty acquisitions, consecutive series at both image sizes, size changes between
+series, geometry rejection, pixel values, scan clipping, BF/ADF results, readiness,
+credits, and shutdown. For ZMQ-only checks, omit the verbs device argument;
 RDMA tests will skip without their two opt-in variables. The ZMQ tests generate their own
 messages and do not require a detector or reference dataset. A green run with skipped RDMA
 tests is not RDMA acceptance. These application tests require the built image and GPU;
@@ -246,8 +257,9 @@ a substitute for delivered image counts.
 
 For sample pixel validation, `python3 -m live4d.validate` accepts an NPZ containing
 `ids` (unique zero-based sample IDs, shape `(N,)`) and CPU-reference `frames` (uint16,
-shape `(N, 96, 96)`). `--expected-frames` is the total acquisition count, which may be larger
-than the number of reference samples. The validator is ZMQ-only and forces finite mode:
+shape `(N, 96, 96)` or `(N, 192, 192)`, matching the acquisition). `--expected-frames`
+is the total acquisition count, which may be larger than the number of reference samples.
+The validator is ZMQ-only and forces finite mode:
 
 ```bash
 docker run --rm --gpus all --network host --ulimit memlock=-1:-1 \
@@ -271,7 +283,7 @@ or independently validate BF/ADF sums. `--report` can save its JSON to a writabl
 | Docker cannot map `/dev/infiniband` | For ZMQ, remove the device argument or Compose device entry. For RDMA, verify host verbs devices first. |
 | RDMA fails before readiness | Verify the sender handshake service, remote host/port, receiver RoCE address/device, locked-memory limit, and ring registration support. `host_mapped` is an alternative when GPU registration is unavailable. |
 | Ready, but no series result | Confirm sender transport/compression and endpoint, trigger acquisition after readiness, and check that the sender emits END. `seconds: 0` allows an indefinite wait. |
-| Unsupported image or START error | Both routes require 96×96 uint16 metadata; ZMQ additionally requires BSLZ4. START metadata must fit within 16 KiB. |
+| Unsupported image or START error | Both routes require 96×96 or 192×192 uint16 images matching START metadata; ZMQ additionally requires BSLZ4. START metadata must fit within 16 KiB. |
 | Fewer placed images than received | Check `scan.width * scan.height` against image IDs; out-of-scan IDs are intentionally excluded from maps. |
 | Missing modules or old behavior after edits | Build the unified image again; source-only `PYTHONPATH` does not supply native operators or generated schemas. |
 

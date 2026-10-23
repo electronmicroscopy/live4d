@@ -6,6 +6,12 @@ This project develops streaming algorithms for DECTRIS data using Holoscan
 SDK 5. ZMQ and imagemux RDMA inputs feed a shared processing pipeline.
 Keep numerical algorithms separate from transport and scheduling.
 
+Both transports support ARINA uint16 images at 192×192 with 1×1 binning
+(unbinned) and 96×96 with 2×2 binning. Each series' START metadata selects
+the dimensions; consecutive series may change size. Runtime tensor shapes
+follow the series, while pool capacity covers the larger images. BF/ADF
+radii remain configured in input-image pixels; they do not scale automatically.
+
 Read [README.md](README.md) and [the pipeline guide](docs/holoscan_basic_ingest.md)
 before changing the pipeline. Use this repository's documented build and test
 commands.
@@ -32,6 +38,7 @@ Processing operators own scheduling, scan placement, and GPU buffer lifetime.
 
 Preserve typed messages, acquisition boundaries, valid batch lengths,
 bounded buffering, tensor ownership, CUDA readiness, and RDMA credit ordering.
+Preserve support for both image sizes and reject images that disagree with START.
 Avoid hidden copies, allocations, and unnecessary synchronization in hot paths.
 
 Use the compose → compile → run workflow. Inspect graph diagnostics before
@@ -49,11 +56,18 @@ benchmark evidence.
 Before each test group, explain its purpose, whether it is correctness,
 smoke, or stress testing, and its pass criteria and limitations.
 
+For image-geometry changes, focused correctness checks must cover both supported
+sizes, size changes between series, empty and partial batches, and geometry
+mismatches. Keep numerical reference checks independent of the implementation.
+
 After development changes, run focused correctness checks, then stress-test
 the full configured pipeline at 120,000 fps with detector 2×2 binning for
 30 seconds: 3,600,000 source frames, excluding warm-up and subsequent drain.
 Stress testing checks sustained processing, correctness, loss, backlog,
 resource growth, and clean completion.
+
+The 120,000 fps target applies to 96×96 images with 2×2 binning. Record binning
+and image dimensions with each result; report unbinned throughput separately.
 
 Prefer RDMA when available; otherwise use ZMQ. For shared pipeline changes,
 test both when available. Transport-specific changes require the affected
