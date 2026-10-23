@@ -5,14 +5,19 @@ services:
       dockerfile: docker/Dockerfile.holoscan
       args:
         CUDA_ARCHITECTURES: "86;89"
-    image: dectris-holoscan-basic:hsdk5
+    image: dectris-holoscan:hsdk5
     network_mode: host
+    devices:
+      - /dev/infiniband:/dev/infiniband
     gpus:
       - driver: nvidia
         count: all
         capabilities:
           - gpu
     ulimits:
+      memlock:
+        soft: -1
+        hard: -1
       stack:
         soft: 33554432
         hard: 33554432

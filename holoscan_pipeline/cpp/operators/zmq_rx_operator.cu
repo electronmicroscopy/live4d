@@ -11,7 +11,7 @@
 namespace holoscan::ops {
 namespace {
 constexpr size_t kImageBytes = dectris::kDetectorPixels * sizeof(uint16_t);
-constexpr size_t kMaxCompressedImage = 12 + kImageBytes + kImageBytes / 255 + 16;
+constexpr size_t kMaxCompressedImage = 12 + kImageBytes + kImageBytes / 255 + 3 * (16 + 4);
 constexpr size_t kMaxCompressedBatch = kMaxCompressedImage * dectris::kMaxBatchSize;
 }
 ZmqRxOp::~ZmqRxOp() { cleanup_zmq(); }
@@ -33,7 +33,8 @@ Contract ZmqRxOp::contract() const {
 }
 
 void ZmqRxOp::start() {
-  ended_ = false;
+  publication_window_ = ::dectris::access(params().publication_window);
+  ready_ = active_ = pending_end_ = false;
   batch_id_ = 0;
   metadata_ = {};
   metadata_.image_ids.reserve(dectris::kMaxBatchSize);
@@ -54,7 +55,17 @@ void ZmqRxOp::start() {
 }
 
 expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
-  if (ended_) return {};
+  if (context.cancellation().stop_requested()) return {};
+  if (publication_window_ && !publication_window_->admits(batch_id_ + 1)) return {};
+  if (!ready_) {
+    ready_ = true;
+    return emit_batch(false, false, true);
+  }
+  if (pending_end_) {
+    pending_end_ = false;
+    active_ = false;
+    return emit_batch(false, true);
+  }
   const auto target = static_cast<size_t>(context.params<ZmqRxParams>().batch_size);
   // Bound control/unknown messages too, so idle and cancellation stay responsive.
   for (size_t received = 0; received < dectris::kMaxBatchSize + 2; ++received) {
@@ -66,13 +77,27 @@ expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
     const auto* data = static_cast<const uint8_t*>(zmq_msg_data(&msg_));
     const size_t bytes = zmq_msg_size(&msg_);
     const auto type = fast_detect_message_type(data, bytes);
-    if (type == ZMQ_MSG_START) continue;
-    if (type == ZMQ_MSG_END) {
-      ended_ = true;
+    if (type == ZMQ_MSG_START) {
+      if (active_ || bytes > 16384 || fast_extract_series_id(data, bytes, &metadata_.series_id))
+        return make_unexpected(Error{ErrorCode::kProtocolError, "Invalid START or missing END"});
+      active_ = true;
+      series_images_ = 0;
+      metadata_.start_metadata.assign(data, data + bytes);
       return emit_batch(true);
+    }
+    if (type == ZMQ_MSG_END) {
+      if (!active_)
+        return make_unexpected(Error{ErrorCode::kProtocolError, "END has no matching START"});
+      pending_end_ = true;
+      if (!metadata_.image_ids.empty()) return emit_batch();
+      pending_end_ = false;
+      active_ = false;
+      return emit_batch(false, true);
     }
     if (type != ZMQ_MSG_IMAGE)
       return make_unexpected(Error{ErrorCode::kProtocolError, "Unknown Stream2 message"});
+    if (!active_)
+      return make_unexpected(Error{ErrorCode::kProtocolError, "Image has no matching START"});
     const uint8_t* compressed = nullptr;
     size_t size = 0, original_size = 0, elem_size = 0;
     uint64_t image_id = 0;
@@ -84,13 +109,14 @@ expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
     metadata_.offsets.push_back(staging_.size());
     metadata_.sizes.push_back(size);
     metadata_.image_ids.push_back(image_id);
+    ++series_images_;
     staging_.insert(staging_.end(), compressed, compressed + size);
-    if (metadata_.image_ids.size() == target) return emit_batch(false);
+    if (metadata_.image_ids.size() == target) return emit_batch();
   }
   return {};
 }
 
-expected<void, Error> ZmqRxOp::emit_batch(bool end_of_stream) {
+expected<void, Error> ZmqRxOp::emit_batch(bool start, bool end, bool ready) {
   // Empty acquisitions and exact batch multiples carry an explicit final marker.
   const std::array<int64_t, 1> shape{static_cast<int64_t>(std::max(size_t{1}, staging_.size()))};
   HOLOSCAN_TRY(auto loan, output.allocate_tensor(shape));
@@ -98,12 +124,16 @@ expected<void, Error> ZmqRxOp::emit_batch(bool end_of_stream) {
     if (!staging_.empty()) std::memcpy(writer.data(), staging_.data(), staging_.size());
   }));
   metadata_.batch_id = ++batch_id_;
-  metadata_.end_of_stream = end_of_stream;
+  metadata_.start_of_series = start;
+  metadata_.end_of_series = end;
+  metadata_.pipeline_ready = ready;
+  metadata_.series_images = series_images_;
   HOLOSCAN_TRY(output.emit_tensor(std::move(loan), metadata_));
   staging_.clear();
   metadata_.image_ids.clear();
   metadata_.sizes.clear();
   metadata_.offsets.clear();
+  metadata_.start_metadata.clear();
   return {};
 }
 

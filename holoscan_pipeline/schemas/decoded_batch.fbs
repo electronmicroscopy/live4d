@@ -4,7 +4,12 @@ table DecodedBatch {
   batch_id: ulong (id: 0);
   image_ids: [ulong] (id: 1);
   frames: holoscan.schema.Tensor (id: 2);
-  end_of_stream: bool (id: 3);
+  end_of_series: bool (id: 3);
+  start_of_series: bool (id: 4);
+  series_id: ulong (id: 5);
+  start_metadata: [ubyte] (id: 6);
+  series_images: ulong (id: 7);
+  pipeline_ready: bool (id: 8);
 }
 root_type DecodedBatch;
 file_identifier "DCFR";

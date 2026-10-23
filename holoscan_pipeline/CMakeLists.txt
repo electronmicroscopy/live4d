@@ -19,29 +19,40 @@ file(REAL_PATH "${nvcomp_LIBRARY_DIR}/libnvcomp.so" NVCOMP_RUNTIME_LIBRARY)
 get_filename_component(NVCOMP_RUNTIME_DIR "${NVCOMP_RUNTIME_LIBRARY}" DIRECTORY)
 find_path(ZMQ_INCLUDE_DIR NAMES zmq.h REQUIRED)
 find_library(ZMQ_LIBRARY NAMES zmq REQUIRED)
+set(IMXRX_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(IMXRX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../dectris/native ${CMAKE_BINARY_DIR}/imxrx)
 
 set(PYTHON_BUILD_DIR ${CMAKE_BINARY_DIR}/python)
 foreach(schema IN ITEMS compressed_batch decoded_batch)
+  # START metadata is at most 16 KiB; image IDs need at most 8 KiB in a separate message.
+  # Keep the decoded descriptor envelope below the channel's inline payload bound.
+  if(schema STREQUAL "decoded_batch")
+    set(SCHEMA_METADATA_CAPACITY 24576)
+  else()
+    set(SCHEMA_METADATA_CAPACITY 32768)
+  endif()
   holoscan_add_flatbuffer_schema(
     TARGET ${schema}_schema SCHEMA schemas/${schema}.fbs
-    MAX_SERIALIZED_SIZE 32768 PYTHON
-    PYTHON_OUTPUT_DIR ${PYTHON_BUILD_DIR}/dectris_holoscan/schemas)
+    MAX_SERIALIZED_SIZE ${SCHEMA_METADATA_CAPACITY} PYTHON
+    PYTHON_OUTPUT_DIR ${PYTHON_BUILD_DIR}/live4d/schemas)
 endforeach()
 add_library(dectris_holoscan_ops SHARED
   cpp/bindings/dectris_holoscan_ops.cpp
-  cpp/common/fast_cbor_parse.c cpp/common/bitshuffle_kernel_gpu.cu
-  cpp/operators/zmq_rx_operator.cu cpp/operators/decompress_gpu_operator.cu)
+  cpp/common/fast_cbor_parse.c cpp/common/batch_window.cpp cpp/common/bitshuffle_kernel_gpu.cu
+  cpp/operators/zmq_rx_operator.cu cpp/operators/decompress_gpu_operator.cu
+  cpp/operators/rdma_rx_operator.cu)
 set_target_properties(dectris_holoscan_ops PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON
   BUILD_RPATH "${NVCOMP_RUNTIME_DIR}"
-  LIBRARY_OUTPUT_DIRECTORY ${PYTHON_BUILD_DIR}/dectris_holoscan)
+  LIBRARY_OUTPUT_DIRECTORY ${PYTHON_BUILD_DIR}/live4d)
 target_include_directories(dectris_holoscan_ops PRIVATE
   cpp/common cpp/operators ${ZMQ_INCLUDE_DIR})
 target_compile_options(dectris_holoscan_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
 target_compile_definitions(dectris_holoscan_ops PRIVATE ENABLE_STATUS_VERIFICATION)
 target_link_libraries(dectris_holoscan_ops PRIVATE holoscan::core holoscan::logger
-  CUDA::cudart nvcomp::nvcomp ${ZMQ_LIBRARY} compressed_batch_schema decoded_batch_schema)
+  CUDA::cudart nvcomp::nvcomp ${ZMQ_LIBRARY} imxrx compressed_batch_schema decoded_batch_schema)
 
-add_custom_target(copy_dectris_holoscan_python ALL
+add_custom_target(copy_live4d_python ALL
   COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_CURRENT_SOURCE_DIR}/python/dectris_holoscan ${PYTHON_BUILD_DIR}/dectris_holoscan)
+    ${CMAKE_CURRENT_SOURCE_DIR}/python/live4d ${PYTHON_BUILD_DIR}/live4d)
