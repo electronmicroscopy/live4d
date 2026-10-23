@@ -10,6 +10,7 @@ import numpy as np
 
 from dectris.messages import IMAGE_SHAPE, ScanShape, parse_start, scan_positions
 from .algorithms import virtual_detectors
+from .completion import CompletionTracker
 from .schemas.decoded_batch import DecodedBatch
 
 
@@ -19,6 +20,7 @@ class PositionedBatch:
     positions: np.ndarray
     selected: np.ndarray
     images: object = None
+    tensor: object = None
     result: dict | None = None
 
 
@@ -28,6 +30,10 @@ class ScanTensorOp(hs.Operator):
     out = hs.Output("output", hs.pyobject)
     scan_width = hs.Param(1000)
     scan_height = hs.Param(1000)
+
+    def __init__(self, *, release=None):
+        super().__init__()
+        self.release = release
 
     def setup(self, spec):
         spec.input(self.inp)
@@ -59,6 +65,8 @@ class ScanTensorOp(hs.Operator):
         while not ctx.stop_requested:
             try:
                 self.out.emit(positioned, options=options)
+                if self.release is not None:
+                    self.release(int(batch.batch_id))
                 return
             except hs.errors.BackpressuredError:
                 time.sleep(0.0001)
@@ -76,12 +84,15 @@ class VirtualDetectorOp(hs.Operator):
     adf_inner = hs.Param(24.0)
     adf_outer = hs.Param(48.0)
 
-    def __init__(self, *, ready=None, finite=True, observer=None, release=None):
+    def __init__(self, *, ready=None, finite=True, observer=None, release=None,
+                 completions=None, observer_host_ready=False):
         super().__init__()
         self.ready = ready
         self.finite = finite
         self.observer = observer
         self.release = release
+        self.completions = completions
+        self.observer_host_ready = observer_host_ready
         self.last = None
 
     def setup(self, spec):
@@ -101,6 +112,13 @@ class VirtualDetectorOp(hs.Operator):
             self.masks = virtual_detectors.build_masks(
                 self.bf_radius, self.adf_inner, self.adf_outer)
             cp.cuda.get_current_stream().synchronize()
+        if self.completions is None:
+            self.completions = CompletionTracker(1, self.device_id, self.release)
+        self.completions.start()
+
+    def stop(self):
+        if self.completions is not None:
+            self.completions.close()
 
     def _warm_up(self):
         # Run in the READY callback's thread and runtime CUDA stream, as image batches do.
@@ -123,82 +141,97 @@ class VirtualDetectorOp(hs.Operator):
                              f"positions={positioned.batch_id}@{position_sample.metadata.capture_timestamp_ns}")
         runtime_stream = ctx.stream()
         with self.device, runtime_stream, cp.cuda.Stream.from_external(runtime_stream) as stream:
-            if batch.pipeline_ready:
-                # Exercise the actual runtime Tensor-to-CuPy handoff before acquisition.
-                view = cp.from_dlpack(batch.frames)
-                self._warm_up()
+            self.completions.wait_for_previous(stream)
+            owners = [original, position_sample, self.masks]
+            completed = None
+            succeeded = False
+            try:
+                completed = self._compute_batch(ctx, batch, positioned, stream, owners)
+                succeeded = True
+            finally:
+                # Record even after an observer/algorithm error so scratch outlives GPU work.
+                self.completions.track(int(batch.batch_id), stream, owners=owners,
+                                       on_complete=completed, acknowledge=succeeded)
+
+    def _compute_batch(self, ctx, batch, positioned, stream, owners):
+        if batch.pipeline_ready:
+            # Exercise the actual runtime Tensor-to-CuPy handoff before acquisition.
+            view = cp.from_dlpack(batch.frames)
+            self._warm_up()
+            stream.synchronize()
+            del view
+            if self.ready is not None:
+                print("[holoscan] ready", flush=True)
+                self.ready.set()
+            return
+        if batch.start_of_series:
+            self.series = cbor2.loads(bytes(batch.start_metadata))
+            self.image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
+            self.received = self.placed = self.gaps = self.missing = 0
+            self.next_id = 0
+            self.timing = dict(first=None, last=None)
+            self.first_batch_count = 0
+            self.batches = 0
+            self.batch_sizes = {}
+        count = len(batch.image_ids)
+        if count:
+            if self.batches == 0:
+                self.first_batch_count = count
+            ids = np.asarray(batch.image_ids, dtype=np.uint64)
+            self.gaps += int(ids[0] != self.next_id) + int(np.count_nonzero(np.diff(ids) != 1))
+            self.missing += max(0, int(ids[0]) - self.next_id)
+            forward = ids[1:] > ids[:-1]
+            self.missing += int((np.diff(ids)[forward] - 1).sum())
+            self.next_id = int(ids[-1]) + 1
+            self.received += count
+            self.batches += 1
+            self.batch_sizes[count] = self.batch_sizes.get(count, 0) + 1
+            frames = cp.from_dlpack(batch.frames)[:count]
+            positioned.images = frames
+            positioned.tensor = batch.frames
+            owners.extend((frames, self.image))
+            if len(positioned.selected):
+                selected = positioned.selected
+                if len(selected) != count:
+                    frames = frames[cp.asarray(selected)]
+                values = virtual_detectors.integrate(frames, self.masks)
+                positions = cp.asarray(positioned.positions)
+                self.image[:, positions[:, 0], positions[:, 1]] = values.T
+                owners.extend((frames, values, positions))
+                self.placed += len(selected)
+            timing = self.timing
+
+            def completed(timestamp):
+                if timing["first"] is None:
+                    timing["first"] = timestamp
+                timing["last"] = timestamp
+        if not batch.end_of_series and self.observer is not None:
+            if self.observer_host_ready:
                 stream.synchronize()
-                del view
-                if self.ready is not None:
-                    print("[holoscan] ready", flush=True)
-                    self.ready.set()
-                if self.release is not None:
-                    self.release(int(batch.batch_id))
-                return
-            if batch.start_of_series:
-                self.series = cbor2.loads(bytes(batch.start_metadata))
-                self.image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
-                self.received = self.placed = self.gaps = self.missing = 0
-                self.next_id = 0
-                self.first = self.last_image = None
-                self.first_batch_count = 0
-                self.batches = 0
-                self.batch_sizes = {}
-            count = len(batch.image_ids)
-            if count:
-                if self.first is None:
-                    self.first_batch_count = count
-                ids = np.asarray(batch.image_ids, dtype=np.uint64)
-                self.gaps += int(ids[0] != self.next_id) + int(np.count_nonzero(np.diff(ids) != 1))
-                self.missing += max(0, int(ids[0]) - self.next_id)
-                forward = ids[1:] > ids[:-1]
-                self.missing += int((np.diff(ids)[forward] - 1).sum())
-                self.next_id = int(ids[-1]) + 1
-                self.received += count
-                self.batches += 1
-                self.batch_sizes[count] = self.batch_sizes.get(count, 0) + 1
-                frames = cp.from_dlpack(batch.frames)[:count]
-                positioned.images = frames
-                if len(positioned.selected):
-                    selected = positioned.selected
-                    if len(selected) != count:
-                        frames = frames[cp.asarray(selected)]
-                    values = virtual_detectors.integrate(frames, self.masks)
-                    positions = cp.asarray(positioned.positions)
-                    self.image[:, positions[:, 0], positions[:, 1]] = values.T
-                    self.placed += len(selected)
-                stream.synchronize()
-                self.last_image = time.perf_counter()
-                if self.first is None:
-                    self.first = self.last_image
-            if not batch.end_of_series and self.observer is not None:
+            self.observer(batch, positioned)
+        if batch.end_of_series:
+            # Preserve float32 processing and report a float64 aggregate of the stored values.
+            totals = cp.asnumpy(self.image.sum(axis=(1, 2), dtype=cp.float64)).tolist()
+            self.completions.drain()
+            first, last = self.timing["first"], self.timing["last"]
+            elapsed = last - first if first is not None else 0.0
+            result = dict(series_id=int(batch.series_id), images=self.received,
+                          announced_images=self.series.get("number_of_images"),
+                          positions=self.placed, scan_positions=self.scan.size,
+                          gap_events=self.gaps, missing_images=self.missing, batches=self.batches,
+                          batch_sizes=self.batch_sizes, bf_sum=totals[0], adf_sum=totals[1],
+                          processing_dtype="float32", totals_dtype="float64",
+                          delivered_interval_s=elapsed,
+                          delivered_fps=(self.received - self.first_batch_count) / elapsed
+                          if elapsed and self.batches > 1 else None)
+            if int(batch.series_images) != self.received:
+                raise ValueError("END image count does not match delivered images")
+            self.last = (batch.series_id, self.image, result)
+            positioned.result = result
+            print("[series-result] " + json.dumps(result, sort_keys=True), flush=True)
+            if self.observer is not None:
                 self.observer(batch, positioned)
-            positioned.images = None
-            if batch.end_of_series:
-                # Preserve float32 processing and report a float64 aggregate of the stored values.
-                totals = cp.asnumpy(self.image.sum(axis=(1, 2), dtype=cp.float64)).tolist()
-                stream.synchronize()
-                elapsed = (self.last_image - self.first) if self.first is not None else 0.0
-                result = dict(series_id=int(batch.series_id), images=self.received,
-                              announced_images=self.series.get("number_of_images"),
-                              positions=self.placed, scan_positions=self.scan.size,
-                              gap_events=self.gaps, missing_images=self.missing, batches=self.batches,
-                              batch_sizes=self.batch_sizes, bf_sum=totals[0], adf_sum=totals[1],
-                              processing_dtype="float32", totals_dtype="float64",
-                              delivered_interval_s=elapsed,
-                              delivered_fps=(self.received - self.first_batch_count) / elapsed
-                              if elapsed and self.batches > 1 else None)
-                if int(batch.series_images) != self.received:
-                    raise ValueError("END image count does not match delivered images")
-                self.last = (batch.series_id, self.image, result)
-                positioned.result = result
-                print("[series-result] " + json.dumps(result, sort_keys=True), flush=True)
-                if self.observer is not None:
-                    self.observer(batch, positioned)
-                self.series = self.image = None
-                if self.finite:
-                    ctx.request_completion()
-            if batch.start_of_series:
-                stream.synchronize()
-            if self.release is not None:
-                self.release(int(batch.batch_id))
+            self.series = self.image = None
+            if self.finite:
+                ctx.request_completion()
+        return completed if count else None

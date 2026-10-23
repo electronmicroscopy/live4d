@@ -56,7 +56,7 @@ def image_message(image_id, value):
 
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
-               processing_delay=0, queue_depth=4):
+               processing_delay=0, queue_depth=4, observer=None):
     observed, results, errors, starts = [], [], [], []
     context = zmq.Context()
     sender = context.socket(zmq.PUSH)
@@ -64,12 +64,15 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
     sender.setsockopt(zmq.SNDTIMEO, 10000)
     port = sender.bind_to_random_port("tcp://127.0.0.1")
 
-    def observer(batch, positioned):
+    def observe(batch, positioned):
         if batch.start_of_series:
             starts.append(bytes(batch.start_metadata))
         if len(batch.image_ids):
-            pixels = cp.asnumpy(positioned.images)
-            observed.append((int(batch.series_id), list(batch.image_ids), pixels))
+            if observer is None:
+                pixels = cp.asnumpy(positioned.images)
+                observed.append((int(batch.series_id), list(batch.image_ids), pixels))
+            else:
+                observer(batch, positioned)
             time.sleep(processing_delay)
         if batch.end_of_series:
             results.append(positioned.result)
@@ -78,7 +81,7 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                             scan=dict(width=scan[0], height=scan[1]),
                             execute=dict(mode="service" if service else "finite", seconds=3 if service else 10),
                             zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"))
-    app = PipelineApp(config, observer=observer)
+    app = PipelineApp(config, observer=observe)
     stopping = threading.Event()
 
     def receive():
@@ -147,3 +150,142 @@ def test_idle_sigterm(capsys):
     thread.join(timeout=5)
     assert termination.name == "STOPPED"
     assert "[holoscan] ready" in capsys.readouterr().out
+
+
+def _delayed_copy_kernel():
+    return cp.RawKernel(r"""
+        extern "C" __global__ void delayed_copy(
+                const unsigned short* source, unsigned short* destination,
+                int count, unsigned long long delay_cycles) {
+            unsigned long long started = clock64();
+            while (clock64() - started < delay_cycles) { }
+            for (int index = threadIdx.x; index < count; index += blockDim.x) {
+                destination[index] = source[index];
+            }
+        }
+    """, "delayed_copy")
+
+
+def _queue_copy(kernel, source, destination, stream, delay_cycles):
+    kernel((1,), (256,), (source, destination, int(source.size), int(delay_cycles)),
+           stream=stream)
+
+
+def test_async_observer_retains_sdk_tensor_and_cupy_views_across_callbacks():
+    kernel = _delayed_copy_kernel()
+    retained = []
+    reimports = []
+
+    def observer(batch, positioned):
+        ids = [int(value) for value in batch.image_ids]
+        if not ids:
+            return
+        stream = cp.cuda.get_current_stream()
+        if retained:
+            previous = retained[-1]
+            tensor = cp.from_dlpack(previous["tensor"])
+            view = tensor[:len(previous["ids"])]
+            output = cp.empty_like(view)
+            _queue_copy(kernel, view, output, stream, 0)
+            event = cp.cuda.Event(disable_timing=True)
+            event.record(stream)
+            reimports.append({"ids": previous["ids"], "output": output, "event": event})
+
+        view = positioned.images
+        output = cp.empty_like(view)
+        _queue_copy(kernel, view, output, stream, 200_000_000)
+        event = cp.cuda.Event(disable_timing=True)
+        event.record(stream)
+        retained.append({
+            "ids": ids,
+            "tensor": positioned.tensor,
+            "view": view,
+            "output": output,
+            "event": event,
+            "callback_pending": not event.done,
+        })
+
+    observed, _, _ = run_series(
+        [(19, list(range(9)))], batch_size=3, scan=(4, 3), queue_depth=2,
+        observer=observer)
+
+    assert not observed
+    assert len(retained) == 3
+    assert all(item["callback_pending"] for item in retained)
+    assert [item["ids"] for item in retained] == [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    assert [item["ids"] for item in reimports] == [[0, 1, 2], [3, 4, 5]]
+    for item in retained:
+        item["event"].synchronize()
+        expected = np.broadcast_to(
+            (np.asarray(item["ids"], dtype=np.uint16) + 1)[:, None, None],
+            item["output"].shape)
+        np.testing.assert_array_equal(cp.asnumpy(item["output"]), expected)
+        np.testing.assert_array_equal(cp.asnumpy(item["view"]), expected)
+    for item in reimports:
+        item["event"].synchronize()
+        expected = np.broadcast_to(
+            (np.asarray(item["ids"], dtype=np.uint16) + 1)[:, None, None],
+            item["output"].shape)
+        np.testing.assert_array_equal(cp.asnumpy(item["output"]), expected)
+
+
+def test_completion_tracker_rejects_over_capacity_until_drain():
+    from live4d.completion import CompletionTracker
+
+    tracker = CompletionTracker(capacity=1, device=0)
+    tracker.start()
+    kernel = _delayed_copy_kernel()
+    source = cp.arange(256, dtype=cp.uint16)
+    first_output = cp.empty_like(source)
+    second_output = cp.empty_like(source)
+    first_stream = cp.cuda.Stream(non_blocking=True)
+    second_stream = cp.cuda.Stream(non_blocking=True)
+    completed = []
+    try:
+        with first_stream:
+            _queue_copy(kernel, source, first_output, first_stream, 600_000_000)
+        tracker.track(1, first_stream, owners=(source, first_output),
+                      on_complete=lambda completed_at: completed.append(1))
+
+        with second_stream:
+            _queue_copy(kernel, source, second_output, second_stream, 1_000_000)
+        with pytest.raises(RuntimeError, match="Asynchronous completion capacity exhausted"):
+            tracker.track(2, second_stream, owners=(source, second_output),
+                          on_complete=lambda completed_at: completed.append(2))
+
+        assert completed == []
+        tracker.drain()
+        tracker.check()
+        assert completed == [1]
+
+        with second_stream:
+            _queue_copy(kernel, source, second_output, second_stream, 0)
+        tracker.track(3, second_stream, owners=(source, second_output),
+                      on_complete=lambda completed_at: completed.append(3))
+        tracker.drain()
+        tracker.check()
+        assert completed == [1, 3]
+    finally:
+        tracker.close()
+
+
+def test_completion_tracker_reports_callback_error_during_close():
+    from live4d.completion import CompletionTracker
+
+    tracker = CompletionTracker(capacity=1, device=0)
+    tracker.start()
+    stream = cp.cuda.Stream(non_blocking=True)
+    source = cp.arange(32, dtype=cp.uint16)
+    output = cp.empty_like(source)
+    kernel = _delayed_copy_kernel()
+
+    def fail_completion(completed_at):
+        raise ValueError("completion callback failed")
+
+    with stream:
+        _queue_copy(kernel, source, output, stream, 1_000_000)
+    tracker.track(4, stream, owners=(source, output), on_complete=fail_completion)
+    with pytest.raises(RuntimeError, match="Asynchronous GPU completion failed") as error:
+        tracker.close()
+    assert isinstance(error.value.__cause__, ValueError)
+    assert str(error.value.__cause__) == "completion callback failed"

@@ -11,17 +11,21 @@ import time
 import holoscan as hs
 
 from .config import PipelineConfig, load_config
+from .completion import CompletionTracker
 from .operators import DecompressGpuOp, RdmaRxOp, ZmqRxOp, _PublicationWindow
 from .processing import ScanTensorOp, VirtualDetectorOp
 
 
 class PipelineApp:
     def __init__(self, config: PipelineConfig, *, conn=None, ring=None, credit=None,
-                 ring_device_address=None, observer=None):
+                 ring_device_address=None, observer=None, observer_host_ready=False):
         self.config = config
         self.ready = threading.Event()
         # One spare queue slot covers a released input until its callback commits consumption.
-        self.decoded_window = _PublicationWindow(config.queue_depth - 1)
+        self.decoded_window = _PublicationWindow(config.queue_depth - 1,
+                                                 consumers=("scan", "detector"))
+        self.completions = CompletionTracker(config.queue_depth - 1, config.device,
+                                             self.decoded_window.consumer("detector"))
         self.graph = hs.Graph("dectris-4dstem", default_clock=hs.RealtimeClock)
         graph = self.graph
         if config.transport == "zmq":
@@ -46,15 +50,22 @@ class PipelineApp:
                                batch_size=config.batch_size, max_batch=config.rdma["max_batch"],
                                device=config.device, publication_window=self.decoded_window.handle)
             graph.partition("receiver").add(decoded)
-        scan = graph.op(ScanTensorOp, "scan", scan_width=config.scan["width"],
+        scan_release = self.decoded_window.consumer("scan")
+
+        class BoundScan(ScanTensorOp):
+            def __init__(self):
+                super().__init__(release=scan_release)
+
+        scan = graph.op(BoundScan, "scan", scan_width=config.scan["width"],
                         scan_height=config.scan["height"])
         graph.add_flow(decoded.output, scan.input, queue_depth=config.queue_depth)
         ready, finite = self.ready, config.execute["mode"] == "finite"
-        release = self.decoded_window.release
+        completions = self.completions
 
         class BoundDetector(VirtualDetectorOp):
             def __init__(self):
-                super().__init__(ready=ready, finite=finite, observer=observer, release=release)
+                super().__init__(ready=ready, finite=finite, observer=observer,
+                                 completions=completions, observer_host_ready=observer_host_ready)
 
         detector = graph.op(BoundDetector, "detector", device_id=config.device,
                             scan_width=config.scan["width"], scan_height=config.scan["height"],
@@ -82,6 +93,7 @@ class PipelineApp:
                 deadline = None
                 reported = False
                 while not session.wait(timeout=0.05):
+                    self.completions.check()
                     if self.ready.is_set() and not reported:
                         reported = True
                         seconds = self.config.execute["seconds"]
@@ -95,8 +107,11 @@ class PipelineApp:
                     raise RuntimeError(f"Holoscan run failed: {session.summary()}")
                 return session.termination
         finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+            try:
+                self.completions.close()
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
 
 
 def main():

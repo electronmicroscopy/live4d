@@ -20,7 +20,8 @@ RDMA → registered ingress ring → GPU tensor loan ─┘
 | `holoscan_pipeline/python/live4d/app.py` | Graph construction, transport selection, CLI, and application lifetime |
 | `holoscan_pipeline/python/live4d/config.py` | Shared configuration and validation |
 | `holoscan_pipeline/python/live4d/algorithms/virtual_detectors.py` | CuPy BF/ADF masks and per-frame integration |
-| `holoscan_pipeline/python/live4d/processing.py` | Scan placement and Holoscan processing operators, including CUDA synchronization and tensor lifetime |
+| `holoscan_pipeline/python/live4d/processing.py` | Scan placement, ordered GPU processing, and observers |
+| `holoscan_pipeline/python/live4d/completion.py` | Bounded event polling, completion metrics, and admission acknowledgements |
 | `holoscan_pipeline/python/live4d/operators.py` | Python access to registered native ingest operators |
 | `holoscan_pipeline/cpp/` | ZMQ reception, GPU decompression, RDMA gathering, and bounded publication |
 | `holoscan_pipeline/schemas/` | Typed batch messages; CMake generates their Python and C++ bindings |
@@ -126,9 +127,72 @@ the configured scan are counted as received but omitted from BF/ADF placement. T
 output feeds both operators through typed inputs. The scan operator sends position metadata;
 the detector pairs it with the original batch using its event time and checks the batch ID.
 GPU tensors remain visible to runtime capacity and readiness tracking. CuPy views are created
-inside the typed detector callback, and CUDA work finishes before they are released.
+on the callback's runtime stream. The SDK protects storage through producer readiness,
+each consumer's queued CUDA work, and retained Tensor/CuPy views, even after `compute()` returns.
+Tensor recycling does not depend on an application acknowledgement.
 BF/ADF values retain float32 processing. Reported totals use a
 float64 reduction of those stored values to avoid large-scan float32 reduction rounding.
+
+### Contract for additional algorithms
+
+The supported runtime is Holoscan SDK 5.0.0. Its
+[Tensor stream and pool contract](https://docs.nvidia.com/holoscan/sdk-user-guide/data-and-payloads/tensors-in-depth)
+and [Python Tensor API](https://docs.nvidia.com/holoscan/sdk-user-guide/python/api-reference/holoscan)
+define the ownership rules used here:
+
+- Import the received runtime Tensor with `cp.from_dlpack(batch.frames)` inside
+  `with ctx.stream():`. CuPy must use that runtime stream, as `VirtualDetectorOp` does
+  with `cp.cuda.Stream.from_external`. Producer readiness is already ordered there.
+  Submit all work and record its completion event before the callback returns. Borrowed
+  SDK stream handles must never be saved for submissions from later callbacks or threads.
+- Retain the Tensor or its CuPy view when later work needs the input. Reimport the
+  retained Tensor on a later callback's current stream before using it there. Release
+  retained views in the operator that last used them, or establish completion before
+  releasing them elsewhere. Independent consumers each import on their own callback
+  stream; an acknowledgement from one consumer cannot retire another consumer's storage.
+- Use `CompletionTracker.wait_for_previous(stream)` when an algorithm mutates state
+  across callbacks. It inserts a GPU event dependency, allowing callbacks to return
+  while preserving series and scan-write order. Algorithms themselves remain in
+  `live4d.algorithms` and accept arrays and numerical parameters without Holoscan imports.
+- Call `CompletionTracker.track()` inside the callback after the algorithm and observer
+  submit work. Retain algorithm scratch through its `owners` argument. Its polling
+  thread only queries recorded events; it makes no submissions on borrowed streams.
+  Drain and close the tracker before destroying native windows or transport resources.
+- Register every consumer in `_PublicationWindow(..., consumers=(...))`. Give each
+  consumer its own acknowledgement callback. Acknowledgements identify exact batch IDs;
+  out-of-order completion cannot skip earlier batches. Admission advances only after
+  every registered consumer completes each batch. A metadata-only consumer may acknowledge
+  after publishing its metadata; GPU consumers acknowledge after their event completes.
+  The existing graph registers scan and detector separately.
+- Keep runtime-owned output loans for inter-operator image data and commit writes on
+  the producing callback's stream before publication. Bind the output device explicitly.
+  New output boundaries need their own finite tensor bounds and admission budget.
+  Runtime pool exhaustion fails explicitly; retained views consume that finite pool.
+  CuPy pass-through outputs require a separate bound on allocations and submitted work.
+
+`CompletionTracker` has a fixed pending-event capacity matching the publication window.
+It polls independently of detector callbacks, so a one-batch window can make progress.
+It retains owners until completion, propagates asynchronous failures, and drains outstanding
+events during shutdown. Exhaustion raises an error rather than growing storage or waiting
+for a routine batch. Its acknowledgements control application admission, while the SDK
+independently controls tensor reuse and the RDMA source independently returns ring credits.
+
+Observers run on the current callback's stream. `positioned.images` is an asynchronous
+CuPy view of the valid input prefix, and `positioned.tensor` is its retained SDK Tensor.
+Keeping either retains storage and can exhaust the finite pool. To use retained input on
+a later callback's stream, reimport `positioned.tensor`. An observer that needs host-ready
+input can opt into `PipelineApp(..., observer_host_ready=True)`; explicit `cp.asnumpy` in
+an observer is also a blocking readback. Enqueued observer work is included in completion
+and admission tracking. END observers receive host-ready totals.
+
+Blocking waits remain at startup warm-up, requested observer readback, END aggregation,
+validation, error cleanup, and teardown. The ZMQ decoder also reads GPU block counts and
+nvCOMP validation statuses on the host. These waits do not pace normal detector batches.
+The [asynchronous consumer tests](../holoscan_pipeline/tests/test_rdma_batches.py)
+enqueue delayed GPU reads, release callback-local views, and verify pixels after execution
+has drained. A separate pressure test disables application admission, fills the finite
+SDK pool, and checks that storage used by pending reads is preserved until explicit
+allocation exhaustion. Retained inputs and fanout are also covered.
 
 ## Validation and measurements
 
@@ -147,14 +211,19 @@ to enable them in the HSDK image. Tests cover fixed batching, partial
 and empty acquisitions, consecutive series, pixel values, scan clipping, BF/ADF results,
 readiness, credits, and shutdown. Protocol tests remain under `dectris/tests`; five existing
 probe tests currently reference the absent `tools.probe_imagemux` helper.
+GPU-ring cases also require verbs registration of CUDA device memory. A registration
+failure that reports missing `nvidia_peermem` and `Bad address` skips those cases;
+mapped-host tests still exercise CUDA consumers, asynchronous lifetime, and shutdown.
 
 At each completed series, `[series-result]` reports received/placed images, continuity gaps,
 batch sizes, BF/ADF totals, and delivered throughput. `delivered_fps` measures images between
-the first delivered batch and the last completed image batch, excluding the first batch
+the first completed batch and the last completed image batch, excluding the first batch
 from its numerator. It includes shared scan/BF/ADF processing. Compare it with separately
 recorded sender image counts, source acquisition duration, bstream drop deltas, and NIC
 counters. NIC sampling measures transport traffic and includes protocol overhead; it is not
 a substitute for delivered image counts.
+Completion timestamps come from ordered event polling, with approximately millisecond
+polling resolution; this is a completion-based rate, not a CPU submission rate.
 
 For sample pixel validation, `python3 -m live4d.validate` accepts an NPZ containing
 `ids` and CPU-reference `frames`, an expected image count, and a ZMQ endpoint. It exercises

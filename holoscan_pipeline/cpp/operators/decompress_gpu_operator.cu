@@ -311,7 +311,7 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
     const std::array<int64_t, 3> shape{static_cast<int64_t>(std::max(size_t{1}, count)),
                                      DETECTOR_HEIGHT, DETECTOR_WIDTH};
     HOLOSCAN_TRY(auto loan, output.allocate_tensor(shape));
-    stream_ = context.cuda_stream().get();  // Borrowed; Runtime owns this stream.
+    const auto stream = context.cuda_stream().get();
     HOLOSCAN_TRY(auto writer, loan.write(context.cuda_stream()));
     if (batch.pipeline_ready) {
       // Literal LZ4 blocks of zeroed bitshuffled pixels exercise nvCOMP and CUDA before READY.
@@ -334,7 +334,7 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
       for (size_t i = 0; i < BATCH_SIZE; ++i) pointers[i] = data.data() + i * image.size();
       DeviceAllocation scratch;
       scratch.allocate(BATCH_SIZE * DETECTOR_SIZE * sizeof(uint16_t));
-      if (!decompress_batch_gpu(pointers, sizes, BATCH_SIZE, scratch.as<uint16_t>()))
+      if (!decompress_batch_gpu(pointers, sizes, BATCH_SIZE, scratch.as<uint16_t>(), stream))
         return make_unexpected(Error{ErrorCode::kFailure, "GPU decompression warm-up failed"});
     }
     if (count > 0) {
@@ -348,7 +348,7 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
         pointers[i] = data + batch.offsets[i];
         sizes[i] = batch.sizes[i];
       }
-      if (!decompress_batch_gpu(pointers, sizes, count, writer.data_as<uint16_t>()))
+      if (!decompress_batch_gpu(pointers, sizes, count, writer.data_as<uint16_t>(), stream))
         return make_unexpected(Error{ErrorCode::kFailure, "GPU BSLZ4 decompression failed"});
     }
     HOLOSCAN_TRY(std::move(writer).commit());
@@ -417,7 +417,6 @@ void DecompressGpuOp::allocate_gpu_resources() {
 }
 
 void DecompressGpuOp::free_gpu_resources() {
-  stream_ = nullptr;  // Borrowed from ExecutionContext; never destroy it here.
 
   // Note: h_pinned_compressed_ is now owned by zmq_rx_operator, don't free it here
 
@@ -441,7 +440,7 @@ void DecompressGpuOp::free_gpu_resources() {
 bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& compressed_ptrs,
                                             const std::vector<size_t>& compressed_sizes,
                                             size_t num_images,
-                                            uint16_t* output_buffer) {
+                                            uint16_t* output_buffer, cudaStream_t stream) {
   nvtx3::scoped_range range("GPU Decompression Pipeline", nvtx3::rgb{0, 0, 255}); // Blue
 
   if (num_images == 0 || num_images > BATCH_SIZE) {
@@ -477,7 +476,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
     CUDA_CHECK(cudaMemcpyAsync(d_compressed_data_,
                                 compressed_ptrs[0],
                                 total_compressed_size,
-                                cudaMemcpyHostToDevice, stream_));
+                                cudaMemcpyHostToDevice, stream));
 
     HOLOSCAN_LOG_DEBUG("  H2D transfer: {} bytes (single contiguous copy)", total_compressed_size);
   }
@@ -508,9 +507,9 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
 
     // Copy compressed pointers and sizes to device
     CUDA_CHECK(cudaMemcpyAsync((void*)d_compressed_ptrs_, h_compressed_ptrs.data(),
-                                num_images * sizeof(uint8_t*), cudaMemcpyHostToDevice, stream_));
+                                num_images * sizeof(uint8_t*), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_compressed_sizes_, h_compressed_sizes_no_dectris.data(),
-                                num_images * sizeof(size_t), cudaMemcpyHostToDevice, stream_));
+                                num_images * sizeof(size_t), cudaMemcpyHostToDevice, stream));
 
     HOLOSCAN_LOG_DEBUG("  Built compressed pointer arrays: {} images", num_images);
   }
@@ -546,7 +545,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
         d_num_blocks_temp,
         num_images,
         MAX_BLOCKS_PER_IMAGE,
-        stream_);
+        stream);
 
     if (err != cudaSuccess) {
       HOLOSCAN_LOG_ERROR("GPU header parsing failed: {}", cudaGetErrorString(err));
@@ -558,10 +557,10 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
 
   // Get total number of blocks across all images (async copy with pinned memory)
   CUDA_CHECK(cudaMemcpyAsync(h_pinned_num_blocks_, d_num_blocks_temp,
-                            num_images * sizeof(int), cudaMemcpyDeviceToHost, stream_));
+                            num_images * sizeof(int), cudaMemcpyDeviceToHost, stream));
 
   // Synchronize only when we need to read the value
-  CUDA_CHECK(cudaStreamSynchronize(stream_));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   size_t total_blocks = 0;
   for (size_t i = 0; i < num_images; ++i) {
@@ -621,7 +620,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
         d_nvcomp_in_sizes,
         d_nvcomp_out_ptrs,
         d_nvcomp_out_sizes,
-        stream_);
+        stream);
 
     if (err != cudaSuccess) {
       HOLOSCAN_LOG_ERROR("GPU nvcomp array building failed: {}", cudaGetErrorString(err));
@@ -684,7 +683,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
         d_nvcomp_out_ptrs,         // device_uncompressed_chunk_ptrs
         decompress_opts,           // decompress_opts (NEW in 5.0)
         d_nvcomp_statuses,         // device_statuses
-        stream_));                 // stream
+        stream));                 // stream
 
     HOLOSCAN_LOG_DEBUG("  LZ4 decompression launched for {} blocks", total_blocks);
   }
@@ -714,9 +713,9 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
     uint8_t** d_output_ptrs_array = output_ptrs_alloc.as<uint8_t*>();
 
     CUDA_CHECK(cudaMemcpyAsync(d_intermediate_ptrs_array, h_intermediate_ptrs.data(),
-                                num_images * sizeof(uint8_t*), cudaMemcpyHostToDevice, stream_));
+                                num_images * sizeof(uint8_t*), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_output_ptrs_array, h_output_ptrs.data(),
-                                num_images * sizeof(uint8_t*), cudaMemcpyHostToDevice, stream_));
+                                num_images * sizeof(uint8_t*), cudaMemcpyHostToDevice, stream));
 
     // Call bitshuffle with pointer arrays
     size_t num_elements = image_size / sizeof(uint16_t);  // Number of uint16 elements per image
@@ -726,7 +725,7 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
         num_elements,
         sizeof(uint16_t),  // element_size
         num_images,        // batch_size
-        stream_);
+        stream);
 
     if (err != cudaSuccess) {
       HOLOSCAN_LOG_ERROR("Bitshuffle unshuffle failed: {}", cudaGetErrorString(err));
@@ -734,16 +733,6 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
     }
 
     HOLOSCAN_LOG_DEBUG("  Bitshuffle unshuffle: {} images", num_images);
-  }
-
-  // ============================================================================
-  // Step 8: Synchronize Stream
-  // ============================================================================
-
-  {
-    nvtx3::scoped_range sync_range("Stream Synchronization", nvtx3::rgb{128, 128, 128}); // Gray
-
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
   }
 
   // ============================================================================
@@ -758,10 +747,10 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
     // Use async copy to pinned memory (non-blocking)
     CUDA_CHECK(cudaMemcpyAsync(h_pinned_statuses_, d_nvcomp_statuses,
                               total_blocks * sizeof(nvcompStatus_t),
-                              cudaMemcpyDeviceToHost, stream_));
+                              cudaMemcpyDeviceToHost, stream));
 
     // Synchronize to ensure status is ready
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     size_t num_failures = 0;
     for (size_t i = 0; i < total_blocks; ++i) {
@@ -778,6 +767,9 @@ bool DecompressGpuOp::decompress_batch_gpu(const std::vector<const uint8_t*>& co
       return false;
     }
   }
+  #else
+  // Without host status validation, drain temporary allocations before they are freed.
+  CUDA_CHECK(cudaStreamSynchronize(stream));
   #endif  // ENABLE_STATUS_VERIFICATION
 
   HOLOSCAN_LOG_DEBUG("GPU decompression complete: {} images, {} blocks", num_images, total_blocks);

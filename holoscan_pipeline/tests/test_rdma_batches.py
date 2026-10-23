@@ -32,6 +32,7 @@ class RingWriter:
         self.position = 0
         self.sequence = 0
         self.records = []
+        self.wrap_count = 0
 
     def write(self, kind, data=b"", *, series_id=0, image=None):
         from dectris.imagemux import FrameHeader, FrameKind, frame_span
@@ -39,6 +40,7 @@ class RingWriter:
         offset = self.position % self.ring_bytes
         span = frame_span(len(data))
         if kind != FrameKind.WRAP and offset + span > self.ring_bytes:
+            self.wrap_count += 1
             self.write(FrameKind.WRAP)
             offset = 0
 
@@ -134,9 +136,9 @@ def _end(writer, series_id):
 
 
 class Loopback:
-    """Two local queue pairs with a registered host-mapped receiver ring."""
+    """Two local queue pairs with a registered receiver ring."""
 
-    def __init__(self, ring_bytes):
+    def __init__(self, ring_bytes, ring_memory="host_mapped"):
         import cupy as cp
         import numpy as np
         from dectris import imxrdma
@@ -145,9 +147,17 @@ class Loopback:
         self.cp = cp
         self.np = np
         self.ctx = imxrdma.Context(local_addr=LOCAL_ADDR)
-        self.ring_mem = cp.cuda.PinnedMemory(ring_bytes, cp.cuda.runtime.hostAllocMapped)
-        self.ring_address = self.ring_mem.ptr
-        self.ring_device_address = mapped_device_pointer(self.ring_address, 0)
+        if ring_memory == "host_mapped":
+            self.ring_mem = cp.cuda.PinnedMemory(ring_bytes, cp.cuda.runtime.hostAllocMapped)
+            self.ring_address = self.ring_mem.ptr
+            self.ring_device_address = mapped_device_pointer(self.ring_address, 0)
+        elif ring_memory == "gpu":
+            with cp.cuda.Device(0):
+                self.ring_mem = cp.empty(ring_bytes, dtype=cp.uint8)
+            self.ring_address = self.ring_mem.data.ptr
+            self.ring_device_address = self.ring_address
+        else:
+            raise ValueError(f"unsupported ring memory: {ring_memory}")
         self.ring_mr = self.ctx.register(self.ring_address, ring_bytes, remote_write=True)
         self.credit = np.zeros(1, dtype=np.uint64)
         self.credit_mr = self.ctx.register(self.credit.ctypes.data, self.credit.nbytes,
@@ -161,6 +171,7 @@ class Loopback:
         self.source_mr = None
         self.imms = np.empty(64, dtype=np.uint32)
         self.ring_bytes = ring_bytes
+        self.ring_memory = ring_memory
 
     @property
     def credit_position(self):
@@ -231,9 +242,20 @@ class Loopback:
         self.ctx = None
 
 
+def _loopback_or_skip(ring_bytes, ring_memory):
+    try:
+        return Loopback(ring_bytes, ring_memory=ring_memory)
+    except RuntimeError as error:
+        message = str(error)
+        if (ring_memory == "gpu" and "ibv_reg_mr" in message
+                and "Bad address" in message and "nvidia_peermem" in message):
+            pytest.skip("GPU ring registration requires nvidia_peermem on the RDMA device")
+        raise
+
+
 def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
                     stop_after_first_data=False, publication_window=0, release=None,
-                    sink_delay_s=0):
+                    sink_delay_s=0, ring_memory=None):
     import cupy as cp
     import holoscan as hs
     import numpy as np
@@ -294,7 +316,7 @@ def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
         graph, "rdma_rx", qp_handle=loopback.rx.native_handle,
         ring_address=loopback.ring_address,
         ring_device_address=loopback.ring_device_address,
-        ring_bytes=loopback.ring_bytes, ring_memory="host_mapped",
+        ring_bytes=loopback.ring_bytes, ring_memory=ring_memory or loopback.ring_memory,
         credit_address=loopback.credit_mr.address, credit_rkey=loopback.credit_mr.rkey,
         batch_size=batch_size, max_batch=max_batch, device=0,
         publication_window=publication_window,
@@ -310,6 +332,198 @@ def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
     if not plan.ok:
         raise RuntimeError(plan.summary())
     return plan, records, ready, first_data, all_ends
+
+
+class AsyncBatchReleaser:
+    def __init__(self, window, consumer_count):
+        self.window = window
+        self.consumer_count = consumer_count
+        self.pending = {}
+        self.released = []
+        self.max_pending = 0
+        self.errors = []
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self._poll, daemon=True)
+        self.thread.start()
+
+    def add(self, batch_id, event):
+        with self.lock:
+            events = self.pending.setdefault(batch_id, [])
+            events.append(event)
+            if len(events) > self.consumer_count:
+                raise AssertionError(f"too many consumer events for batch {batch_id}")
+            self.max_pending = max(self.max_pending, len(self.pending))
+
+    def _poll(self):
+        while not self.stopping.is_set():
+            with self.lock:
+                ready = [
+                    (batch_id, tuple(events))
+                    for batch_id, events in self.pending.items()
+                    if len(events) == self.consumer_count
+                ]
+            for batch_id, events in ready:
+                try:
+                    if all(event.done for event in events):
+                        self.window.release(batch_id)
+                        with self.lock:
+                            self.pending.pop(batch_id, None)
+                            self.released.append(batch_id)
+                except BaseException as error:
+                    self.errors.append(error)
+                    self.stopping.set()
+                    return
+            time.sleep(0.001)
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=10)
+        assert not self.thread.is_alive(), "asynchronous RDMA release poller did not stop"
+        assert not self.errors, self.errors
+
+
+def _async_copy_kernel():
+    import cupy as cp
+
+    return cp.RawKernel(r"""
+        extern "C" __global__ void delayed_copy(
+                const unsigned short* source, unsigned short* destination,
+                int count, unsigned long long delay_cycles) {
+            unsigned long long started = clock64();
+            while (clock64() - started < delay_cycles) { }
+            for (int index = threadIdx.x; index < count; index += blockDim.x) {
+                destination[index] = source[index];
+            }
+        }
+    """, "delayed_copy")
+
+
+def _build_async_receiver(loopback, batch_size, *, queue_depth=1,
+                          publication_window=0, releaser=None, fanout=False,
+                          stop_after_first_data=False, delay_cycles=100_000_000,
+                          copy_kernel=None, output_buffers=None,
+                          record_input_reuse=False):
+    import cupy as cp
+    import holoscan as hs
+
+    from live4d.operators import RdmaRxOp
+    from live4d.schemas.decoded_batch import DecodedBatch
+
+    records = {"slow": []}
+    if fanout:
+        records["fast"] = []
+    ready = threading.Event()
+    first_data = threading.Event()
+    kernel = copy_kernel or _async_copy_kernel()
+    output_indices = {name: 0 for name in records}
+
+    class AsyncSink(hs.Operator):
+        inp = hs.Input("input", DecodedBatch)
+
+        def __init__(self):
+            super().__init__()
+
+        def setup(self, spec):
+            spec.input(self.inp)
+
+        def contract(self):
+            return hs.Contract().trigger(hs.OnEach(self.inp))
+
+        def compute(self, ctx):
+            batch = self.inp.receive_data()
+            consumer_name = "fast" if "fast_sink" in ctx.operator_path else "slow"
+            ids = [int(value) for value in batch.image_ids]
+            tensor = None
+            view = None
+            output = None
+            input_ptr = None
+            prior_pending_input_ptrs = ()
+            with cp.cuda.Device(0), ctx.stream():
+                stream = cp.cuda.get_current_stream()
+                if ids:
+                    tensor = cp.from_dlpack(batch.frames)
+                    view = tensor[:len(ids)]
+                    if record_input_reuse:
+                        input_ptr = int(view.data.ptr)
+                        prior_pending_input_ptrs = tuple(
+                            previous["input_ptr"]
+                            for previous in records[consumer_name]
+                            if previous["image_ids"] and not previous["event"].done
+                        )
+                    if output_buffers is None:
+                        output = cp.empty_like(view)
+                    else:
+                        output = output_buffers[consumer_name][output_indices[consumer_name]]
+                        output_indices[consumer_name] += 1
+                    kernel((1,), (256,), (view, output, len(view.ravel()),
+                                          delay_cycles if consumer_name == "slow" else 0),
+                           stream=stream)
+                event = cp.cuda.Event(disable_timing=True)
+                event.record(stream)
+                callback_pending = not event.done
+            item = {
+                "batch_id": int(batch.batch_id),
+                "image_ids": ids,
+                "output": output,
+                "event": event,
+                "callback_pending": callback_pending,
+                "end": bool(batch.end_of_series),
+            }
+            if record_input_reuse and ids:
+                item["input_ptr"] = input_ptr
+                item["prior_pending_input_ptrs"] = prior_pending_input_ptrs
+            if releaser is not None:
+                releaser.add(item["batch_id"], event)
+            records[consumer_name].append(item)
+            if batch.pipeline_ready:
+                ready.set()
+            if ids:
+                first_data.set()
+                if stop_after_first_data:
+                    ctx.request_completion()
+            del tensor, view
+
+    graph = hs.Graph("rdma-async-lifetime", default_clock=hs.RealtimeClock)
+    source = RdmaRxOp(
+        graph, "rdma_rx", qp_handle=loopback.rx.native_handle,
+        ring_address=loopback.ring_address,
+        ring_device_address=loopback.ring_device_address,
+        ring_bytes=loopback.ring_bytes, ring_memory=loopback.ring_memory,
+        credit_address=loopback.credit_mr.address, credit_rkey=loopback.credit_mr.rkey,
+        batch_size=batch_size, max_batch=32, device=0,
+        publication_window=publication_window,
+    )
+    sink_types = [("slow", AsyncSink)]
+    if fanout:
+        sink_types.append(("fast", AsyncSink))
+    for name, sink_type in sink_types:
+        sink = graph.op(sink_type, f"{name}_sink")
+        graph.add_flow(source.output, sink.input, queue_depth=queue_depth)
+        graph.partition(f"{name}_partition").add(sink)
+    graph.partition("receiver").add(source)
+    deployment = hs.execution.DeploymentBinding()
+    deployment.bind_tensor_output_device(
+        operator_path="rdma_rx", output_port="output", device=hs.execution.DeviceId(0))
+    plan = hs.compile(graph, hs.CompileOptions(deployment=deployment))
+    if not plan.ok:
+        raise RuntimeError(plan.summary())
+    return plan, records, ready, first_data
+
+
+def _assert_async_pixels(records, expected_batches, *, require_pending=True):
+    import numpy as np
+
+    data = [record for record in records if record["image_ids"]]
+    assert [record["image_ids"] for record in data] == [ids for ids, _ in expected_batches]
+    for record, (_, values) in zip(data, expected_batches):
+        if require_pending:
+            assert record["callback_pending"], "the GPU read completed before the callback returned"
+        record["event"].synchronize()
+        pixels = record["output"].get()
+        expected = np.broadcast_to(
+            np.asarray(values, dtype=np.uint16)[:, None, None], pixels.shape)
+        np.testing.assert_array_equal(pixels, expected)
 
 
 def _wait_until(session, predicate, timeout, detail):
@@ -541,5 +755,256 @@ def test_failed_receive_completion_fails_the_graph():
                 hs.RunTermination.STOPPED,
             ), session.summary()
             assert "RDMA connection failed" in session.summary()
+    finally:
+        loopback.close()
+
+
+@pytest.mark.parametrize("ring_memory", ["gpu", "host_mapped"])
+def test_async_fanout_reads_survive_repeated_ring_wraps_and_partial_batch(ring_memory):
+    ring_bytes = 37_376
+    loopback = _loopback_or_skip(ring_bytes, ring_memory)
+    window = BatchWindow(1)
+    releaser = AsyncBatchReleaser(window, consumer_count=2)
+    try:
+        writer = RingWriter(ring_bytes)
+        _start(writer, 93, 17)
+        values = [((image_id * 29) + 7) % 251 for image_id in range(17)]
+        for image_id, value in enumerate(values):
+            _image(writer, 93, [image_id], [value])
+        _end(writer, 93)
+        plan, received, ready, _ = _build_async_receiver(
+            loopback, batch_size=3, queue_depth=1, publication_window=window.handle,
+            releaser=releaser, fanout=True)
+
+        sender, sender_errors = _start_sender(loopback, writer.records)
+        try:
+            import holoscan as hs
+
+            with hs.run_async(plan) as session:
+                _wait_until(session, ready.is_set, 20, "READY")
+                _wait_until(session, lambda: any(item["end"] for item in received["slow"]),
+                            45, "END after asynchronous fanout")
+                assert not session.wait(timeout=0.1)
+                session.request_stop()
+                assert session.wait(timeout=10), session.summary()
+                assert session.termination in (
+                    hs.RunTermination.REQUESTED_COMPLETED, hs.RunTermination.COMPLETED,
+                    hs.RunTermination.STOPPED,
+                ), session.summary()
+        finally:
+            _join_sender(sender, sender_errors, timeout=25)
+
+        expected = [(list(range(start, min(start + 3, 17))),
+                     values[start:min(start + 3, 17)]) for start in range(0, 17, 3)]
+        _assert_async_pixels(received["slow"], expected)
+        _assert_async_pixels(received["fast"], expected, require_pending=False)
+        assert writer.wrap_count >= 3
+        assert releaser.max_pending <= 1
+        assert len(releaser.released) >= len(expected)
+        assert loopback.credit_position >= writer.position
+    finally:
+        releaser.close()
+        window.close()
+        loopback.close()
+
+
+def test_async_split_transport_frame_preserves_partial_tail():
+    loopback = Loopback(1 << 20, ring_memory="host_mapped")
+    window = BatchWindow(1)
+    releaser = AsyncBatchReleaser(window, consumer_count=1)
+    try:
+        writer = RingWriter(loopback.ring_bytes)
+        _start(writer, 96, 9)
+        ids = list(range(101, 110))
+        values = [5, 17, 33, 65, 129, 11, 23, 41, 87]
+        _image(writer, 96, ids, values)
+        _end(writer, 96)
+        plan, received, ready, _ = _build_async_receiver(
+            loopback, batch_size=2, queue_depth=1, publication_window=window.handle,
+            releaser=releaser)
+        sender, sender_errors = _start_sender(loopback, writer.records)
+        try:
+            import holoscan as hs
+
+            with hs.run_async(plan) as session:
+                _wait_until(session, ready.is_set, 20, "READY")
+                _wait_until(session, lambda: any(item["end"] for item in received["slow"]),
+                            30, "END after asynchronous frame split")
+                assert not session.wait(timeout=0.1)
+                session.request_stop()
+                assert session.wait(timeout=10), session.summary()
+                assert session.termination in (
+                    hs.RunTermination.REQUESTED_COMPLETED, hs.RunTermination.COMPLETED,
+                    hs.RunTermination.STOPPED,
+                ), session.summary()
+        finally:
+            _join_sender(sender, sender_errors, timeout=20)
+
+        expected = [(ids[index:index + 2], values[index:index + 2])
+                    for index in range(0, len(ids), 2)]
+        _assert_async_pixels(received["slow"], expected)
+        assert [len(item["image_ids"]) for item in received["slow"]
+                if item["image_ids"]] == [2, 2, 2, 2, 1]
+        assert loopback.credit_position >= writer.position
+    finally:
+        releaser.close()
+        window.close()
+        loopback.close()
+
+
+@pytest.mark.parametrize("ring_memory", ["gpu", "host_mapped"])
+def test_stop_drains_delayed_gpu_read_after_callback_returns(ring_memory):
+    loopback = _loopback_or_skip(1 << 20, ring_memory)
+    window = BatchWindow(1)
+    releaser = AsyncBatchReleaser(window, consumer_count=1)
+    try:
+        writer = RingWriter(loopback.ring_bytes)
+        _start(writer, 94, 8)
+        image_record, _ = _image(writer, 94, list(range(8)),
+                                 [2, 4, 8, 16, 32, 64, 128, 256])
+        plan, received, ready, first_data = _build_async_receiver(
+            loopback, batch_size=2, queue_depth=1, publication_window=window.handle,
+            releaser=releaser, stop_after_first_data=True)
+        import holoscan as hs
+
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 20, "READY")
+            sender, sender_errors = _start_sender(loopback, writer.records)
+            try:
+                assert session.wait(timeout=25), "source did not stop after the first GPU read"
+                assert session.termination in (
+                    hs.RunTermination.REQUESTED_COMPLETED, hs.RunTermination.COMPLETED,
+                    hs.RunTermination.STOPPED,
+                ), session.summary()
+                assert first_data.is_set()
+            finally:
+                _join_sender(sender, sender_errors, timeout=25)
+
+        _assert_async_pixels(received["slow"], [([0, 1], [2, 4])])
+        data = [item for item in received["slow"] if item["image_ids"]]
+        assert len(data) == 1 and data[0]["callback_pending"]
+        assert loopback.credit_position <= image_record.start
+        assert not any(item["end"] for item in received["slow"])
+    finally:
+        releaser.close()
+        window.close()
+        loopback.close()
+
+
+def test_receive_error_preserves_async_gpu_read_until_graph_teardown():
+    loopback = Loopback(1 << 20, ring_memory="host_mapped")
+    try:
+        writer = RingWriter(loopback.ring_bytes)
+        _start(writer, 95, 2)
+        _image(writer, 95, [50, 51], [17, 29])
+        plan, received, ready, first_data = _build_async_receiver(
+            loopback, batch_size=2, queue_depth=1, delay_cycles=2_000_000_000)
+        import holoscan as hs
+
+        sender, sender_errors = _start_sender(loopback, writer.records)
+        try:
+            with hs.run_async(plan) as session:
+                _wait_until(session, ready.is_set, 20, "READY")
+                _wait_until(session, first_data.is_set, 20, "first asynchronous GPU read")
+                _join_sender(sender, sender_errors, timeout=20)
+                data_item = next(item for item in received["slow"] if item["image_ids"])
+                assert not data_item["event"].done
+                loopback.send_bad_rkey()
+                deadline = time.monotonic() + 20
+                while not session.wait(timeout=0.02) and time.monotonic() < deadline:
+                    pass
+                assert session.termination not in (
+                    hs.RunTermination.REQUESTED_COMPLETED, hs.RunTermination.COMPLETED,
+                    hs.RunTermination.STOPPED,
+                ), session.summary()
+                assert "RDMA connection failed" in session.summary()
+        finally:
+            if sender.is_alive():
+                _join_sender(sender, sender_errors, timeout=20)
+
+        _assert_async_pixels(received["slow"], [([50, 51], [17, 29])])
+        assert data_item["callback_pending"]
+    finally:
+        loopback.close()
+
+
+def test_async_slow_fanout_exhausts_bounded_sdk_pool_without_reusing_live_inputs():
+    ring_bytes = 2 << 20
+    loopback = Loopback(ring_bytes, ring_memory="host_mapped")
+    try:
+        writer = RingWriter(ring_bytes)
+        image_ids = list(range(300, 364))
+        values = [(image_id * 17 + 3) % 251 for image_id in image_ids]
+        _start(writer, 98, len(image_ids))
+        for image_id, value in zip(image_ids, values):
+            _image(writer, 98, [image_id], [value])
+        _end(writer, 98)
+
+        import cupy as cp
+
+        kernel = _async_copy_kernel()
+        kernel.compile()
+        output_buffers = {
+            consumer: [cp.empty((1, 96, 96), dtype=cp.uint16) for _ in image_ids]
+            for consumer in ("slow", "fast")
+        }
+        # No publication window: the source may publish independently of the slow consumer's
+        # callback-stream events. Its finite SDK tensor pool must reject exhaustion rather than
+        # recycle storage still being read by those asynchronous kernels.
+        plan, received, ready, _ = _build_async_receiver(
+            loopback, batch_size=1, queue_depth=8, fanout=True,
+            delay_cycles=500_000_000, copy_kernel=kernel,
+            output_buffers=output_buffers, record_input_reuse=True)
+        import holoscan as hs
+
+        sender, sender_errors = _start_sender(loopback, writer.records)
+        try:
+            with hs.run_async(plan) as session:
+                _wait_until(session, ready.is_set, 20, "READY")
+                deadline = time.monotonic() + 12
+                completed = False
+                while time.monotonic() < deadline:
+                    if session.wait(timeout=0.01):
+                        completed = True
+                        break
+                    if (any(item["end"] for item in received["slow"])
+                            or sum(bool(item["image_ids"]) for item in received["slow"])
+                            == len(image_ids)):
+                        break
+                failure_summary = session.summary()
+                if not completed:
+                    session.request_stop()
+                    assert session.wait(timeout=20), session.summary()
+                _join_sender(sender, sender_errors, timeout=20)
+                slow_data = [item for item in received["slow"] if item["image_ids"]]
+                fast_data = [item for item in received["fast"] if item["image_ids"]]
+                progress = {
+                    "slow_ids": [item["image_ids"] for item in slow_data],
+                    "slow_pending": [item["callback_pending"] for item in slow_data],
+                    "slow_prior_pending": [item["prior_pending_input_ptrs"]
+                                           for item in slow_data],
+                    "fast_ids": [item["image_ids"] for item in fast_data],
+                }
+                assert completed and "kResourceExhausted" in failure_summary, (
+                    f"source did not report bounded tensor-pool exhaustion: "
+                    f"{failure_summary}; progress={progress}")
+        finally:
+            if sender.is_alive():
+                _join_sender(sender, sender_errors, timeout=20)
+
+        assert slow_data, "the slow partition did not receive asynchronous data"
+        assert fast_data, "the fast partition did not receive asynchronous data"
+        assert len(slow_data) <= len(image_ids)
+        assert len(fast_data) <= len(image_ids)
+        assert all(item["callback_pending"] for item in slow_data)
+        assert any(item["prior_pending_input_ptrs"] for item in slow_data)
+        for item in slow_data:
+            assert item["input_ptr"] not in item["prior_pending_input_ptrs"]
+        values_by_id = dict(zip(image_ids, values))
+        for consumer, data in (("slow", slow_data), ("fast", fast_data)):
+            expected = [(item["image_ids"], [values_by_id[index]
+                                               for index in item["image_ids"]])
+                        for item in data]
+            _assert_async_pixels(received[consumer], expected, require_pending=False)
     finally:
         loopback.close()

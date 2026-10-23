@@ -42,7 +42,6 @@ class DecompressGpuOp final : public Operator<DecompressGpuParams> {
   size_t* d_compressed_sizes_ = nullptr;
   int* h_pinned_num_blocks_ = nullptr;
   nvcompStatus_t* h_pinned_statuses_ = nullptr;
-  cudaStream_t stream_ = nullptr;
   int64_t last_capture_ns_ = -1;
   ::dectris::BatchWindow* publication_window_{};
   ::dectris::BatchWindow* input_window_{};
@@ -52,6 +51,6 @@ class DecompressGpuOp final : public Operator<DecompressGpuParams> {
   void free_gpu_resources();
   bool decompress_batch_gpu(const std::vector<const uint8_t*>& compressed_ptrs,
                             const std::vector<size_t>& compressed_sizes,
-                            size_t num_images, uint16_t* output_buffer);
+                            size_t num_images, uint16_t* output_buffer, cudaStream_t stream);
 };
 }  // namespace holoscan::ops
