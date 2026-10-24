@@ -62,7 +62,8 @@ def image_message(image_id, value, shape=(96, 96)):
 
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
-               processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False):
+               processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
+               devices=None, extra_observer=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
     context = zmq.Context()
     sender = context.socket(zmq.PUSH)
@@ -85,8 +86,10 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
             time.sleep(processing_delay)
         if batch.end_of_series:
             results.append(positioned.result)
+        if extra_observer is not None:
+            extra_observer(batch, positioned)
 
-    config = PipelineConfig(batch_size=batch_size, queue_depth=queue_depth,
+    config = PipelineConfig(batch_size=batch_size, queue_depth=queue_depth, devices=devices,
                             scan=dict(width=scan[0], height=scan[1]),
                             execute=dict(mode="service" if service else "finite", seconds=3 if service else 10),
                             zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"))
@@ -121,11 +124,11 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
             assert errors, errors
             return observed, results, app.plan, batch_shapes
         assert not errors, errors
-        assert starts == [cbor2.dumps(cbor2.CBORTag(
+        assert sorted(starts) == sorted([cbor2.dumps(cbor2.CBORTag(
             55799, start_message(entry[0], len(entry[1]),
                                  entry[2] if len(entry) > 2 else (96, 96),
                                  entry[4] if len(entry) > 4 else "uint16")))
-                          for entry in series]
+                          for entry in (series if service else series[:1])])
         if defer_readback:
             observed[:] = [(batch_id, sid, ids, cp.asnumpy(pixels))
                            for batch_id, sid, ids, pixels in observed]
@@ -232,3 +235,189 @@ def test_unsupported_start_geometry_is_rejected(shape, dtype):
 ])
 def test_image_geometry_must_match_start(start_shape, image_shape):
     run_series([(10, [0], start_shape, image_shape)], expect_error=True)
+
+
+@pytest.mark.parametrize("devices", [(0,), (0, 1), (1, 0)])
+def test_zmq_routes_whole_acquisitions_and_reuses_branches(devices):
+    if cp.cuda.runtime.getDeviceCount() <= max(devices):
+        pytest.skip("requires two visible GPUs")
+    series = [(101, [], (96, 96)), (102, [0, 1, 2, 3, 4], (192, 192)),
+              (103, [0], (192, 192)), (104, [0, 1, 2], (96, 96)),
+              (105, [], (192, 192)), (106, [0, 1], (96, 96))]
+    seen, last_ids = {}, {}
+
+    def observe(batch, positioned):
+        device = cp.cuda.runtime.getDevice()
+        bid, sid = int(batch.batch_id), int(batch.series_id)
+        assert bid > last_ids.get(device, 0)
+        last_ids[device] = bid
+        seen.setdefault(sid, set()).add(device)
+
+    observed, results, plan, _ = run_series(series, batch_size=2, service=True,
+        devices=devices, queue_depth=2, extra_observer=observe)
+    assert plan.ok, plan.summary()
+    for index, (sid, ids, shape) in enumerate(series):
+        device = devices[index % len(devices)]
+        assert seen[sid] == {device}
+        result, = [r for r in results if r["series_id"] == sid]
+        assert result["device"] == device
+        assert result["images"] == result["announced_images"] == result["positions"] == len(ids)
+        assert result["gap_events"] == result["missing_images"] == 0
+        y, x = np.ogrid[:shape[0], :shape[1]]
+        r2 = (2*y-(shape[0]-1))**2 + (2*x-(shape[1]-1))**2
+        assert result["bf_sum"] == int((r2 <= 4*16**2).sum()) * sum(i+1 for i in ids)
+        assert result["adf_sum"] == int(((r2 >= 4*24**2) & (r2 <= 4*48**2)).sum()) * sum(i+1 for i in ids)
+        for s, batch_ids, pixels in observed:
+            if s == sid:
+                assert pixels.shape[1:] == shape
+                np.testing.assert_array_equal(pixels, np.broadcast_to(
+                    np.asarray(batch_ids, dtype=np.uint16)[:, None, None] + 1, pixels.shape))
+
+
+def test_zmq_second_gpu_overlaps_and_first_gpu_revisit_waits_for_completion():
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("requires two visible GPUs")
+    hold = cp.RawKernel(r'''
+        extern "C" __global__ void hold(unsigned long long cycles) {
+            unsigned long long start = clock64();
+            while (clock64()-start < cycles) { }
+        }
+    ''', "hold")
+    with cp.cuda.Device(0):
+        hold((1,), (1,), (np.uint64(1),))
+        cp.cuda.get_current_stream().synchronize()
+        rate = cp.cuda.runtime.getDeviceProperties(0)["clockRate"]
+    event = cp.cuda.Event(disable_timing=True)
+    times, pending = {}, []
+
+    def observe(batch, positioned):
+        sid = int(batch.series_id)
+        if sid == 201 and len(batch.image_ids):
+            hold((1,), (1,), (np.uint64(rate * 1000 * 2),))
+            event.record()
+        if sid == 202 and len(batch.image_ids):
+            with cp.cuda.Device(0):
+                pending.append(not event.done)
+        if batch.start_of_series:
+            times[(sid, "start")] = time.monotonic()
+        if batch.end_of_series:
+            times[(sid, "done")] = time.monotonic()
+
+    run_series([(201, [0]), (202, [0]), (203, [0])], devices=[0, 1],
+               service=True, batch_size=1, queue_depth=2, extra_observer=observe)
+    assert pending == [True]
+    assert times[(202, "done")] < times[(201, "done")]
+    assert times[(203, "start")] >= times[(201, "done")]
+
+
+@pytest.mark.parametrize("image_id", [55335, 55336, 55337])
+def test_parser_does_not_interpret_image_id_bytes_as_tensor_tag(image_id):
+    # D8 28 inside uint16(55336) used to be mistaken for the tensor tag 40.
+    observed, results, _, _ = run_series([(301, [image_id])])
+    assert observed[0][1] == [image_id]
+    assert results[0]["images"] == 1
+
+
+@pytest.mark.parametrize("noise", [b"\xd8\x28\xd9\xdc\xb4", cbor2.CBORTag(40, [[1, 2], b"fake"])])
+def test_parser_ignores_tag_patterns_in_unrelated_metadata(noise):
+    import ctypes as c
+    from live4d.operators import _library
+    image = image_message(55336, 42)
+    message = dict(type=image["type"], image_id=image["image_id"], noise=noise, data=image["data"])
+    wire = cbor2.dumps(cbor2.CBORTag(55799, message))
+    raw = c.create_string_buffer(wire)
+    payload = c.c_void_p()
+    size, original, element = c.c_size_t(), c.c_size_t(), c.c_size_t()
+    width, height, image_id = c.c_uint32(), c.c_uint32(), c.c_uint64()
+    result = _library.fast_extract_compressed_bslz4(raw, c.c_size_t(len(wire)),
+        c.byref(payload), c.byref(size), c.byref(original), c.byref(element),
+        c.byref(width), c.byref(height), c.byref(image_id))
+    assert result == 0
+    assert (width.value, height.value, image_id.value, original.value, element.value) == (96, 96, 55336, 18432, 2)
+
+
+def test_sample_validator_accepts_completed_async_result(tmp_path, monkeypatch):
+    import json
+    import sys
+    from live4d import validate
+    context = zmq.Context()
+    sender = context.socket(zmq.PUSH)
+    sender.setsockopt(zmq.LINGER, 0)
+    sender.setsockopt(zmq.SNDTIMEO, 10000)
+    port = sender.bind_to_random_port("tcp://127.0.0.1")
+    reference = tmp_path / "reference.npz"
+    report = tmp_path / "report.json"
+    np.savez(reference, ids=np.array([0]), frames=np.ones((1, 96, 96), dtype=np.uint16))
+    producers = []
+
+    def construct(config, **kwargs):
+        app = PipelineApp(config, **kwargs)
+        def send():
+            assert app.ready.wait(20)
+            for item in (start_message(401, 1), image_message(0, 1), dict(type="end")):
+                sender.send(cbor2.dumps(item))
+        thread = threading.Thread(target=send)
+        producers.append(thread)
+        thread.start()
+        return app
+
+    monkeypatch.setattr(validate, "PipelineApp", construct)
+    monkeypatch.setattr(sys, "argv", ["validate", "--reference", str(reference),
+        "--expected-frames", "1", "--report", str(report), "--endpoint", f"tcp://127.0.0.1:{port}"])
+    try:
+        with pytest.raises(SystemExit) as done:
+            validate.main()
+        assert done.value.code == 0
+        result = json.loads(report.read_text())
+        assert result["success"] and result["cpu_reference_samples_checked"] == 1
+        assert result["images"] == 1 and result["termination"] == "STOPPED"
+    finally:
+        for thread in producers:
+            thread.join(20)
+            assert not thread.is_alive()
+        sender.close()
+        context.term()
+
+
+@pytest.mark.parametrize("devices", [(0,), (0, 1)])
+def test_zmq_maximum_compressed_metadata_batch_fits_channel_envelope(devices):
+    if cp.cuda.runtime.getDeviceCount() <= max(devices):
+        pytest.skip("requires two visible GPUs")
+    observed, results, _, _ = run_series([(501, list(range(1000)))],
+        devices=devices, batch_size=1000, scan=(40, 25))
+    assert len(observed) == 1 and len(observed[0][1]) == 1000
+    result, = results
+    assert result["images"] == result["positions"] == 1000
+    assert result["bf_sum"] == 812 * sum(range(1, 1001))
+    assert result["adf_sum"] == 5428 * sum(range(1, 1001))
+
+
+
+def test_finite_zmq_processes_first_acquisition_even_if_later_gpu_could_finish_first():
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("requires two visible GPUs")
+    hold = cp.RawKernel(r'''
+        extern "C" __global__ void hold(unsigned long long cycles) {
+            unsigned long long start = clock64();
+            while (clock64()-start < cycles) { }
+        }
+    ''', "hold")
+    devices = [1, 0]
+    with cp.cuda.Device(devices[0]):
+        hold((1,), (1,), (np.uint64(1),))
+        cp.cuda.get_current_stream().synchronize()
+        rate = cp.cuda.runtime.getDeviceProperties(devices[0])["clockRate"]
+    seen = []
+
+    def observe(batch, positioned):
+        seen.append(int(batch.series_id))
+        if len(batch.image_ids):
+            hold((1,), (1,), (np.uint64(rate * 1000),))
+
+    observed, results, _, _ = run_series([(601, [0]), (602, [])],
+        devices=devices, batch_size=1, queue_depth=2, extra_observer=observe)
+    assert set(seen) == {601}
+    assert [r["series_id"] for r in results] == [601]
+    assert results[0]["device"] == devices[0]
+    assert results[0]["images"] == 1
+    assert [sid for sid, _, _ in observed] == [601]

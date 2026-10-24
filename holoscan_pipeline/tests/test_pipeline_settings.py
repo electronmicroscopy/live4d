@@ -47,6 +47,5 @@ def test_rejects_invalid_device_lists(devices):
         PipelineConfig(devices=devices)
 
 
-def test_multiple_devices_require_rdma():
-    with pytest.raises(ValueError, match="require RDMA"):
-        PipelineConfig(devices=[0, 1])
+def test_multiple_devices_select_the_same_order_for_zmq():
+    assert PipelineConfig(devices=[3, 2, 0]).gpu_devices == (3, 2, 0)

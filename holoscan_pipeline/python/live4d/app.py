@@ -19,33 +19,38 @@ class PipelineApp:
     def __init__(self, config: PipelineConfig, *, observer=None, receiver_ready=None):
         self.config = config
         self.ready = threading.Event()
-        self.rdma = None
-        self._rdma_run_started = False
+        self.rdma = self.zmq = self.receiver = None
+        self._run_started = False
         self.graph = hs.Graph("dectris-4dstem", default_clock=hs.RealtimeClock)
         self.branch_ready, self.windows = [], []
         deployment = hs.execution.DeploymentBinding()
         try:
             if config.transport == "rdma":
                 from .rdma import RdmaReceiver
-                self.rdma = RdmaReceiver(config, receiver_ready)
+                self.rdma = self.receiver = RdmaReceiver(config, receiver_ready)
+            else:
+                from .zmq import ZmqReceiver
+                self.zmq = self.receiver = ZmqReceiver(config)
+                rx = ZmqRxOp(self.graph, "zmq_rx", endpoint=config.zmq["endpoint"],
+                    batch_size=config.batch_size,
+                    publication_windows=[window.handle for window in self.zmq.inputs],
+                    acquisition_windows=[window.handle for window in self.zmq.acquisitions],
+                    acquisition_limit=1 if config.execute["mode"] == "finite" else 0)
+                self.graph.partition("receiver").add(rx)
             for index, device in enumerate(config.gpu_devices):
-                prefix = f"gpu{index}_" if config.transport == "rdma" else ""
+                prefix = f"gpu{index}_"
                 warmed = threading.Event()
                 window = _PublicationWindow(config.queue_depth - 1)
                 self.branch_ready.append(warmed)
                 self.windows.append(window)
                 if self.rdma is None:
-                    self.compressed_window = _PublicationWindow(config.queue_depth - 1)
-                    rx = ZmqRxOp(self.graph, "zmq_rx", endpoint=config.zmq["endpoint"],
-                                 batch_size=config.batch_size,
-                                 publication_window=self.compressed_window.handle)
-                    decoded = DecompressGpuOp(self.graph, "decompress_gpu",
-                        publication_window=window.handle, input_window=self.compressed_window.handle)
+                    source_path = prefix + "decompress_gpu"
+                    decoded = DecompressGpuOp(self.graph, source_path,
+                        publication_window=window.handle,
+                        input_window=self.zmq.inputs[index].handle, destination=index, device=device)
                     self.graph.add_flow(rx.output, decoded.input, queue_depth=config.queue_depth)
-                    self.graph.partition("receiver").add(rx)
-                    self.graph.partition("decode").add(decoded)
-                    source_path = "decompress_gpu"
-                    completion = None
+                    self.graph.partition(prefix + "decode").add(decoded)
+                    completion = self.zmq.completion(index)
                 else:
                     ring = self.rdma.rings[index]
                     source_path = prefix + "rdma_rx"
@@ -64,8 +69,8 @@ class PipelineApp:
             if not self.plan.ok:
                 raise RuntimeError(self.plan.summary())
         except BaseException:
-            if self.rdma is not None:
-                self.rdma.close()
+            if self.receiver is not None:
+                self.receiver.close()
             raise
 
     def _add_processing(self, decoded, prefix, device, ready, window, observer, completion):
@@ -90,10 +95,9 @@ class PipelineApp:
         graph.partition(prefix + "detector").add(detector)
 
     def run(self, sender_gone=None, *, stop_event=None):
-        if self.rdma is not None:
-            if self._rdma_run_started:
-                raise RuntimeError("Construct a new RDMA PipelineApp for another run")
-            self._rdma_run_started = True
+        if self._run_started:
+            raise RuntimeError(f"Construct a new {self.config.transport.upper()} PipelineApp for another run")
+        self._run_started = True
         stopping = stop_event if stop_event is not None else threading.Event()
         previous = {}
         if threading.current_thread() is threading.main_thread():
@@ -103,10 +107,9 @@ class PipelineApp:
             with hs.run_async(self.plan) as session:
                 deadline = None
                 reported = False
-                while not session.wait(timeout=0.001 if self.rdma is not None else 0.05):
+                while not session.wait(timeout=0.001):
                     if all(event.is_set() for event in self.branch_ready):
-                        if self.rdma is not None:
-                            self.rdma.tick()
+                        self.receiver.tick()
                         if self.rdma is None or self.rdma.last_ready is not None:
                             self.ready.set()
                     if self.ready.is_set() and not reported:
@@ -114,7 +117,7 @@ class PipelineApp:
                         reported = True
                         seconds = self.config.execute["seconds"]
                         deadline = time.monotonic() + seconds if seconds else None
-                    finite_done = (self.rdma is not None and self.rdma.completed
+                    finite_done = (self.receiver.completed
                                    and self.config.execute["mode"] == "finite")
                     if (finite_done or stopping.is_set()
                             or (sender_gone is not None and sender_gone.is_set())
@@ -126,8 +129,8 @@ class PipelineApp:
                     raise RuntimeError(f"Holoscan run failed: {session.summary()}")
                 return session.termination
         finally:
-            if self.rdma is not None:
-                self.rdma.close()
+            if self.receiver is not None:
+                self.receiver.close()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
@@ -139,7 +142,7 @@ def main():
     parser.add_argument("--endpoint", help="Override zmq.endpoint")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--device", type=int)
-    parser.add_argument("--devices", type=int, nargs="+", help="Ordered RDMA CUDA device list")
+    parser.add_argument("--devices", type=int, nargs="+", help="Ordered CUDA device list")
     parser.add_argument("--queue-depth", type=int)
     parser.add_argument("--plan", type=Path)
     args = parser.parse_args()
@@ -159,8 +162,8 @@ def main():
             args.plan.write_text(app.plan.json(), encoding="utf-8")
         app.run()
     finally:
-        if app.rdma is not None:
-            app.rdma.close()
+        if app.receiver is not None:
+            app.receiver.close()
 
 
 if __name__ == "__main__":

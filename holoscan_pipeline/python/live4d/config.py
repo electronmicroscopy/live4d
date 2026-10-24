@@ -43,8 +43,6 @@ class PipelineConfig:
                     or len(set(self.devices)) != len(self.devices)):
                 raise ValueError("devices must contain distinct CUDA device ordinals")
             object.__setattr__(self, "devices", tuple(self.devices))
-        if self.transport == "zmq" and len(self.gpu_devices) != 1:
-            raise ValueError("multiple devices currently require RDMA")
         for value in self.scan.values():
             if type(value) is not int or not 1 <= value <= 2147483647:
                 raise ValueError("scan dimensions must be positive int32 values")

@@ -65,8 +65,8 @@ int fast_extract_start_metadata(const uint8_t* data, size_t size,
 /**
  * Fast extraction of compressed BSLZ4 data from Dectris IMAGE message.
  *
- * This function directly locates the compressed data by searching for the
- * Dectris compression tag (56500) without full CBOR traversal.
+ * This function follows the data/threshold_1 channel and nested tensor/compression
+ * tags structurally, skipping unrelated CBOR values without scanning their bytes.
  * Also extracts the image_id field from the CBOR map.
  *
  * @param msg_data        CBOR-encoded IMAGE message

@@ -112,11 +112,11 @@ shipped ZMQ YAML.
 `execute.mode/seconds`. Unknown sections and keys are rejected. `batch_size` is between
 1 and 1000; `queue_depth` is between 2 and 16 per graph edge.
 
-`devices: [0, 1]` selects an ordered list of distinct visible CUDA ordinals for RDMA.
+`devices: [0, 1]` selects an ordered list of distinct visible CUDA ordinals for either transport.
 It overrides the legacy scalar `device`. Omitting it uses `[device]`; explicitly setting
-`devices: [0]` follows exactly the same RDMA path. `--devices 0 1` overrides the list;
-`--device 0` clears it and selects one device. ZMQ accepts one device and rejects longer
-lists. Device numbers are relative to the container's `CUDA_VISIBLE_DEVICES` selection.
+`devices: [0]` follows exactly the same path as longer lists. `--devices 0 1` overrides the list;
+`--device 0` clears it and selects one device. Device numbers are relative to the
+container's `CUDA_VISIBLE_DEVICES` selection.
 
 The receiver publishes exactly `batch_size` images during an acquisition and flushes the
 remainder before END. A batch never contains images from different series. Empty series
@@ -201,9 +201,9 @@ and consumed inside the typed detector callback's runtime stream scope. HSDK5 or
 readiness and release on that stream, so callbacks can return with GPU work pending while
 tensor storage remains protected from premature reuse. No separate owner queue is needed.
 See the SDK's [tensor ownership and stream contract](https://docs.nvidia.com/holoscan/sdk-user-guide/data-and-payloads/tensors-in-depth).
-Mask initialization and READY warm-up retain host waits. ZMQ END copies totals to the CPU
-before publishing the result. RDMA END queues that copy on the runtime stream and records
-a CUDA event; the application polls completion without blocking other GPUs. One result
+Mask initialization and READY warm-up retain host waits. END queues the totals copy on
+the runtime stream and records a CUDA event; the application polls completion without
+blocking other GPUs. Both transports use the same asynchronous result infrastructure. One result
 slot per GPU retains the map, totals, and END callback until the event completes. It never
 retains the runtime stream. Results are published only after their copy completes.
 BF/ADF values retain float32 processing. Reported totals use a
@@ -251,10 +251,44 @@ connection are rejected rather than silently routed to the wrong GPU.
 
 `[series-result]` includes the CUDA `device`. Different GPUs may complete out of order.
 The optional data observer still runs inside the detector activation's runtime stream.
-For RDMA, its END notification runs on the control thread after CUDA completion; treat
+For both transports, its END notification runs on the control thread after CUDA completion; treat
 that notification as completed metadata and do not submit work using its input tensor.
 On shutdown or failure the runtime joins before QPs, pending results, mailboxes, and
-registered rings are released. A `PipelineApp` with RDMA resources is for one run.
+registered rings are released. A `PipelineApp` is for one run.
+
+## ZMQ acquisition routing
+
+ZMQ uses the same `devices` selection and whole-acquisition round-robin order. One PULL
+socket receives the ordered START/images/END stream. The source publishes each compressed
+batch once in a pinned runtime tensor, with a destination index. Fixed-device decoders
+share that read-only host tensor through graph fanout; only the selected decoder allocates
+GPU output and performs H2D/decompression. Each GPU then uses the same scan and detector
+operators as RDMA. No decoded tensor or numerical operation crosses devices, and the
+single-device case follows the same path.
+
+The supported image envelope is `data.threshold_1`, tensor tag 40, uint16 typed-array tag
+69, and BSLZ4 compression tag 56500. The native parser follows that structure and skips
+unrelated metadata; tag-like bytes inside image IDs or metadata are not tensor tags.
+
+One compressed publication window per decoder bounds fanout queue occupancy; inactive
+decoders release only their own input credit. Decoded batch IDs are monotonic within each
+GPU branch. A separate acquisition window per GPU admits a new START only after that
+GPU's preceding result completes. Other GPUs can process while a prior result is pending.
+When the destination is busy, ingress pauses before reading START and ZMQ/TCP applies
+backpressure. Runtime tensor pools, graph queues, and result slots remain bounded. The
+fanout means a slow decoder can also delay delivery to other branches; there is no
+unbounded intermediate acquisition queue. Sender drop behavior under backpressure still
+depends on the detector's ZMQ buffering policy.
+
+Wait for `[holoscan] ready` before the first ARM. ZMQ keeps its socket across acquisitions
+and routes subsequent START messages automatically, so it needs no RDMA-style per-ARM
+reconnection notification. START can arrive during ARM, and consecutive series may change
+geometry. Results include the CUDA device and may complete out of acquisition order.
+Finite mode admits only the first acquisition, on the first configured GPU; queued later
+START messages remain unread. The control thread requests cooperative stop only after
+that acquisition's CUDA event and observer callback complete. The sample
+validator also requires one completed acquisition, exact counts, and checked reference
+pixels before accepting that termination.
 
 ## Validation and measurements
 
