@@ -9,7 +9,7 @@ import pytest
 from test_rdma_batches import LOCAL_ADDR, Loopback, RingWriter, _start, _image, _end, pytestmark
 
 
-@pytest.mark.parametrize("devices", [(0,), (0, 1)])
+@pytest.mark.parametrize("devices", [(0,), (0, 0), (0, 1)])
 def test_application_routes_complete_acquisitions_and_reuses_branches(devices):
     import cupy as cp
     import numpy as np
@@ -59,7 +59,8 @@ def test_application_routes_complete_acquisitions_and_reuses_branches(devices):
                         device = devices[index % len(devices)]
                         assert claim["device"] == device
                         identity = (hello.ring_addr, hello.ring_rkey)
-                        assert registrations.setdefault(device, identity) == identity
+                        lane = index % len(devices)
+                        assert registrations.setdefault(lane, identity) == identity
                         writer = RingWriter(peer.ring_bytes)
                         _start(writer, 501 + index, count, shape)
                         if count:
@@ -92,6 +93,9 @@ def test_application_routes_complete_acquisitions_and_reuses_branches(devices):
                   local_address=LOCAL_ADDR, ring_memory="host_mapped", ring_mib=1))
     app = PipelineApp(config, observer=observer, receiver_ready=claims.put)
     assert app.plan.ok, app.plan.summary()
+    for resources in (app.branch_ready, app.windows, app.rdma.rings,
+                      app.rdma.sessions, app.rdma.results):
+        assert len(resources) == len({id(item) for item in resources}) == len(devices)
     producer = threading.Thread(target=sender)
     producer.start()
 

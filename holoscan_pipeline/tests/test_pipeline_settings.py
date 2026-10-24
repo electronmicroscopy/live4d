@@ -41,7 +41,7 @@ def test_device_list_and_legacy_scalar_share_normalized_selection():
     assert PipelineConfig(transport="rdma", devices=[2], rdma=rdma).gpu_devices == (2,)
 
 
-@pytest.mark.parametrize("devices", [[], [0, 0], [-1], [256], [True], "0", [0, "1"]])
+@pytest.mark.parametrize("devices", [[], [-1], [256], [True], "0", [0, "1"]])
 def test_rejects_invalid_device_lists(devices):
     with pytest.raises(ValueError):
         PipelineConfig(devices=devices)
@@ -49,3 +49,10 @@ def test_rejects_invalid_device_lists(devices):
 
 def test_multiple_devices_select_the_same_order_for_zmq():
     assert PipelineConfig(devices=[3, 2, 0]).gpu_devices == (3, 2, 0)
+
+
+@pytest.mark.parametrize("transport", ["zmq", "rdma"])
+def test_repeated_devices_preserve_independent_routing_entries(transport):
+    rdma = dict(remote_address="sender:31003", local_address="receiver")
+    assert PipelineConfig(transport=transport, devices=[0, 0], rdma=rdma).gpu_devices == (0, 0)
+    assert PipelineConfig(transport=transport, devices=[2, 3, 2], rdma=rdma).gpu_devices == (2, 3, 2)

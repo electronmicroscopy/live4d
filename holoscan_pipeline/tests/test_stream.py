@@ -63,7 +63,7 @@ def image_message(image_id, value, shape=(96, 96)):
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
-               devices=None, extra_observer=None):
+               devices=None, extra_observer=None, inspect_app=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
     context = zmq.Context()
     sender = context.socket(zmq.PUSH)
@@ -94,6 +94,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                             execute=dict(mode="service" if service else "finite", seconds=3 if service else 10),
                             zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"))
     app = PipelineApp(config, observer=observer)
+    if inspect_app is not None:
+        inspect_app(app)
     stopping = threading.Event()
 
     def receive():
@@ -237,25 +239,38 @@ def test_image_geometry_must_match_start(start_shape, image_shape):
     run_series([(10, [0], start_shape, image_shape)], expect_error=True)
 
 
-@pytest.mark.parametrize("devices", [(0,), (0, 1), (1, 0)])
+@pytest.mark.parametrize("devices", [(0,), (0, 0), (0, 1), (1, 0)])
 def test_zmq_routes_whole_acquisitions_and_reuses_branches(devices):
     if cp.cuda.runtime.getDeviceCount() <= max(devices):
         pytest.skip("requires two visible GPUs")
     series = [(101, [], (96, 96)), (102, [0, 1, 2, 3, 4], (192, 192)),
               (103, [0], (192, 192)), (104, [0, 1, 2], (96, 96)),
               (105, [], (192, 192)), (106, [0, 1], (96, 96))]
-    seen, last_ids = {}, {}
+    seen, last_ids, finished = {}, {}, []
+    lanes = {entry[0]: index % len(devices) for index, entry in enumerate(series)}
 
     def observe(batch, positioned):
         device = cp.cuda.runtime.getDevice()
         bid, sid = int(batch.batch_id), int(batch.series_id)
-        assert bid > last_ids.get(device, 0)
-        last_ids[device] = bid
+        if sid not in lanes:  # READY precedes any acquisition.
+            return
+        lane = lanes[sid]
+        assert bid > last_ids.get(lane, 0)
+        last_ids[lane] = bid
         seen.setdefault(sid, set()).add(device)
 
+    def inspect(app):
+        # Repeated device ordinals still own independent branches and admission.
+        finished.append(app.zmq.finished)
+        for resources in (app.branch_ready, app.windows, app.zmq.results,
+                          app.zmq.inputs, app.zmq.acquisitions):
+            assert len(resources) == len({id(item) for item in resources}) == len(devices)
+
     observed, results, plan, _ = run_series(series, batch_size=2, service=True,
-        devices=devices, queue_depth=2, extra_observer=observe)
+        devices=devices, queue_depth=2, extra_observer=observe, inspect_app=inspect)
     assert plan.ok, plan.summary()
+    assert finished[0] == [sum(lane == index for lane in lanes.values())
+                           for index in range(len(devices))]
     for index, (sid, ids, shape) in enumerate(series):
         device = devices[index % len(devices)]
         assert seen[sid] == {device}

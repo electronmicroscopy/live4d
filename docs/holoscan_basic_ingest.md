@@ -112,11 +112,17 @@ shipped ZMQ YAML.
 `execute.mode/seconds`. Unknown sections and keys are rejected. `batch_size` is between
 1 and 1000; `queue_depth` is between 2 and 16 per graph edge.
 
-`devices: [0, 1]` selects an ordered list of distinct visible CUDA ordinals for either transport.
+`devices: [0, 1]` selects an ordered list of visible CUDA ordinals for either transport.
 It overrides the legacy scalar `device`. Omitting it uses `[device]`; explicitly setting
 `devices: [0]` follows exactly the same path as longer lists. `--devices 0 1` overrides the list;
 `--device 0` clears it and selects one device. Device numbers are relative to the
 container's `CUDA_VISIBLE_DEVICES` selection.
+
+Each list entry creates an independent acquisition-routing lane. Repeated entries such
+as `devices: [0, 0]` run two branches on one GPU for development and testing, with separate
+buffers, result slots, and admission windows (and registered rings for RDMA). Acquisitions
+alternate between the entries and then reuse the first branch. They share the physical
+GPU's compute and memory capacity; this does not test transfers or isolation between GPUs.
 
 The receiver publishes exactly `batch_size` images during an acquisition and flushes the
 remainder before END. A batch never contains images from different series. Empty series
@@ -204,7 +210,7 @@ See the SDK's [tensor ownership and stream contract](https://docs.nvidia.com/hol
 Mask initialization and READY warm-up retain host waits. END queues the totals copy on
 the runtime stream and records a CUDA event; the application polls completion without
 blocking other GPUs. Both transports use the same asynchronous result infrastructure. One result
-slot per GPU retains the map, totals, and END callback until the event completes. It never
+slot per routing lane retains the map, totals, and END callback until the event completes. It never
 retains the runtime stream. Results are published only after their copy completes.
 BF/ADF values retain float32 processing. Reported totals use a
 float64 reduction of those stored values to avoid large-scan float32 reduction rounding.
@@ -225,7 +231,7 @@ acquisition, on the first device. Numerical kernels, scan placement, and detecto
 processing are shared with the single-device graph and ZMQ.
 
 The application creates one fixed-device source/scan/detector branch and one registered
-ring per GPU, then compiles and runs one graph. Only one sender connection is active.
+ring per list entry, then compiles and runs one graph. Only one sender connection is active.
 After END is published, the source drains ring reads and credit-send completions. The
 controller requests detach, waits for its generation-tagged acknowledgment, closes the
 old connection, and handshakes using the next ring. Sources are never restarted between
@@ -234,8 +240,8 @@ start fresh per connection. Published batch IDs remain monotonic within each bra
 
 Ingress drain is independent of BF/ADF completion because the source has copied the ring
 into runtime-owned tensors. The next GPU can process while the previous GPU finishes.
-Before reconnecting a GPU, the controller waits for its preceding result; this bounds
-pending acquisitions to one per GPU. A list containing one GPU uses the same lifecycle,
+Before reconnecting a lane, the controller waits for its preceding result; this bounds
+pending acquisitions to one per lane. A list containing one GPU uses the same lifecycle,
 including reconnection after every acquisition in service mode.
 
 **Wait for `[rdma-ready]` before each ARM**, including with one GPU: START can be sent
@@ -272,8 +278,8 @@ unrelated metadata; tag-like bytes inside image IDs or metadata are not tensor t
 
 One compressed publication window per decoder bounds fanout queue occupancy; inactive
 decoders release only their own input credit. Decoded batch IDs are monotonic within each
-GPU branch. A separate acquisition window per GPU admits a new START only after that
-GPU's preceding result completes. Other GPUs can process while a prior result is pending.
+routing branch. A separate acquisition window per list entry admits a new START only after
+that branch's preceding result completes. Other branches can process while a prior result is pending.
 When the destination is busy, ingress pauses before reading START and ZMQ/TCP applies
 backpressure. Runtime tensor pools, graph queues, and result slots remain bounded. The
 fanout means a slow decoder can also delay delivery to other branches; there is no
@@ -376,3 +382,30 @@ Keep historical measurements tied to their tested revision: the tensor-retiremen
 in `4b4b12f` changed `delivered_fps` from per-batch GPU-completion timing to host-submission
 timing. Older and newer rates need that distinction when compared. Transport-only RDMA
 WRITE or NIC-loopback measurements do not establish Live4D processing capacity.
+
+### Deferred known issue: intermittent RDMA tensor-pool exhaustion
+
+Status: low priority; investigation is deferred. Revisit if it recurs in normal camera
+acquisitions or when extending support for unusual acquisition sequences.
+
+During some aggregate integration-test runs, the native RDMA source failed to borrow an
+output tensor from its four-slot runtime pool with
+`RDMA data tensor allocation failed: kResourceExhausted`. HSDK then stopped the graph.
+The failing fixture is
+`test_consecutive_empty_and_partial_series_keep_service_source_active` in
+[test_rdma_batches.py](../holoscan_pipeline/tests/test_rdma_batches.py). It queues every
+transport completion before graph startup, then feeds an empty 96×96 series, three
+192×192 images with output batch size 2, and another empty 96×96 series. This is a
+same-host verbs-loopback test using one GPU and a fixed connection; the failure has not
+been established as a GPU-switching problem.
+
+The root cause remains unknown, and no runtime workaround or fixture change was retained.
+The fixture passed unchanged in the final suite, and cross-host two-GPU RDMA switching
+checks passed, including two acquisitions totaling 7,200,000 checked frames. Those
+successful runs do not establish that the intermittent failure is fixed.
+
+Local diagnostic evidence is retained under the untracked
+`benchmark_results/20261024-zmq-routing/` directory: `REPORT.md` summarizes the issue;
+`evidence/tests-1792819468595634683/run.log` records a failure, and
+`evidence/pytest-final-finite/run.log` records the final passing suite. Preserve these
+artifacts when moving the investigation to another machine.

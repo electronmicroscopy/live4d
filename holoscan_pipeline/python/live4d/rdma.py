@@ -1,6 +1,6 @@
 """Acquisition routing around fixed-device RDMA/processing branches.
 
-One registered ring and one result slot per GPU; only one live sender connection.
+One registered ring and result slot per routing lane; one live sender connection.
 The detector controller must wait for each receiver_ready notification before ARM.
 """
 import json

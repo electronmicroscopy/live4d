@@ -39,9 +39,8 @@ class PipelineConfig:
             raise ValueError("transport must be 'zmq' or 'rdma'")
         if self.devices is not None:
             if (not isinstance(self.devices, (list, tuple)) or not self.devices
-                    or any(type(d) is not int or not 0 <= d <= 255 for d in self.devices)
-                    or len(set(self.devices)) != len(self.devices)):
-                raise ValueError("devices must contain distinct CUDA device ordinals")
+                    or any(type(d) is not int or not 0 <= d <= 255 for d in self.devices)):
+                raise ValueError("devices must contain CUDA device ordinals between 0 and 255")
             object.__setattr__(self, "devices", tuple(self.devices))
         for value in self.scan.values():
             if type(value) is not int or not 1 <= value <= 2147483647:
@@ -66,7 +65,7 @@ class PipelineConfig:
 
     @property
     def gpu_devices(self) -> tuple[int, ...]:
-        """Legacy scalar device and explicit lists use the same application path."""
+        """Ordered routing lanes; repeated CUDA ordinals remain separate entries."""
         return tuple(self.devices) if self.devices is not None else (self.device,)
 
 

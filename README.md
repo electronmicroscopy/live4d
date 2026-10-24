@@ -18,6 +18,8 @@ maps from the CLI.
 Service mode can route consecutive acquisitions across an ordered `devices` list for
 both transports.
 One GPU and multiple GPUs use the same processing and connection management code.
+Repeated entries such as `devices: [0, 0]` create independent routing branches on one
+GPU for development and testing.
 
 ## Documentation
 

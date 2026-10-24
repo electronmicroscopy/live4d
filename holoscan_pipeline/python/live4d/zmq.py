@@ -4,7 +4,7 @@ from .results import ResultSlot
 
 
 class ZmqReceiver:
-    """One outstanding acquisition per GPU, with ordered source backpressure."""
+    """One outstanding acquisition per routing lane, with source backpressure."""
 
     def __init__(self, config):
         self.results = []
