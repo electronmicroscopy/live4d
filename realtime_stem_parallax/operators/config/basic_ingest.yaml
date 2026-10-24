@@ -1,0 +1,6 @@
+endpoint: tcp://127.0.0.1:5555
+batch_size: 2048
+scheduler_threads: 4
+detector_shape: [96, 96]
+dtype: uint16
+compression: bslz4
