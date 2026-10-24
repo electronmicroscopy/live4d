@@ -39,7 +39,8 @@ foreach(schema IN ITEMS compressed_batch decoded_batch)
 endforeach()
 add_library(dectris_holoscan_ops SHARED
   cpp/bindings/dectris_holoscan_ops.cpp
-  cpp/common/fast_cbor_parse.c cpp/common/batch_window.cpp cpp/common/bitshuffle_kernel_gpu.cu
+  cpp/common/fast_cbor_parse.c cpp/common/batch_window.cpp cpp/common/rdma_session.cpp
+  cpp/common/bitshuffle_kernel_gpu.cu
   cpp/operators/zmq_rx_operator.cu cpp/operators/decompress_gpu_operator.cu
   cpp/operators/rdma_rx_operator.cu)
 set_target_properties(dectris_holoscan_ops PROPERTIES

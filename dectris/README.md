@@ -42,6 +42,11 @@ handshake link, and queue-pair owner alive until all GPU reads and the runtime s
 finished. `QueuePair.native_handle` is a borrowed native pointer for integration with the
 shared C++ source operator; it does not transfer ownership.
 
+`dectris.connection.RegisteredRing` separates ring allocation/registration from QP
+lifetime. Multiple connections can reuse it after prior NIC writes and GPU reads drain.
+The [Live4D acquisition controller](../docs/holoscan_basic_ingest.md#rdma-acquisition-routing)
+uses this ownership model for one or more GPUs.
+
 ## Protocol and flow control
 
 The receiver connects to the sender's imagemux TCP handshake endpoint. Hello/Accept/Ready

@@ -236,6 +236,14 @@ class HandshakeTest(unittest.TestCase):
         self.assertFalse(link.liveness.alive)
         link.close()
 
+    def test_local_close_wakes_liveness_and_is_idempotent(self):
+        imagemux = MockImagemux()
+        link = self.connector(imagemux).connect()
+        imagemux.thread.join(0.5)
+        link.close()
+        self.assertTrue(link.liveness.wait_dead(2))
+        link.close()
+
     def test_imagemux_closing_after_the_hello_is_explained(self):
         server = socket.socket()
         server.bind(("127.0.0.1", 0))

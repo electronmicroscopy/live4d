@@ -93,9 +93,9 @@ requires that configuration change; granting verbs access alone does not select 
 
 ### CLI overrides and development builds
 
-`--transport`, `--endpoint` (ZMQ only), `--batch-size`, `--queue-depth`, and `--device`
+`--transport`, `--endpoint` (ZMQ only), `--batch-size`, `--queue-depth`, `--device`, and `--devices`
 override their YAML values. `--plan /path/plan.json` writes the compiled graph plan and
-then runs the application; it is not a dry run and RDMA still performs its handshake.
+then runs the application; it is not a dry run. RDMA performs its handshake after GPU warm-up.
 Use a writable bind mount to retain a plan outside the container.
 
 The image runs the Python package, native library, and generated schema bindings from
@@ -111,6 +111,12 @@ shipped ZMQ YAML.
 `device`, `scan.width/height`, `detector.bf_radius/adf_inner/adf_outer`, and
 `execute.mode/seconds`. Unknown sections and keys are rejected. `batch_size` is between
 1 and 1000; `queue_depth` is between 2 and 16 per graph edge.
+
+`devices: [0, 1]` selects an ordered list of distinct visible CUDA ordinals for RDMA.
+It overrides the legacy scalar `device`. Omitting it uses `[device]`; explicitly setting
+`devices: [0]` follows exactly the same RDMA path. `--devices 0 1` overrides the list;
+`--device 0` clears it and selects one device. ZMQ accepts one device and rejects longer
+lists. Device numbers are relative to the container's `CUDA_VISIBLE_DEVICES` selection.
 
 The receiver publishes exactly `batch_size` images during an acquisition and flushes the
 remainder before END. A batch never contains images from different series. Empty series
@@ -195,8 +201,11 @@ and consumed inside the typed detector callback's runtime stream scope. HSDK5 or
 readiness and release on that stream, so callbacks can return with GPU work pending while
 tensor storage remains protected from premature reuse. No separate owner queue is needed.
 See the SDK's [tensor ownership and stream contract](https://docs.nvidia.com/holoscan/sdk-user-guide/data-and-payloads/tensors-in-depth).
-Mask initialization and READY warm-up retain host waits. END copies totals to the CPU before
-publishing the result.
+Mask initialization and READY warm-up retain host waits. ZMQ END copies totals to the CPU
+before publishing the result. RDMA END queues that copy on the runtime stream and records
+a CUDA event; the application polls completion without blocking other GPUs. One result
+slot per GPU retains the map, totals, and END callback until the event completes. It never
+retains the runtime stream. Results are published only after their copy completes.
 BF/ADF values retain float32 processing. Reported totals use a
 float64 reduction of those stored values to avoid large-scan float32 reduction rounding.
 
@@ -206,6 +215,46 @@ in the received ID sequence; `missing_images` counts forward skips, not an unrec
 after the final ID. Compare `images` with the sender's count and `announced_images` as well.
 A successful END validates the receiver's internal count but does not require it to equal
 the announced count. Maps stay in GPU memory; the CLI reports totals, not image files.
+
+## RDMA acquisition routing
+
+For round-robin acquisition routing, select `transport: rdma`, `execute.mode: service`,
+and `devices: [0, 1]` (or a longer ordered list). Whole acquisitions stay on one GPU;
+subsequent acquisitions advance through the list. Finite mode still processes just one
+acquisition, on the first device. Numerical kernels, scan placement, and detector
+processing are shared with the single-device graph and ZMQ.
+
+The application creates one fixed-device source/scan/detector branch and one registered
+ring per GPU, then compiles and runs one graph. Only one sender connection is active.
+After END is published, the source drains ring reads and credit-send completions. The
+controller requests detach, waits for its generation-tagged acknowledgment, closes the
+old connection, and handshakes using the next ring. Sources are never restarted between
+acquisitions. Ring addresses and rkeys persist; QPs, wire sequence numbers, and credits
+start fresh per connection. Published batch IDs remain monotonic within each branch.
+
+Ingress drain is independent of BF/ADF completion because the source has copied the ring
+into runtime-owned tensors. The next GPU can process while the previous GPU finishes.
+Before reconnecting a GPU, the controller waits for its preceding result; this bounds
+pending acquisitions to one per GPU. A list containing one GPU uses the same lifecycle,
+including reconnection after every acquisition in service mode.
+
+**Wait for `[rdma-ready]` before each ARM**, including with one GPU: START can be sent
+during arming. This notification identifies the zero-based acquisition index, CUDA
+device, and connection generation. Sender connection status or a previous series result
+alone does not prove the next receiver is ready. `[holoscan] ready` and `PipelineApp.ready`
+are one-time startup notifications. Embedded acquisition controllers can pass
+`receiver_ready=callback` to `PipelineApp`; the callback receives the same dictionary
+on the application's control thread and should enqueue work without blocking. Keep
+detector ARM/TRIGGER/DISARM sequencing in the acquisition controller; Live4D does not
+configure or trigger the detector. Uncoordinated back-to-back acquisitions on the old
+connection are rejected rather than silently routed to the wrong GPU.
+
+`[series-result]` includes the CUDA `device`. Different GPUs may complete out of order.
+The optional data observer still runs inside the detector activation's runtime stream.
+For RDMA, its END notification runs on the control thread after CUDA completion; treat
+that notification as completed metadata and do not submit work using its input tensor.
+On shutdown or failure the runtime joins before QPs, pending results, mailboxes, and
+registered rings are released. A `PipelineApp` with RDMA resources is for one run.
 
 ## Validation and measurements
 
