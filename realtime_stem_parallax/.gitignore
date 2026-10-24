@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# run outputs — the pipeline writes these; keep them out of the repo
+out/
+*.npy
+*.png
+
+# but DO keep the committed sample capture
+!examples/data/*.dstream
