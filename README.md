@@ -15,6 +15,12 @@ a configured raster scan and BF/ADF integration. It prints per-series JSON summa
 it does not yet provide a live image viewer, save diffraction datasets, or export BF/ADF
 maps from the CLI.
 
+Service mode can route consecutive acquisitions across an ordered `devices` list for
+both transports.
+One GPU and multiple GPUs use the same processing and connection management code.
+Repeated entries such as `devices: [0, 0]` create independent routing branches on one
+GPU for development and testing.
+
 ## Documentation
 
 - [Build, configure, run, and troubleshoot Live4D](docs/holoscan_basic_ingest.md)

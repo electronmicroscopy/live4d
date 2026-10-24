@@ -17,12 +17,16 @@ namespace holoscan::ops {
 struct DecompressGpuParams {
   uint64_t publication_window{};
   uint64_t input_window{};
+  uint32_t destination{};
+  int64_t device{};
 };
 HOLOSCAN_PARAM_SCHEMA(
     DecompressGpuParams,
-    holoscan::param_schema("holoscan.dectris.DecompressGpuParams", 1),
+    holoscan::param_schema("holoscan.dectris.DecompressGpuParams", 2),
     holoscan::field<&DecompressGpuParams::publication_window>("publication_window"),
-    holoscan::field<&DecompressGpuParams::input_window>("input_window"));
+    holoscan::field<&DecompressGpuParams::input_window>("input_window"),
+    holoscan::field<&DecompressGpuParams::destination>("destination"),
+    holoscan::field<&DecompressGpuParams::device>("device").range(int64_t{0}, int64_t{255}));
 
 class DecompressGpuOp final : public Operator<DecompressGpuParams> {
  public:
@@ -44,6 +48,8 @@ class DecompressGpuOp final : public Operator<DecompressGpuParams> {
   nvcompStatus_t* h_pinned_statuses_ = nullptr;
   cudaStream_t stream_ = nullptr;
   int64_t last_capture_ns_ = -1;
+  uint64_t batch_id_{};
+  int device_{-1};
   ::dectris::BatchWindow* publication_window_{};
   ::dectris::BatchWindow* input_window_{};
   size_t max_compressed_size_per_image_ = 0;

@@ -17,10 +17,6 @@
 // CBOR additional info (bottom 5 bits)
 #define CBOR_ADDL_INFO_MASK  0x1F
 
-// Dectris compression tag: 56500 = 0xDCB4
-// Encoded as: 0xD9 (tag with 2-byte uint16) 0xDC 0xB4
-static const uint8_t DECTRIS_TAG_PATTERN[3] = {0xD9, 0xDC, 0xB4};
-
 /**
  * Read CBOR unsigned integer (variable length).
  * Returns the value and advances the pointer.
@@ -166,31 +162,32 @@ int fast_extract_start_metadata(const uint8_t* data, size_t size,
     return 0;
 }
 
-static int extract_image_shape(const uint8_t* data, size_t size,
-                               uint32_t* width_out, uint32_t* height_out) {
-    const uint8_t* ptr = data;
-    const uint8_t* end = data + size;
-    while (ptr + 2 <= end) {
-        if (ptr[0] == 0xD8 && ptr[1] == 0x28) {
-            const uint8_t* candidate = ptr + 2;
-            uint64_t wrapper_size;
-            if (candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY ||
-                read_cbor_uint(&candidate, end, &wrapper_size) || wrapper_size != 2 ||
-                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY) return -1;
-            uint64_t shape_size, width, height;
-            if (read_cbor_uint(&candidate, end, &shape_size) || shape_size != 2 ||
-                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
-                read_cbor_uint(&candidate, end, &width) || width > UINT32_MAX ||
-                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
-                read_cbor_uint(&candidate, end, &height) || height > UINT32_MAX ||
-                skip_cbor(&candidate, end, 0)) return -1;
-            *width_out = (uint32_t)width;
-            *height_out = (uint32_t)height;
-            return 0;
-        }
-        ++ptr;
+/* Locate a map member structurally. Integer/byte contents may contain tag bytes. */
+static int map_value(const uint8_t* ptr, const uint8_t* end, const char* key,
+                     const uint8_t** value, const uint8_t** value_end) {
+    uint64_t n;
+    while (ptr < end && (*ptr >> 5) == 6)
+        if (read_cbor_uint(&ptr, end, &n)) return -1;
+    if (ptr >= end || (*ptr >> 5) != 5 || read_cbor_uint(&ptr, end, &n)) return -1;
+    const size_t wanted = strlen(key);
+    while (n--) {
+        uint64_t length;
+        if (ptr >= end || (*ptr >> 5) != 3 || read_cbor_uint(&ptr, end, &length) ||
+            length > (uint64_t)(end - ptr)) return -1;
+        const int matches = length == wanted && !memcmp(ptr, key, wanted);
+        ptr += length;
+        const uint8_t* start = ptr;
+        if (skip_cbor(&ptr, end, 0)) return -1;
+        if (matches) { *value = start; *value_end = ptr; return 0; }
     }
     return -1;
+}
+
+static int expect_cbor(const uint8_t** ptr, const uint8_t* end,
+                       uint8_t major, uint64_t expected) {
+    uint64_t value;
+    return *ptr >= end || (**ptr >> 5) != major ||
+           read_cbor_uint(ptr, end, &value) || value != expected ? -1 : 0;
 }
 
 /**
@@ -213,7 +210,7 @@ static int read_cbor_bytes(const uint8_t** data, const uint8_t* end,
         return -1;
     }
 
-    if (*data + length > end) {
+    if (length > (uint64_t)(end - *data)) {
         fprintf(stderr, "Byte string extends beyond message: %lu + %lu > %lu\n",
                 (unsigned long)(*data - end + (*data - end)),
                 (unsigned long)length,
@@ -319,181 +316,48 @@ zmq_message_type_t fast_detect_message_type(
     return ZMQ_MSG_UNKNOWN;
 }
 
-/**
- * Extract image_id from CBOR map.
- * Scans the message for "image_id" key and extracts its value.
- */
-static int extract_image_id(const uint8_t* msg_data, size_t msg_size, uint64_t* image_id_out) {
-    const uint8_t* end = msg_data + msg_size;
-    const uint8_t* ptr = msg_data;
-
-    // Look for the text string "image_id" (9 bytes: 0x68 + "image_id")
-    const char* image_id_key = "image_id";
-    const size_t key_len = 8;
-
-    while (ptr + key_len + 1 < end) {
-        // Check if this is a text string with length 8
-        if (*ptr == 0x68) {  // CBOR text string, length 8
-            if (memcmp(ptr + 1, image_id_key, key_len) == 0) {
-                // Found "image_id" key, next should be the value
-                ptr += 1 + key_len;
-
-                if (ptr >= end) return -1;
-
-                // Read the unsigned integer value
-                if ((*ptr & CBOR_MAJOR_TYPE_MASK) == CBOR_MAJOR_UNSIGNED) {
-                    uint64_t value;
-                    if (read_cbor_uint(&ptr, end, &value) == 0) {
-                        *image_id_out = value;
-                        return 0;  // Success!
-                    }
-                }
-                return -1;
-            }
-        }
-        ptr++;
-    }
-
-    return -1;  // Not found
-}
-
-/**
- * Fast path: Find Dectris compression tag (56500) and extract compressed data.
- *
- * Strategy:
- * 1. Extract image_id from the CBOR map
- * 2. Scan for the 3-byte pattern 0xD9 0xDC 0xB4 (Dectris tag 56500)
- * 3. Parse the following array: [algorithm, elem_size, compressed_bytes]
- * 4. Extract the compressed bytes directly
+/* Parse the supported channel envelope without scanning image bytes for tags.
+ * In particular, image_id=55336 encodes D8 28 inside an integer, not a tensor tag.
  */
 int fast_extract_compressed_bslz4(
-    const uint8_t* msg_data,
-    size_t msg_size,
-    const uint8_t** compressed_out,
-    size_t* compressed_size_out,
-    size_t* original_size_out,
-    size_t* elem_size_out,
-    uint32_t* image_size_x_out,
-    uint32_t* image_size_y_out,
+    const uint8_t* msg_data, size_t msg_size,
+    const uint8_t** compressed_out, size_t* compressed_size_out,
+    size_t* original_size_out, size_t* elem_size_out,
+    uint32_t* image_size_x_out, uint32_t* image_size_y_out,
     uint64_t* image_id_out)
 {
-    const uint8_t* end = msg_data + msg_size;
-    const uint8_t* ptr = msg_data;
-
-    if (image_size_x_out == NULL || image_size_y_out == NULL ||
-        extract_image_shape(msg_data, msg_size, image_size_x_out, image_size_y_out) != 0)
+    const uint8_t *ptr, *end, *channels, *channels_end;
+    uint64_t value, height, width;
+    if (!msg_data || !msg_size || !compressed_out || !compressed_size_out ||
+        !original_size_out || !elem_size_out || !image_size_x_out || !image_size_y_out)
         return -1;
-
-    // Extract image_id if requested
-    if (image_id_out != NULL) {
-        if (extract_image_id(msg_data, msg_size, image_id_out) != 0) {
-            // If image_id extraction fails, set to 0 and continue
-            // (compressed data extraction is more critical)
-            *image_id_out = 0;
-        }
-    }
-
-    // Scan for Dectris compression tag pattern
-    while (ptr + sizeof(DECTRIS_TAG_PATTERN) <= end) {
-        if (memcmp(ptr, DECTRIS_TAG_PATTERN, sizeof(DECTRIS_TAG_PATTERN)) == 0) {
-            // Found tag 56500!
-            ptr += sizeof(DECTRIS_TAG_PATTERN);
-
-            // Next should be an array with 3 elements: [algorithm, elem_size, bytes]
-            if (ptr >= end) {
-                fprintf(stderr, "Unexpected end after Dectris tag\n");
-                return -1;
-            }
-
-            uint8_t array_byte = *ptr;
-            if ((array_byte & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY) {
-                fprintf(stderr, "Expected array after Dectris tag, got 0x%02x\n", array_byte);
-                return -1;
-            }
-
-            uint8_t array_length = array_byte & CBOR_ADDL_INFO_MASK;
-            if (array_length != 3) {
-                fprintf(stderr, "Expected array of length 3, got %d\n", array_length);
-                return -1;
-            }
-            ptr++;
-
-            // Element 0: algorithm (text string, should be "bslz4")
-            if (ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_TEXT) {
-                fprintf(stderr, "Expected text string for algorithm\n");
-                return -1;
-            }
-
-            uint64_t algo_len;
-            if (read_cbor_uint(&ptr, end, &algo_len) != 0) {
-                fprintf(stderr, "Failed to read algorithm string length\n");
-                return -1;
-            }
-
-            if (ptr + algo_len > end) {
-                fprintf(stderr, "Algorithm string extends beyond message\n");
-                return -1;
-            }
-
-            // Verify it's "bslz4"
-            if (algo_len != 5 || memcmp(ptr, "bslz4", 5) != 0) {
-                fprintf(stderr, "Expected 'bslz4' algorithm, got something else\n");
-                return -1;
-            }
-            ptr += algo_len;
-
-            // Element 1: elem_size (unsigned integer)
-            if (ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED) {
-                fprintf(stderr, "Expected unsigned int for elem_size\n");
-                return -1;
-            }
-
-            uint64_t elem_size;
-            if (read_cbor_uint(&ptr, end, &elem_size) != 0) {
-                fprintf(stderr, "Failed to read elem_size\n");
-                return -1;
-            }
-            *elem_size_out = (size_t)elem_size;
-
-            // Element 2: compressed_bytes (byte string)
-            const uint8_t* compressed_bytes;
-            size_t compressed_len;
-            if (read_cbor_bytes(&ptr, end, &compressed_bytes, &compressed_len) != 0) {
-                fprintf(stderr, "Failed to read compressed bytes\n");
-                return -1;
-            }
-
-            // Extract Dectris header (first 12 bytes):
-            // - 8 bytes: original_size (big-endian uint64)
-            // - 4 bytes: block_size (big-endian uint32)
-            if (compressed_len < 12) {
-                fprintf(stderr, "Compressed data too short for Dectris header: %zu bytes\n", compressed_len);
-                return -1;
-            }
-
-            // Read original size from Dectris header
-            uint64_t orig_size =
-                ((uint64_t)compressed_bytes[0] << 56) |
-                ((uint64_t)compressed_bytes[1] << 48) |
-                ((uint64_t)compressed_bytes[2] << 40) |
-                ((uint64_t)compressed_bytes[3] << 32) |
-                ((uint64_t)compressed_bytes[4] << 24) |
-                ((uint64_t)compressed_bytes[5] << 16) |
-                ((uint64_t)compressed_bytes[6] << 8) |
-                ((uint64_t)compressed_bytes[7]);
-
-            *original_size_out = (size_t)orig_size;
-
-            // Return pointer to the full compressed data (including 12-byte header)
-            *compressed_out = compressed_bytes;
-            *compressed_size_out = compressed_len;
-
-            return 0;  // Success!
-        }
-
-        ptr++;
-    }
-
-    fprintf(stderr, "Dectris compression tag (56500) not found in message\n");
-    return -1;
+    if (map_value(msg_data, msg_data + msg_size, "image_id", &ptr, &end) ||
+        ptr >= end || (*ptr >> 5) != 0 || read_cbor_uint(&ptr, end, &value) || ptr != end)
+        return -1;
+    if (image_id_out) *image_id_out = value;
+    if (map_value(msg_data, msg_data + msg_size, "data", &channels, &channels_end) ||
+        map_value(channels, channels_end, "threshold_1", &ptr, &end) ||
+        expect_cbor(&ptr, end, 6, 40) || expect_cbor(&ptr, end, 4, 2) ||
+        expect_cbor(&ptr, end, 4, 2) ||
+        ptr >= end || (*ptr >> 5) != 0 || read_cbor_uint(&ptr, end, &height) ||
+        ptr >= end || (*ptr >> 5) != 0 || read_cbor_uint(&ptr, end, &width) ||
+        height > UINT32_MAX || width > UINT32_MAX ||
+        expect_cbor(&ptr, end, 6, 69) || expect_cbor(&ptr, end, 6, 56500) ||
+        expect_cbor(&ptr, end, 4, 3) || expect_cbor(&ptr, end, 3, 5) ||
+        end - ptr < 5 || memcmp(ptr, "bslz4", 5))
+        return -1;
+    ptr += 5;
+    if (ptr >= end || (*ptr >> 5) != 0 || read_cbor_uint(&ptr, end, &value) ||
+        value > SIZE_MAX) return -1;
+    *elem_size_out = (size_t)value;
+    if (read_cbor_bytes(&ptr, end, compressed_out, compressed_size_out) ||
+        ptr != end || *compressed_size_out < 12) return -1;
+    const uint8_t* bytes = *compressed_out;
+    uint64_t original = 0;
+    for (unsigned i = 0; i < 8; ++i) original = (original << 8) | bytes[i];
+    if (original > SIZE_MAX) return -1;
+    *original_size_out = (size_t)original;
+    *image_size_x_out = (uint32_t)width;
+    *image_size_y_out = (uint32_t)height;
+    return 0;
 }

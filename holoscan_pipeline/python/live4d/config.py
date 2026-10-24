@@ -10,6 +10,7 @@ class PipelineConfig:
     batch_size: int = 512
     queue_depth: int = 4
     device: int = 0
+    devices: list[int] | None = None
     scan: dict = field(default_factory=lambda: dict(width=1000, height=1000))
     detector: dict = field(default_factory=lambda: dict(bf_radius=16.0, adf_inner=24.0, adf_outer=48.0))
     execute: dict = field(default_factory=lambda: dict(mode="finite", seconds=0.0))
@@ -36,6 +37,11 @@ class PipelineConfig:
                 raise ValueError(f"{name} must be an integer between {low} and {high}")
         if self.transport not in ("zmq", "rdma"):
             raise ValueError("transport must be 'zmq' or 'rdma'")
+        if self.devices is not None:
+            if (not isinstance(self.devices, (list, tuple)) or not self.devices
+                    or any(type(d) is not int or not 0 <= d <= 255 for d in self.devices)):
+                raise ValueError("devices must contain CUDA device ordinals between 0 and 255")
+            object.__setattr__(self, "devices", tuple(self.devices))
         for value in self.scan.values():
             if type(value) is not int or not 1 <= value <= 2147483647:
                 raise ValueError("scan dimensions must be positive int32 values")
@@ -56,6 +62,11 @@ class PipelineConfig:
             host, sep, port = rdma["remote_address"].rpartition(":")
             if not host or not sep or not port.isdigit() or not 1 <= int(port) <= 65535 or not rdma["local_address"]:
                 raise ValueError("RDMA requires remote_address host:port and local_address")
+
+    @property
+    def gpu_devices(self) -> tuple[int, ...]:
+        """Ordered routing lanes; repeated CUDA ordinals remain separate entries."""
+        return tuple(self.devices) if self.devices is not None else (self.device,)
 
 
 def load_config(path: Path | None) -> PipelineConfig:

@@ -56,7 +56,8 @@ def main():
     result = results[0] if len(results) == 1 else {}
     success = (result.get("images") == args.expected_frames and result.get("gap_events") == 0
                and len(checked) == len(samples) and not mismatched
-               and termination.name in ("REQUESTED_COMPLETED", "COMPLETED"))
+               and app.receiver.completed == 1
+               and termination.name in ("REQUESTED_COMPLETED", "COMPLETED", "STOPPED"))
     report = dict(success=success, **result, cpu_reference_samples_checked=len(checked),
                   mismatched_sample_ids=mismatched, termination=termination.name)
     output = json.dumps(report, indent=2)

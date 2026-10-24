@@ -76,12 +76,13 @@ class VirtualDetectorOp(hs.Operator):
     adf_inner = hs.Param(24.0)
     adf_outer = hs.Param(48.0)
 
-    def __init__(self, *, ready=None, finite=True, observer=None, release=None):
+    def __init__(self, *, ready=None, finite=True, observer=None, release=None, completion=None):
         super().__init__()
         self.ready = ready
         self.finite = finite
         self.observer = observer
         self.release = release
+        self.completion = completion
         self.last = None
 
     def setup(self, spec):
@@ -135,7 +136,6 @@ class VirtualDetectorOp(hs.Operator):
                 stream.synchronize()
                 del view
                 if self.ready is not None:
-                    print("[holoscan] ready", flush=True)
                     self.ready.set()
                 if self.release is not None:
                     self.release(int(batch.batch_id))
@@ -192,27 +192,38 @@ class VirtualDetectorOp(hs.Operator):
             positioned.images = None
             if batch.end_of_series:
                 # Preserve float32 processing and report a float64 aggregate of the stored values.
-                totals = cp.asnumpy(self.image.sum(axis=(1, 2), dtype=cp.float64)).tolist()
+                totals = self.image.sum(axis=(1, 2), dtype=cp.float64)
                 elapsed = (self.last_image - self.first) if self.first is not None else 0.0
                 result = dict(series_id=int(batch.series_id), images=self.received,
                               announced_images=self.announced_images,
                               positions=self.placed, scan_positions=self.scan.size,
                               gap_events=self.gaps, missing_images=self.missing, batches=self.batches,
-                              batch_sizes=self.batch_sizes, bf_sum=totals[0], adf_sum=totals[1],
+                              batch_sizes=self.batch_sizes,
                               processing_dtype="float32", totals_dtype="float64",
                               delivered_interval_s=elapsed,
                               delivered_fps=(self.received - self.first_batch_count) / elapsed
                               if elapsed and self.batches > 1 else None)
                 if int(batch.series_images) != self.received:
                     raise ValueError("END image count does not match delivered images")
-                self.last = (batch.series_id, self.image, result)
-                positioned.result = result
-                print("[series-result] " + json.dumps(result, sort_keys=True), flush=True)
-                if self.observer is not None:
-                    self.observer(batch, positioned)
+                image = self.image
+
+                def finish(values):
+                    result.update(bf_sum=values[0], adf_sum=values[1], device=self.device_id)
+                    self.last = (batch.series_id, image, result)
+                    positioned.result = result
+                    print("[series-result] " + json.dumps(result, sort_keys=True), flush=True)
+                    if self.observer is not None:
+                        self.observer(batch, positioned)
+
+                if self.completion is None:
+                    finish(cp.asnumpy(totals).tolist())
+                else:
+                    # Completion owns totals, map, and callback until its CUDA event is done.
+                    # It must bound outstanding results and must not retain the runtime stream.
+                    self.completion(totals, finish)
                 self.series = self.image = None
                 self.announced_images = None
-                if self.finite:
+                if self.finite and self.completion is None:
                     ctx.request_completion()
             if self.release is not None:
                 self.release(int(batch.batch_id))
