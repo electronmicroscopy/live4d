@@ -8,9 +8,15 @@ identically whichever one delivered the frames. No Holoscan or GPU dependency.
 
 from __future__ import annotations
 
+import threading
 import time
 
 from realtime_stem.processing.base import Accumulator
+
+# Held while a batch is folded in and published, and by a live control (`apps/control.py`) while
+# it changes the reconstruction, so a change never lands in the middle of a batch. One pipeline
+# per process, so one lock.
+ACC_LOCK = threading.RLock()
 
 
 def publish_snapshot(publisher, acc: Accumulator, *, final: bool = False) -> None:
@@ -28,12 +34,10 @@ class BatchSink:
 
     def __init__(self, acc: Accumulator, *, print_every: int = 50, live_publisher=None,
                  live_every: float = 0.2, live_every_rows: int = 0):
-        self.acc = acc
         self.print_every = print_every
         self.live_publisher = live_publisher
-        self._n_positions = acc.scan_shape[0] * acc.scan_shape[1]
-        self._wrap_ids = bool(getattr(acc, "wrap_ids", False))   # repeated scans: ids wrap
-        self._rows_frames = int(live_every_rows) * int(acc.scan_shape[1])
+        self._live_every_rows = int(live_every_rows)
+        self.replace_accumulator(acc)
         self._throttle = None
         if live_publisher is not None and self._rows_frames <= 0:
             from realtime_stem.streaming.live_stream import Throttle   # lazy: no zmq otherwise
@@ -45,6 +49,19 @@ class BatchSink:
         # Which scan positions have received a frame (on the ids' device; one tiny scatter per
         # batch). The end-of-scan report counts missing positions and duplicate frames from it.
         self._seen = None
+
+    def replace_accumulator(self, acc: Accumulator) -> None:
+        """Fold the following batches into `acc` (a live control switching modes)."""
+        self.acc = acc
+        self._n_positions = acc.scan_shape[0] * acc.scan_shape[1]
+        self._wrap_ids = bool(getattr(acc, "wrap_ids", False))   # repeated scans: ids wrap
+        self._rows_frames = self._live_every_rows * int(acc.scan_shape[1])
+
+    def publish_now(self) -> None:
+        """Publish a snapshot now, e.g. after a live change, without waiting for frames."""
+        if self.live_publisher is not None:
+            with ACC_LOCK:
+                publish_snapshot(self.live_publisher, self.acc)
 
     @property
     def frames(self) -> int:
@@ -69,9 +86,10 @@ class BatchSink:
         if max_id >= self._n_positions and not self._wrap_ids:
             raise ValueError(
                 f"image_id {max_id} >= scan positions {self._n_positions} — --scan doesn't match "
-                f"the acquisition, or the scan repeats (use --accumulate latest / all)."
+                f"the acquisition, or the scan repeats (use --accumulate latest, all, reset or swap)."
             )
-        self.acc.process(frames, ids)
+        with ACC_LOCK:
+            self.acc.process(frames, ids)
         self._mark_seen(ids)
 
         self._batches += 1
@@ -90,7 +108,8 @@ class BatchSink:
             ready = self._throttle.ready()
         if ready:
             self._last_pub_frames = self._frames
-            publish_snapshot(self.live_publisher, self.acc)
+            with ACC_LOCK:
+                publish_snapshot(self.live_publisher, self.acc)
 
     def _mark_seen(self, ids) -> None:
         import torch

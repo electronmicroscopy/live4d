@@ -14,3 +14,6 @@ out/
 
 # but DO keep the committed sample capture
 !examples/data/*.dstream
+
+# macOS
+.DS_Store

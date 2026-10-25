@@ -50,6 +50,18 @@ INTROS = {
                              "scans, or repeated scans whose defocus / astigmatism follow a "
                              "schedule (an operator tuning the microscope). Writes the exact "
                              "`run.py` flags to `<out>.flags`.",
+    "tools.calibrate_parallax": "Measure the parallax geometry of a recorded scan (disk centre, "
+                                "column flip, rotation, C10, C12) from the shifts of its "
+                                "virtual bright-field images, checked with the variance loss, and "
+                                "write the `run.py` flags. Departures from a quadratic aberration "
+                                "surface (C30, C21, C23) are reported as a diagnostic only: "
+                                "parallax corrects quadratic aberrations alone.",
+    "tools.repeat_dstream": "Loop a recorded scan into a continuous acquisition: N passes in one "
+                            "`.dstream` (ids running on, or a series per pass), optionally with "
+                            "specimen drift; only `image_id` is rewritten.",
+    "tools.refocus_dstream": "Emulate turning the focus knob on a recorded scan: each pass is the "
+                             "recording as at another microscope defocus (each bright-field "
+                             "pixel's image moved by the parallax shift of the change).",
     "tools.replay_to_zmq": "Replay a `.dstream` capture over ZMQ PUSH, as the DCU would send it.",
     "tools.record_dstream": "Record a live stream (the DCU, or a feeder) verbatim into a "
                             "`.dstream` capture. Nothing else may listen to the DCU meanwhile.",
@@ -60,25 +72,39 @@ INTROS = {
     "tools.detector_setup": "Set up the DCU for the pipeline over its REST API: `check` (read "
                             "only), `apply`, `arm`, `disarm`, and `scan` (arm, your "
                             "`start_scan`, disarm). Never drives the scan generator.",
+    "realtime_stem.streaming.web": "Browser viewer for the live stream: a page on localhost with "
+                                   "zoom, contrast, colour maps, filters, a Fourier transform and "
+                                   "a history; only the visible region crosses the wire.",
     "examples.viewer": "Desktop live viewer: one panel per channel of the live stream.",
     "examples.probe": "Headless subscriber: report live frames, optionally save the last one.",
     "examples.plot_result": "Plot a saved reconstruction `.npy`.",
     "bench": "Time the parallax hot path and the live readout on the available torch devices.",
+    "compare": "Compare the continuous modes on a looped capture: each mode's live image part-way "
+               "through each pass against the true pass images.",
+    "session": "The standard analysis of a session of recordings (`sessions/README.md`): "
+               "calibrate each recording, reconstruct it at ×1/2/4/8 and at the support and live "
+               "settings, and write the same figures and `summary.json` for every session.",
 }
 
 SHORT = {
     "run": "the pipeline (reconstruct a stream, a capture or a file)",
     "tools.simulate_4dstem": "simulate parallax datasets (incl. focus-tuning sessions)",
+    "tools.calibrate_parallax": "measure centre, flip, rotation and defocus from a recording",
+    "tools.repeat_dstream": "loop a recording into repeated passes",
+    "tools.refocus_dstream": "a recording at other defocus values (focus-walk demos)",
     "tools.replay_to_zmq": "replay a capture as a live stream",
     "tools.record_dstream": "record a live stream into a capture",
     "tools.npy_to_dstream": "convert a 4D `.npy` into a capture",
     "tools.make_dstream": "synthetic random capture (format tests)",
     "tools.dstream": "inspect a capture",
     "tools.detector_setup": "set up, arm and disarm the DCU",
+    "realtime_stem.streaming.web": "browser live viewer",
     "examples.viewer": "desktop live viewer",
     "examples.probe": "headless live-stream probe",
     "examples.plot_result": "plot a saved result",
     "bench": "benchmark the accumulator",
+    "compare": "compare the continuous modes",
+    "session": "the standard analysis of a session of recordings",
 }
 
 
@@ -87,15 +113,29 @@ def _parsers():
     from realtime_stem.processing import registry
 
     out = [("run", run.build_parser(registry.get("parallax")))]
-    for mod in ("tools.simulate_4dstem", "tools.replay_to_zmq", "tools.record_dstream",
+    for mod in ("tools.simulate_4dstem", "tools.calibrate_parallax", "tools.repeat_dstream",
+                "tools.refocus_dstream",
+                "tools.replay_to_zmq",
+                "tools.record_dstream",
                 "tools.npy_to_dstream", "tools.make_dstream", "tools.dstream", "tools.detector_setup",
-                "examples.viewer", "examples.probe", "examples.plot_result"):
+                "realtime_stem.streaming.web", "examples.viewer", "examples.probe",
+                "examples.plot_result"):
         out.append((mod, importlib.import_module(mod).build_parser()))
     spec = importlib.util.spec_from_file_location(
         "bench_accumulator", REPO / "scripts" / "bench_accumulator.py")
     bench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bench)
     out.append(("bench", bench.build_parser()))
+    spec = importlib.util.spec_from_file_location(
+        "compare_accumulate", REPO / "scripts" / "compare_accumulate.py")
+    compare = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(compare)
+    out.append(("compare", compare.build_parser()))
+    spec = importlib.util.spec_from_file_location(
+        "session_report", REPO / "scripts" / "session_report.py")
+    session = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(session)
+    out.append(("session", session.build_parser()))
     return out
 
 
@@ -107,6 +147,8 @@ def _default(action) -> str:
     if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
         return "flag"
     d = action.default
+    if d == sys.executable:                  # machine-specific: keep the reference the same everywhere
+        return "the Python running it"
     if d is None or d is argparse.SUPPRESS or (action.required and d is None):
         return "required" if action.required else ""
     if isinstance(d, (list, tuple)):

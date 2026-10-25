@@ -1,36 +1,80 @@
 # realtime-stem
 
-> **About this folder.** realtime-stem 2.1.0: real-time parallax / tilt-corrected bright-field
-> (tcBF) reconstruction for 4D-STEM on a DECTRIS ARINA. It is the version from the first live
-> sessions in October 2026. It is self-contained: it builds its own Docker image (Holoscan
-> 4.4, CUDA 12) and does not use the rest of this repository. Its GPU ingest
-> (`operators/`) is an earlier fork of this repository's Holoscan operators, kept as it was used
-> live; the current operators are in [`holoscan_pipeline/`](../holoscan_pipeline/). Run every
-> command below from this folder.
+> **About this folder.** realtime-stem 2.2.0: real-time parallax / tilt-corrected bright-field
+> (tcBF) reconstruction for 4D-STEM on a DECTRIS ARINA, with a browser viewer that can fine-tune
+> the reconstruction while the scan runs. It is the version after the first live sessions in
+> October 2026; its history, and the recorded sessions with their analysis, are in
+> [kucukogluberk/EM_Realtime_Processing](https://github.com/kucukogluberk/EM_Realtime_Processing)
+> (tag `v2.2.0`). It is self-contained: it builds its own Docker image (Holoscan 4.4, CUDA 12)
+> and does not use the rest of this repository. Its GPU ingest (`operators/`) is an earlier fork
+> of this repository's Holoscan operators, kept as it was used live; the current operators are in
+> [`holoscan_pipeline/`](../holoscan_pipeline/). Bringing the two together is discussed in
+> [#9](https://github.com/electronmicroscopy/live4d/issues/9). Run every command below from this folder.
 
 This program makes a parallax (tcBF) image **while the scan is running**. The ARINA detector
 sends its frames over the network, an NVIDIA GPU unpacks them, and every frame is added to the
-image as soon as it arrives. You watch the image fill in during the scan. Next to it you see a
-phase-flipped version of the same image. It keeps up with the ARINA at full speed (120,000
-frames per second, 2×2 binned; measured on an NVIDIA RTX 6000 Ada).
+image as soon as it arrives. You watch the image fill in, in a browser. It keeps up with the ARINA
+at full speed (120,000 frames per second, 2×2 binned; measured on an NVIDIA RTX 6000 Ada).
 
-More detail: [`docs/GUIDE.md`](docs/GUIDE.md) (the full guide) and [`docs/CLI.md`](docs/CLI.md)
-(every option).
+![The browser viewer: the Reconstruction section's sliders, the parallax image phase-flipped and filtered, and its Fourier transform](docs/images/web_viewer.jpg)
+
+In the browser you can:
+
+- turn on the **phase flip**, high-pass and low-pass filters, and the **Fourier transform** of
+  what is on screen;
+- **fine-tune the defocus, the rotation and the astigmatism** (C10, rotation, C12) while the scan
+  runs. The values you started with remain the target for the microscope's knobs;
+- save a PNG, the full image as `.npy`, or **record a video** of the page.
+
+The same processing runs on a laptop without a detector or an NVIDIA GPU, on recorded or
+simulated scans (see "Try it without a detector").
+
+More detail: [`docs/GUIDE.md`](docs/GUIDE.md) (the full guide),
+[`docs/WORKFLOWS.md`](docs/WORKFLOWS.md) (from a recording to a live demo: calibration, offline
+reconstruction, looping a scan, a focus-walk demo) and [`docs/CLI.md`](docs/CLI.md) (every
+option).
 
 ## What is where
 
 ```
 realtime_stem/        the Python package
-  apps/run.py           the program you run
+  apps/run.py           the program you run (with --viewer-port it also serves the viewer)
+  apps/control.py       live tuning from the viewer
   ingest/               receives the detector frames
   processing/parallax/  the parallax / tcBF reconstruction
-  streaming/            publishes the live image
+  streaming/            publishes the live image; web/ is the browser viewer
 operators/            the C++/CUDA frame receiver and GPU decompressor
 docker/Dockerfile     builds the Docker image
-examples/             the live viewer
-tools/                detector setup, stream recorder
-scripts/              installation check
+examples/             matplotlib viewer, notebook, sample recording
+tools/                detector setup, stream recorder, replay, simulator, geometry calibration,
+                      looping and refocusing a recording
+scripts/              installation check, demos, the standard session analysis
+tests/                unit tests
 ```
+
+Recorded sessions and their analysis (Gd₂O₃ nanoparticles, an Au grating) are in
+[EM_Realtime_Processing/sessions](https://github.com/kucukogluberk/EM_Realtime_Processing/tree/v2.2.0/sessions).
+
+## Try it without a detector
+
+On a laptop (CPU, Apple silicon or an NVIDIA GPU), without Docker. This simulates a 256×256 scan
+(about a minute), reconstructs it and serves the viewer:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[local,viz,replay]"
+python -m tools.simulate_4dstem --scan 256 256 --format dstream --out out/sim256
+python -m realtime_stem.apps.run --ingest python --source out/sim256.dstream $(cat out/sim256.flags) \
+    --accumulate latest --viewer-port 8050 --out-dir out
+```
+
+Open http://127.0.0.1:8050. The viewer stays up after the replay: change C10 or the rotation in
+the Reconstruction section and the image is re-rendered from the frames it holds. Ctrl-C saves the
+tuned image to `out/` and prints the tuned flags.
+
+`scripts/run_replay_demo.sh` does the same in Docker on the GPU. [`docs/WORKFLOWS.md`](docs/WORKFLOWS.md)
+streams a recording in a loop, as a microscope scanning the same area would, and walks it through
+focus.
 
 ## What you need
 
@@ -39,7 +83,9 @@ scripts/              installation check
 - **An NVIDIA driver for CUDA 12 or newer.** Run `nvidia-smi`: it must show `CUDA Version: 12.x`
   or higher.
 - **Docker** and the **NVIDIA Container Toolkit**, so that Docker can use the GPU.
-- **Python 3.10 or newer**, for the viewer.
+- **Python 3.10 or newer**, for the detector commands (and the optional standalone viewers).
+- **A web browser**, on the processing PC or on another computer (see "Watching from another
+  computer").
 - **Disk space:** the NVIDIA base image is large. Keep several tens of GB free.
 - The image is compiled for A100, RTX 30xx / A6000, RTX 40xx / RTX 6000 Ada / L4 / L40 and
   H100 / H200 GPUs; it was tested on an RTX 6000 Ada. Older GPUs (V100, T4) need an extra build
@@ -61,7 +107,7 @@ It must print your GPU. If it fails, install or fix the NVIDIA Container Toolkit
 **2. Get the code and go into this folder.**
 
 ```bash
-git clone -b realtime-stem-parallax https://github.com/electronmicroscopy/live4d.git
+git clone https://github.com/electronmicroscopy/live4d.git
 cd live4d/realtime_stem_parallax
 ```
 
@@ -72,18 +118,18 @@ a while, depending on your network) and then compiles the GPU code (a few minute
 docker build -t realtime-stem:latest -f docker/Dockerfile .
 ```
 
-**4. Install the viewer** in a Python virtual environment. (On recent Ubuntu, `pip install`
-outside a virtual environment is refused.)
+**4. Install the host tools** (the detector commands, and the optional standalone viewers) in a
+Python virtual environment. (On recent Ubuntu, `pip install` outside a virtual environment is
+refused.)
 
 ```bash
-sudo apt install python3-venv python3-tk   # Ubuntu: virtual environments, the viewer's window
+sudo apt install python3-venv python3-tk   # Ubuntu: virtual environments, the matplotlib window
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[viz,replay]"
 ```
 
-In every new terminal, run `source .venv/bin/activate` again before using the viewer or the
-detector commands.
+In every new terminal, run `source .venv/bin/activate` again before using the detector commands.
 
 **5. Find two things.**
 
@@ -123,10 +169,10 @@ You can also do this on the DCU's web page instead.
 
 ### The setup
 
-- **The processing PC** runs this program, in three terminals:
-  1. the pipeline (it receives the frames and builds the image);
-  2. the viewer (it shows the image);
-  3. the detector commands (arm, disarm).
+- **The processing PC** runs this program, in two terminals and a browser:
+  1. the pipeline (it receives the frames, builds the image and serves the viewer);
+  2. the detector commands (arm, disarm);
+  3. the viewer, a page in the browser.
 - **The scan generator** (often on its own PC, with its own software) moves the beam. It sends
   one trigger to the detector at every scan position, and the detector takes one frame for
   each trigger.
@@ -171,22 +217,36 @@ docker run --rm --network host --gpus "device=<N>" --ulimit stack=33554432:33554
   -v "$PWD":/work -v "$PWD/out":/out -w /work --entrypoint python3 \
   realtime-stem:latest -m realtime_stem.apps.run \
     --endpoint tcp://<DCU_IP>:31001 $(cat site.flags) \
-    --live-endpoint tcp://127.0.0.1:5601 --continuous --out-dir /out
+    --viewer-port 8050 --continuous --out-dir /out
 ```
 
-It prints the GPU it uses and then waits. If it prints `WARNING: cannot reach …`, the DCU
-address is wrong or the network is down; no frames can arrive until that is fixed.
+It prints the GPU it uses and the viewer's address, and then waits. If it prints
+`WARNING: cannot reach …`, the DCU address is wrong or the network is down; no frames can arrive
+until that is fixed.
 
-### Step 3: start the viewer (terminal 2)
+### Step 3: open the viewer
 
-```bash
-source .venv/bin/activate
-python examples/viewer.py tcp://127.0.0.1:5601
-```
+Open http://127.0.0.1:8050 in a browser on the processing PC.
 
-### Step 4: arm, scan, disarm (terminal 3 and the scan generator)
+- **Image:** wheel to zoom, drag to pan, double-click to fit. The Fourier transform of what is on
+  screen can be shown next to it.
+- **Filters:** the phase flip, and a high-pass and low-pass set by their cutoff period in Å
+  (Butterworth, order 12 by default). Their cutoffs are drawn as circles on the Fourier
+  transform.
+- **Contrast:** drag the lines on the histogram, or let it follow the image.
+- **Reconstruction:** C10, the rotation and C12 (see "Setting the right values"), and the
+  `--accumulate` mode.
+- **Save:** a PNG of the view, the full image as `.npy`, or a video of the page (● record).
 
-In terminal 3, first run `source .venv/bin/activate`.
+Instead of `--viewer-port`, the pipeline can publish the image with
+`--live-endpoint tcp://127.0.0.1:5601`, for the standalone browser viewer
+(`python -m realtime_stem.streaming.web tcp://127.0.0.1:5601`), the matplotlib window
+(`python examples/viewer.py tcp://127.0.0.1:5601`) or the notebook
+([`examples/live_view.ipynb`](examples/live_view.ipynb)).
+
+### Step 4: arm, scan, disarm (terminal 2 and the scan generator)
+
+In terminal 2, first run `source .venv/bin/activate`.
 
 1. Arm the detector:
    `python -m tools.detector_setup arm --ip <DCU_IP>`
@@ -205,7 +265,9 @@ saved in the `out/` folder after every scan. Stop the pipeline with Ctrl-C.
 ### Scanning again and again
 
 If the microscope scans the same area over and over, add `--accumulate latest` to the pipeline
-command. The image then keeps updating: every position shows its newest frame. The detector must
+command. The image then keeps updating: every position shows its newest frame. Two other modes
+start every scan afresh: `swap` shows the last complete scan while the next one fills in, and
+`reset` shows only the scan in progress. The viewer can switch between them. The detector must
 expect all those frames: either arm it for every scan, or set its number of triggers to
 (scan positions × number of scans).
 
@@ -213,18 +275,30 @@ expect all those frames: either arm it for every scan, or set its number of trig
 
 The reconstruction is only correct when `--defocus`, `--rotation` and `--center` match the
 microscope: the program uses them to work out how far to shift each detector pixel's image before
-adding it. With wrong values the shifts are wrong, and so is the image. To change one, stop the
-pipeline (Ctrl-C), change the value in `site.flags`, and start it again. The guide explains how to
-find the right values from a recorded scan.
+adding it. With wrong values the shifts are wrong, and so is the image.
+
+- **The values in `site.flags` are the target.** Turn the microscope's knobs (focus, stigmators)
+  until the image is sharp.
+- **Fine-tune in the viewer.** The Reconstruction section has a slider for C10, the rotation and
+  C12 (as a and b, like stigmators). This helps above all with the rotation, which the microscope
+  can only change with a scan rotation.
+  - With `--accumulate latest` the image is re-rendered at once from the frames it holds. The
+    other modes start a new image.
+  - "copy flags" gives the values in use, to paste into `site.flags`. Ctrl-C saves the tuned
+    images and prints the same flags.
+- **Measure them from a recorded scan** with `tools/calibrate_parallax.py`: the disk centre, the
+  mirror, the rotation, C10 and C12. See [`docs/WORKFLOWS.md`](docs/WORKFLOWS.md).
 
 ### Watching from another computer
 
-On the other computer, open a tunnel to the processing PC and start the viewer there:
+On the other computer, open a tunnel to the processing PC, then open http://127.0.0.1:8050 there:
 
 ```bash
-ssh -L 5601:127.0.0.1:5601 <user>@<processing-PC>
-python examples/viewer.py tcp://127.0.0.1:5601
+ssh -L 8050:127.0.0.1:8050 <user>@<processing-PC>
 ```
+
+Only screen-sized images travel, so large images stay smooth. Recording the page works through
+the tunnel too.
 
 ## If something goes wrong
 

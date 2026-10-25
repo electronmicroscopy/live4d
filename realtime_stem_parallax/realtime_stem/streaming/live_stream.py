@@ -104,6 +104,23 @@ class LivePublisher:
         self._sock.close(linger=self.CLOSE_LINGER_MS)
 
 
+class Fanout:
+    """Several publishers as one (e.g. a PUB socket and the in-process viewer's store)."""
+
+    def __init__(self, *publishers):
+        self.publishers = [p for p in publishers if p is not None]
+
+    def publish(self, arr, **kw) -> int:
+        seq = -1
+        for p in self.publishers:
+            seq = p.publish(arr, **kw)
+        return seq
+
+    def close(self) -> None:
+        for p in self.publishers:
+            p.close()
+
+
 class LiveSubscriber:
     """Connect a SUB socket with CONFLATE (keep only the newest frame). recv_latest() returns
     (array, header) or None on timeout so a GUI loop stays responsive."""

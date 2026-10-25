@@ -1,5 +1,157 @@
 # Changelog
 
+This folder holds realtime-stem 2.2.0. Each release is a git tag in
+[EM_Realtime_Processing](https://github.com/kucukogluberk/EM_Realtime_Processing) (e.g. `v2.2.0`), where its history is; the recorded sessions
+named below are there too, in [`sessions/`](https://github.com/kucukogluberk/EM_Realtime_Processing/tree/v2.2.0/sessions).
+
+## 2.2.0
+
+New in this release: a browser viewer served by `run.py --viewer-port` with live tuning of
+C10, the rotation, C12 and the accumulate mode; recording the viewer; the geometry calibration
+from a recording (C10 refined on the lattice); the continuous modes `reset` and `swap`; tools to
+loop and refocus a recording; one layout for recorded sessions. The C++/CUDA operators are
+unchanged (still 2.0.1), so an image built for 2.1.0 runs it.
+
+**Record the viewer.** Save → "● record" writes a video in one of two kinds.
+
+- **page** (the default): the whole page with its controls, through the browser's tab capture,
+  e.g. a supplementary video of tuning a reconstruction. The browser asks to share the tab.
+- **view:** the composition of the PNG export, redrawn at a fixed rate: the image, the Fourier
+  transform if open, scale bars, cutoff circles and the caption.
+- **Rate:** 15 frames/s by default, 5–30 in a dropdown.
+- **Format:** H.264 `.mkv` in Chrome and Edge, VP9 `.webm` in Firefox, `.mp4` in Safari.
+  - A 6 s recording of the view at 1286×802 is about 2 MB.
+  - The page adds the duration that `MediaRecorder` leaves out, so players show the length and
+    can seek.
+
+**Tune the reconstruction from the browser: `run.py --viewer-port 8050`.** The pipeline serves
+the viewer itself (one command instead of two), and the page's Reconstruction section fine-tunes
+the running reconstruction.
+
+- **What it tunes:** C10, the rotation, C12 (as Cartesian a, b) and the `--accumulate` mode. The
+  command line's values are the starting point and remain the target for the microscope's
+  knobs.
+- **How a change lands:** between batches, under a lock shared with the ingest, and into the
+  run's arguments, so later scans and the saved results use it. A snapshot is published at once.
+  - `latest` re-deposits the frames it holds with the new shifts
+    (`ParallaxAccumulator.set_geometry`), so the image is exact at once: ~0.2 s for a 256² scan
+    at ×4 on an M4 Pro.
+  - The other modes restart their image.
+- **Reset and copy:** back to the command line's values, and "copy flags" for the tuned ones.
+- **After the run** the viewer stays up until Ctrl-C, which saves the tuned results and prints
+  the flags. This tunes a recording offline (`--source … --accumulate latest`).
+- **Algorithm-agnostic runner:** an `Algorithm` declares its tunable parameters (`live_params`,
+  `retune`, `tuned_flags`); `apps/control.py` holds the rest.
+- **Snapshot metadata:** it now also carries C12 and φ12.
+
+**Sessions: one layout and one standard analysis for every recorded session.**
+
+- **Layout:** `sessions/<date>_<specimen>/`, with `session.json` (the recordings, their
+  acquisition values, the live flags), `data/` and `recon/` (not in git), `calibration/`,
+  `figures/` and `analysis/`. It is described in `sessions/README.md`.
+- **Standard analysis:** `scripts/session_report.py <session>` produces, for each recording:
+  - the calibration, with C10 refined on the lattice;
+  - the reconstructions at ×1/2/4/8, at the support's focus and with the live flags;
+  - the same figures for every session: an overview of live, support and lattice focus with the
+    spectrum and the calibration along C10, and an upsampling series with a crop where the
+    lattice is strongest;
+  - `summary.json`.
+- **Sessions so far:**
+  - `out_gd2o3_30mrad/` is now `sessions/2026-10-20_Gd2O3/`. It was re-run with the refined
+    calibration (binned C10 −281 Å, against the fit's −316 Å), quantem included.
+  - The Au-grating session of 2026-10-23 is `sessions/2026-10-23_Au-grating/`, with its own
+    checks of the disk size, the scan step and the CTF zeros.
+
+**Continuous modes `--accumulate reset | swap`, movies with `--save-passes`, and looping a
+recording.**
+
+- **`reset`** starts a fresh image with each pass, so the live view is the current pass filling
+  in.
+- **`swap`** shows the current pass on the rows it has completed and the last completed pass
+  elsewhere, never partial. `--pass-average β` makes it a running average of passes.
+- **Saving and memory:** both save the last completed pass and need one more image rather than
+  `latest`'s store (1 MB against 649 MB for the binned Gd₂O₃ scan at ×2).
+- **Pass boundaries:** batches are split at pass boundaries, and stragglers of a closed pass are
+  counted.
+- **`--save-passes`** writes each completed pass's channels to `<out-dir>/passes/`, a movie of the
+  session, from a background thread.
+- **`tools/repeat_dstream.py`** loops a recorded scan into N passes: one series or one per pass,
+  optionally with drift. Only `image_id` is rewritten, and the receiver's C parser reads the
+  patched ids.
+- **`tools/refocus_dstream.py`** turns the focus knob on a recording. Pass k is the scan as at
+  microscope defocus C10_k: each bright-field pixel's image is moved by the parallax shift of the
+  change. Use it for demos of live tuning on real data.
+- **`scripts/compare_accumulate.py`** compares the modes on a looped capture.
+  `scripts/bench_accumulator.py` times `reset` / `swap` too: 985 kHz against 1,123 kHz for `all`
+  on `mps` at M = 1249.
+
+**Browser viewer: `python -m realtime_stem.streaming.web tcp://<host>:5601`.** A page on localhost
+replaces the matplotlib window as the recommended viewer.
+
+- **Smooth at large sizes.** The page asks only for the region it shows, at the size it shows it,
+  so a 4096² snapshot is as smooth as a 512² one. Contrast, gamma and the colour map are applied
+  on the GPU (WebGL2).
+- **Controls:**
+  - **The image:** one panel, the parallax reconstruction.
+  - **Filters,** shown in the Fourier transform too:
+    - the phase flip (the pipeline's `phase_flipped` channel);
+    - Butterworth high- and low-pass (order 12 by default, 2–16 in a menu), set by their
+      cutoff period in Å on logarithmic sliders (the high-pass up to the field of view). The
+      page applies them to the spectrum itself, so they don't refetch the Fourier transform,
+      and marks each cutoff with a circle.
+  - **Fourier transform:** an optional panel of the visible square at native pixels (≤ 2048²),
+    with d-spacings, a scale bar in Å⁻¹, and an outline of its square on the image.
+    - It is fetched once the view stops moving, at the panel's size.
+    - The server computes it as a float32 real FFT.
+  - **Contrast:** auto (frame or view) or manual limits, with a histogram whose lines can be
+    dragged. Manual starts from the limits shown.
+  - **Always on:** scale bars.
+  - **History:** pause and a history slider.
+  - **Export:** one PNG of the view (image and Fourier transform, scale bars, caption) and
+    `.npy`.
+  - **URL presets.**
+- **Dependencies:** the standard library, numpy and pyzmq; the page loads nothing from the
+  internet. `examples/viewer.py` and the notebook view are unchanged.
+- **Snapshot metadata:** it now carries `sampling_A`, the output pixel size. While the image is
+  filling in (a scan's first pass, every pass of `reset`, an image restarted mid-run by a mode
+  switch or a retune), it also carries `complete_rows`, the band of output rows already
+  finished. The Fourier transform and the frame's histogram use only that band, so the blank
+  part, and the phase flip's ringing off the edge of the scan, don't show in them.
+
+**Calibration from a recording: `tools/calibrate_parallax.py`.** It takes one recorded scan (a
+`.dstream` or `.npy`) and the acquisition values, and measures the parallax geometry.
+
+- **What it measures:**
+  - the disk centre on the raw frames, and the flagged / hot pixels, with whether they fall in the
+    disk;
+  - the column flip (handedness), the rotation, C10 and C12.
+- **How:** it cross-correlates the virtual bright-field images of small groups of bright-field
+  pixels, then fits the engine's own shift model. The fit is checked with the variance loss, along
+  C10 and the rotation and against the other handedness.
+- **Output:** `<out>.flags` for `run.py`, `<out>.json`, and a diagnostic plot. `--rotation-prior`
+  picks between the twins (C10, θ) and (−C10, θ + 180°).
+- **Two measurement details:**
+  - Shifts are measured below a low-pass, from pixels clear of the disk edge by that frequency.
+    Near the edge only one sideband is transferred, which moves the correlation peak outwards.
+  - The estimates are refined against an affine-regularized reference until they converge.
+- **Diagnostic only:** departures from a quadratic aberration surface (C30, C21, C23, or radial
+  distortion of the pattern). Parallax keeps χ(k ± q) to first order, and only for quadratic χ is
+  the dropped term common to all bright-field pixels.
+- **C10 on the lattice.** The shifts are measured at low frequencies, so the fit focuses the
+  support film. The tool then reconstructs ×4 images over a range of C10 and keeps the one at
+  which lattice spots beyond the scan's Nyquist frequency stand out most from the diffuse
+  background. That value goes into `--defocus`.
+  - **The score:** a top-pixel/median ratio, ring by ring. Noise, amorphous contrast and aliases
+    have the same ratio at any level, so only spots raise it.
+  - **Sub-pixel phase classes:** each output pixel is normalized by its class count, so uneven
+    coverage adds no comb.
+  - **On the Au grating:** the lattice was sharpest 136–148 Å closer to focus than the fit,
+    with 24–32× the prominence.
+  - **Without a lattice:** it keeps the fit.
+  - **Options:** `--refine-band`, `--refine-span`, `--no-refine`.
+- **Tests:** all 8 layouts, the twin and the flags round trip on simulated data. It is GUIDE
+  commissioning step 4.
+
 ## 2.1.0
 
 New in this release: a live phase-flipped image, any detector orientation, continuous scanning

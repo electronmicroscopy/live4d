@@ -49,6 +49,7 @@ def replay_dstream(path: str, endpoint: str, max_frames: int | None = None,
 
     sent_images = 0
     end_raw = None
+    ends_sent = 0
     t0 = time.perf_counter()
     for raw in iter_records(path):
         t = envelope_type(raw)
@@ -64,8 +65,13 @@ def replay_dstream(path: str, endpoint: str, max_frames: int | None = None,
                 if ahead > 0:
                     time.sleep(ahead)
         elif t == "end":
-            end_raw = raw  # send after the loop so a capped run stays well-formed
-    sock.send(end_raw if end_raw is not None else b"")
+            if max_frames is None:
+                sock.send(raw)        # in order: a capture of several series replays as several
+                ends_sent += 1
+            else:
+                end_raw = raw         # send after the loop so a capped run stays well-formed
+    if ends_sent == 0:
+        sock.send(end_raw if end_raw is not None else b"")
     time.sleep(linger_s)  # let the consumer drain before we close
     sock.close(linger=int(linger_s * 1000))
     return sent_images

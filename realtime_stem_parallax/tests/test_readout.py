@@ -198,6 +198,7 @@ def test_snapshot_stack_and_meta():
     assert stack.shape == (3, *geo.upsampled_scan_gpts) and stack.dtype == np.float32
     assert meta["frames"] == 30 and np.isclose(meta["coverage"], 30 / np.prod(_SCAN))
     assert np.isclose(meta["C10"], -1.5e4) and np.isclose(meta["rotation_deg"], -15.0)
+    np.testing.assert_allclose(meta["sampling_A"], acc.geometry.upsampled_scan_sampling)
     images = acc.images()
     assert set(images) == {"raw", "parallax", "phase_flipped", "coverage"}
     assert np.array_equal(images["raw"], acc.result())

@@ -11,16 +11,22 @@ changed recently, [CHANGELOG.md](../CHANGELOG.md).
 |---|---|
 | [`python -m realtime_stem.apps.run`](#python--m-realtime_stemappsrun) | the pipeline (reconstruct a stream, a capture or a file) |
 | [`python -m tools.simulate_4dstem`](#python--m-toolssimulate_4dstem) | simulate parallax datasets (incl. focus-tuning sessions) |
+| [`python -m tools.calibrate_parallax`](#python--m-toolscalibrate_parallax) | measure centre, flip, rotation and defocus from a recording |
+| [`python -m tools.repeat_dstream`](#python--m-toolsrepeat_dstream) | loop a recording into repeated passes |
+| [`python -m tools.refocus_dstream`](#python--m-toolsrefocus_dstream) | a recording at other defocus values (focus-walk demos) |
 | [`python -m tools.replay_to_zmq`](#python--m-toolsreplay_to_zmq) | replay a capture as a live stream |
 | [`python -m tools.record_dstream`](#python--m-toolsrecord_dstream) | record a live stream into a capture |
 | [`python -m tools.npy_to_dstream`](#python--m-toolsnpy_to_dstream) | convert a 4D `.npy` into a capture |
 | [`python -m tools.make_dstream`](#python--m-toolsmake_dstream) | synthetic random capture (format tests) |
 | [`python -m tools.dstream`](#python--m-toolsdstream) | inspect a capture |
 | [`python -m tools.detector_setup`](#python--m-toolsdetector_setup) | set up, arm and disarm the DCU |
+| [`python -m realtime_stem.streaming.web`](#python--m-realtime_stemstreamingweb) | browser live viewer |
 | [`python examples/viewer.py`](#python-examplesviewerpy) | desktop live viewer |
 | [`python examples/probe.py`](#python-examplesprobepy) | headless live-stream probe |
 | [`python examples/plot_result.py`](#python-examplesplot_resultpy) | plot a saved result |
 | [`python scripts/bench_accumulator.py`](#python-scriptsbench_accumulatorpy) | benchmark the accumulator |
+| [`python scripts/compare_accumulate.py`](#python-scriptscompare_accumulatepy) | compare the continuous modes |
+| [`python scripts/session_report.py`](#python-scriptssession_reportpy) | the standard analysis of a session of recordings |
 | [demo scripts](#demo-scripts) | `run_local_demo.sh`, `run_replay_demo.sh` |
 | [notebook view](#notebook-realtime_stemstreamingnotebookliveview) | `LiveView` for Jupyter |
 
@@ -36,19 +42,22 @@ usage: python -m realtime_stem.apps.run [-h] [--algorithm {parallax}]
                                         [--source-rate HZ] [--dtype {uint16,uint32}]
                                         [--batch-size BATCH_SIZE]
                                         [--scheduler-threads SCHEDULER_THREADS]
-                                        [--accumulate {scan,latest,all}] [--continuous]
+                                        [--accumulate {scan,latest,all,reset,swap}]
+                                        [--pass-average BETA] [--save-passes]
+                                        [--save-passes-dtype {float32,float16}] [--continuous]
                                         [--rounds N] [--live-endpoint LIVE_ENDPOINT]
-                                        [--live-every S] [--live-every-rows N] [--out-dir OUT_DIR]
-                                        [--detector HY HX] [--binned] [--defocus C10_ANG]
-                                        [--rotation DEG] [--c12 C12_ANG] [--phi12 DEG]
-                                        [--upsampling U] [--energy EV] [--semiangle MRAD]
-                                        [--angular-sampling MRAD_PX] [--scan-sampling ANG_PX]
-                                        [--center ROW COL] [--scan NY NX] [--flip-cols]
-                                        [--detector-layout LAYOUT] [--subtract-frame-mean]
-                                        [--no-phase-flip] [--no-dc-correct] [--normalize]
-                                        [--coverage] [--lowpass Q] [--highpass Q]
-                                        [--butterworth-order N] [--suppress-nyquist {auto,on,off}]
-                                        [--band-limit]
+                                        [--live-every S] [--live-every-rows N]
+                                        [--viewer-port PORT] [--viewer-host VIEWER_HOST]
+                                        [--out-dir OUT_DIR] [--detector HY HX] [--binned]
+                                        [--defocus C10_ANG] [--rotation DEG] [--c12 C12_ANG]
+                                        [--phi12 DEG] [--upsampling U] [--energy EV]
+                                        [--semiangle MRAD] [--angular-sampling MRAD_PX]
+                                        [--scan-sampling ANG_PX] [--center ROW COL] [--scan NY NX]
+                                        [--flip-cols] [--detector-layout LAYOUT]
+                                        [--subtract-frame-mean] [--no-phase-flip]
+                                        [--no-dc-correct] [--normalize] [--coverage] [--lowpass Q]
+                                        [--highpass Q] [--butterworth-order N]
+                                        [--suppress-nyquist {auto,on,off}] [--band-limit]
 ```
 
 **general**
@@ -75,7 +84,10 @@ usage: python -m realtime_stem.apps.run [-h] [--algorithm {parallax}]
 
 | parameter | default | description |
 |---|---|---|
-| `--accumulate {scan,latest,all}` | `scan` | What the reconstruction holds. scan: one scan per detector series, ids must stay within the scan (a fresh reconstruction per series with --continuous). latest: the newest frame at every scan position, kept across repeated scans and series (live tuning while the microscope scans continuously: the image follows the knobs within one scan pass). all: every frame of every repeat (averaging a settled condition). |
+| `--accumulate {scan,latest,all,reset,swap}` | `scan` | What the reconstruction holds. scan: one scan per detector series, ids must stay within the scan (a fresh reconstruction per series with --continuous). For repeated scans of the same area (one long series, or a series per pass with --continuous): latest: the newest frame at every scan position (live tuning: the image follows the knobs within one pass; stores positions x bright-field pixels). all: every frame of every pass (averaging a settled condition). reset: a fresh image each pass, so the live view is the current pass filling in. swap: the current pass on the rows it has completed and the last completed pass elsewhere, never partial (with --pass-average, a running average of passes). reset and swap save the last completed pass and need no store. |
+| `--pass-average BETA` | `1.0` | With --accumulate swap: each completed pass is blended into the shown one with this weight, front = (1 - BETA) front + BETA pass (1 = no averaging; 0.3 averages over ~3 passes while following drift). |
+| `--save-passes` | flag | With repeated scans (--accumulate latest/all/reset/swap): save each completed pass's channels to <out-dir>/passes/, one file per pass and channel (a movie of the session), written off the hot path. |
+| `--save-passes-dtype {float32,float16}` | `float32` | Data type of the --save-passes files (float16 halves them). |
 | `--continuous` | flag | Don't exit after one stream: on the series 'end', save results and re-arm for the next series (Ctrl-C / docker stop to end); with --accumulate scan each series starts a fresh reconstruction. Every scan must use the SAME geometry. |
 | `--rounds N` | `0` | With --continuous (implied if set): exit cleanly after N streams (0 = keep going forever). |
 
@@ -86,6 +98,8 @@ usage: python -m realtime_stem.apps.run [-h] [--algorithm {parallax}]
 | `--live-endpoint LIVE_ENDPOINT` | `` | If set (e.g. tcp://127.0.0.1:5601, or tcp://0.0.0.0:5601 for other machines), PUB live snapshots of the reconstruction. Empty = none. |
 | `--live-every S` | `0.2` | Minimum seconds between live snapshots (0.2 = ~5 Hz). |
 | `--live-every-rows N` | `0` | Publish a live snapshot every N scan rows instead of every --live-every seconds (0 = time-based). |
+| `--viewer-port PORT` | `0` | Serve the browser viewer from this process on PORT (e.g. 8050), with live control of the reconstruction: the algorithm's parameters (parallax: C10, rotation, C12) start from the command line's and can be fine-tuned from the page, and the --accumulate mode switched. With --accumulate latest a change re-renders the frames held at once. The viewer stays up after the run until Ctrl-C. 0 = none (a separate viewer can still subscribe to --live-endpoint). |
+| `--viewer-host VIEWER_HOST` | `127.0.0.1` | Address the viewer listens on (0.0.0.0 for other machines; or forward the port over ssh). |
 
 **output**
 
@@ -175,6 +189,105 @@ usage: python -m tools.simulate_4dstem [-h] --out PREFIX
 | `--seed SEED` | `0` | Random seed (object and shot noise). |
 | `--device DEVICE` | `auto` | Torch device for the simulation (auto: cuda, then mps, then cpu). |
 | `--batch N` | `256` | Probe positions per simulation batch (lower it for large probes). |
+
+## `python -m tools.calibrate_parallax`
+
+Measure the parallax geometry of a recorded scan (disk centre, column flip, rotation, C10, C12) from the shifts of its virtual bright-field images, checked with the variance loss, and write the `run.py` flags. Departures from a quadratic aberration surface (C30, C21, C23) are reported as a diagnostic only: parallax corrects quadratic aberrations alone.
+
+```text
+usage: python -m tools.calibrate_parallax [-h] --scan NY NX --energy EV --semiangle MRAD
+                                          --angular-sampling MRAD_PX --scan-sampling ANG
+                                          [--rotation-prior DEG] [--group PX] [--mean-every K]
+                                          [--lowpass Q] [--tol PX]
+                                          [--max-iterations MAX_ITERATIONS] [--no-loss]
+                                          [--no-refine] [--refine-band QMIN QMAX]
+                                          [--refine-span ANG] [--device DEVICE] [--out PREFIX]
+                                          recording
+```
+
+**arguments**
+
+| parameter | default | description |
+|---|---|---|
+| `recording` | required | A recorded scan: .dstream (tools/record_stream.py) or a .npy of frames (..., H, W) in raster order. |
+
+**general**
+
+| parameter | default | description |
+|---|---|---|
+| `--rotation-prior DEG` |  | Report the twin solution whose rotation is nearest this (e.g. the rotation used live). Default: the twin with \|rotation\| <= 90°. |
+| `--group PX` |  | Edge of the square groups of bright-field pixels whose vBF images are aligned (default: about 256 groups). |
+| `--mean-every K` | `8` | Average every K-th frame for the mean diffraction pattern. |
+| `--lowpass Q` |  | Highest spatial frequency (1/Å) the shifts are measured from; pixels within lowpass / Δk of the disk edge are not fitted. Default: 15% of the disk radius in 1/Å, at most the scan's Nyquist frequency. |
+| `--tol PX` | `0.01` | Stop the shift iterations when no shift changes by more than this. |
+| `--max-iterations MAX_ITERATIONS` | `30` | At most this many shift iterations. |
+| `--no-loss` | flag | Skip the variance-loss check along C10, rotation and handedness. |
+| `--no-refine` | flag | Keep the shift fit's C10 in --defocus: skip the refinement on the lattice (the C10 that sharpens a particle's lattice rather than its support film). |
+| `--refine-band QMIN QMAX` |  | Spatial frequencies (1/Å) where the refinement looks for lattice spots. Default: from the scan's Nyquist frequency to 0.95× the scan frequency (what only upsampling recovers); e.g. a band about a lattice's reflections. |
+| `--refine-span ANG` |  | The refinement searches C10 within ± this of the shift fit (Å). Default: half the fitted \|C10\|, at least 10 depths of field. |
+| `--device DEVICE` | `cpu` | Torch device for the cross-correlations, the loss and the refinement. |
+| `--out PREFIX` |  | Write <prefix>.flags (run.py flags), <prefix>.json (all results) and <prefix>.png (diagnostics, needs matplotlib). |
+
+**acquisition values (required, no defaults)**
+
+| parameter | default | description |
+|---|---|---|
+| `--scan NY NX` | required | Scan grid. |
+| `--energy EV` | required | Beam energy (eV). |
+| `--semiangle MRAD` | required | Probe convergence semiangle (mrad). |
+| `--angular-sampling MRAD_PX` | required | Detector angular sampling of the recorded mode (mrad/px); scales the measured C10 and C12. |
+| `--scan-sampling ANG` | required | Scan step (Å). |
+
+## `python -m tools.repeat_dstream`
+
+Loop a recorded scan into a continuous acquisition: N passes in one `.dstream` (ids running on, or a series per pass), optionally with specimen drift; only `image_id` is rewritten.
+
+```text
+usage: python -m tools.repeat_dstream [-h] --passes N [--series {one,per-pass}] [--scan NY NX]
+                                      [--drift DY DX]
+                                      src dst
+```
+
+**arguments**
+
+| parameter | default | description |
+|---|---|---|
+| `src` | required | A recorded scan (.dstream), one frame per position. |
+| `dst` | required | The looped .dstream to write. |
+
+**general**
+
+| parameter | default | description |
+|---|---|---|
+| `--passes N` | required | Passes to write. |
+| `--series {one,per-pass}` | `one` | one: a single series, ids running on (plays with run.py --source). per-pass: a series per pass, ids restarting (replay over ZeroMQ to run.py --continuous). |
+| `--scan NY NX` |  | The scan grid (default: as many positions as the recording has frames; needed for --drift). |
+| `--drift DY DX` | `0 0` | Specimen drift per pass in scan pixels (integers, wrapping round the field); pass k is then sent in raster order. |
+
+## `python -m tools.refocus_dstream`
+
+Emulate turning the focus knob on a recorded scan: each pass is the recording as at another microscope defocus (each bright-field pixel's image moved by the parallax shift of the change).
+
+```text
+usage: python -m tools.refocus_dstream [-h] --flags FILE --defocus-schedule C10 [C10 ...]
+                                       [--series {one,per-pass}]
+                                       src dst
+```
+
+**arguments**
+
+| parameter | default | description |
+|---|---|---|
+| `src` | required | A recorded scan (.dstream), one frame per position. |
+| `dst` | required | The .dstream to write, one pass per schedule entry. |
+
+**general**
+
+| parameter | default | description |
+|---|---|---|
+| `--flags FILE` | required | The recording's run.py flags (geometry and its own --defocus), e.g. from tools/calibrate_parallax.py. |
+| `--defocus-schedule C10 [C10 ...]` | required | The microscope's C10 (Å) on each pass. Plain numbers (-500, not -5e2). |
+| `--series {one,per-pass}` | `one` | one: a single series, ids running on (plays with run.py --source). per-pass: a series per pass (replay to run.py --continuous). |
 
 ## `python -m tools.replay_to_zmq`
 
@@ -315,6 +428,31 @@ usage: python -m tools.detector_setup [-h] --ip IP [--http-port HTTP_PORT] [--ap
 | `--trigger-mode TRIGGER_MODE` | `exts` | exts = one external trigger per frame, from the scan generator. |
 | `--keep-filewriter` | flag | Leave the DCU's file writer as it is (default: disabled, live only). |
 
+## `python -m realtime_stem.streaming.web`
+
+Browser viewer for the live stream: a page on localhost with zoom, contrast, colour maps, filters, a Fourier transform and a history; only the visible region crosses the wire.
+
+```text
+usage: python -m realtime_stem.streaming.web [-h] [--host HOST] [--port PORT] [--history-mb MB]
+                                             [--open]
+                                             endpoint
+```
+
+**arguments**
+
+| parameter | default | description |
+|---|---|---|
+| `endpoint` | required | tcp://host:port of the run.py --live-endpoint PUB. |
+
+**general**
+
+| parameter | default | description |
+|---|---|---|
+| `--host HOST` | `127.0.0.1` | Address to serve the page on (0.0.0.0 for other computers; or keep 127.0.0.1 and use ssh -L). |
+| `--port PORT` | `8050` | Port to serve the page on. |
+| `--history-mb MB` | `512.0` | Memory for past snapshots to scrub back through (the newest is always kept; 4096² × 2 channels is 128 MB each). |
+| `--open` | flag | Open the page in the default browser. |
+
 ## `python examples/viewer.py`
 
 Desktop live viewer: one panel per channel of the live stream.
@@ -386,7 +524,7 @@ Time the parallax hot path and the live readout on the available torch devices.
 usage: python scripts/bench_accumulator.py [-h] [--device DEVICE [DEVICE ...]] [--scan NY NX]
                                            [--batch BATCH] [--semiangle SEMIANGLE [SEMIANGLE ...]]
                                            [--repeats REPEATS]
-                                           [--accumulate {all,latest} [{all,latest} ...]]
+                                           [--accumulate {all,latest,reset,swap} [{all,latest,reset,swap} ...]]
 ```
 
 **general**
@@ -398,7 +536,112 @@ usage: python scripts/bench_accumulator.py [-h] [--device DEVICE [DEVICE ...]] [
 | `--batch BATCH` | `2048` | Frames per process() call. |
 | `--semiangle SEMIANGLE [SEMIANGLE ...]` | `2.0 10.0` | mrad at 0.5 mrad/px: 2 → M≈50 (the binned default), 10 → M≈1250 |
 | `--repeats REPEATS` | `50` | Timed batches per measurement. |
-| `--accumulate {all,latest} [{all,latest} ...]` | `all latest` | Accumulation modes to time (run.py --accumulate). |
+| `--accumulate {all,latest,reset,swap} [{all,latest,reset,swap} ...]` | `all latest` | Accumulation modes to time (run.py --accumulate). |
+
+## `python scripts/compare_accumulate.py`
+
+Compare the continuous modes on a looped capture: each mode's live image part-way through each pass against the true pass images.
+
+```text
+usage: python scripts/compare_accumulate.py [-h]
+                                            [--modes {latest,all,reset,swap,swap β=0.5} [{latest,all,reset,swap,swap β=0.5} ...]]
+                                            [--fractions FRACTIONS [FRACTIONS ...]]
+                                            [--channel CHANNEL] [--batch-size BATCH_SIZE]
+                                            [--device DEVICE] [--out OUT] [--detector HY HX]
+                                            [--binned] [--defocus C10_ANG] [--rotation DEG]
+                                            [--c12 C12_ANG] [--phi12 DEG] [--upsampling U]
+                                            [--energy EV] [--semiangle MRAD]
+                                            [--angular-sampling MRAD_PX] [--scan-sampling ANG_PX]
+                                            [--center ROW COL] [--scan NY NX] [--flip-cols]
+                                            [--detector-layout LAYOUT] [--subtract-frame-mean]
+                                            [--no-phase-flip] [--no-dc-correct] [--normalize]
+                                            [--coverage] [--lowpass Q] [--highpass Q]
+                                            [--butterworth-order N]
+                                            [--suppress-nyquist {auto,on,off}] [--band-limit]
+                                            source
+```
+
+**arguments**
+
+| parameter | default | description |
+|---|---|---|
+| `source` | required | A looped capture (tools/repeat_dstream.py, one series). |
+
+**general**
+
+| parameter | default | description |
+|---|---|---|
+| `--modes {latest,all,reset,swap,swap β=0.5} [{latest,all,reset,swap,swap β=0.5} ...]` | `latest all reset swap swap β=0.5` | Modes to compare. |
+| `--fractions FRACTIONS [FRACTIONS ...]` | `0.25 0.5 0.75 1.0` | Points in each pass at which to take the live images. |
+| `--channel CHANNEL` | `phase_flipped` | Channel to compare and show. |
+| `--batch-size BATCH_SIZE` | `2048` | Frames per batch, as run.py. |
+| `--device DEVICE` | `auto` | Torch device (auto: cuda, then mps, then cpu). |
+| `--out OUT` |  | Montage PNG to write (needs matplotlib). |
+
+**parallax geometry and target aberrations**
+
+| parameter | default | description |
+|---|---|---|
+| `--detector HY HX` |  | Detector geometry (default: config, 192x192; --binned preset: 96x96). Changing the detector changes the BF disk — set --angular-sampling to match the mode. |
+| `--binned` | flag | ARINA 2×2-binned preset: 96×96 detector (give --angular-sampling of the binned mode). |
+| `--defocus C10_ANG` |  | Target defocus C10 (Å) the parallax shifts are built for (negative = underfocus). Required. |
+| `--rotation DEG` |  | Scan/detector rotation (degrees). Required. |
+| `--c12 C12_ANG` |  | Target astigmatism magnitude C12 (Å). Config default: 0. |
+| `--phi12 DEG` |  | Target astigmatism angle phi12 (degrees). Config default: 0. |
+| `--upsampling U` |  | Output-grid upsampling (finer grid → finer shifts). Config default: 1. |
+| `--energy EV` |  | Beam energy (eV; 300 kV = 300000). Required. |
+| `--semiangle MRAD` |  | Probe convergence semiangle, the bright-field cutoff (mrad). Required. |
+| `--angular-sampling MRAD_PX` |  | Detector angular sampling (mrad/px, isotropic) of the mode actually running (binned or not). Required. |
+| `--scan-sampling ANG_PX` |  | Scan step (Å, isotropic). Required. |
+| `--center ROW COL` |  | BF-disk center on the raw detector frames (px), py4DSTEM's Center_X Center_Y from get_probe_size. Default: the frame center (mapped through --detector-layout). (The disk's radius is not an input: it is --semiangle / --angular-sampling.) |
+| `--scan NY NX` |  | Scan grid; must match what the microscope drives. Required. |
+| `--flip-cols` | flag | The detector's columns are reversed relative to the canonical layout (LiberTEM's detector_flip_cols). With --rotation this covers every transpose/flip: e.g. a transposed detector is --rotation +90 --flip-cols. Give --center as measured on the raw frames. Table in docs/GUIDE.md. |
+| `--detector-layout LAYOUT` |  | What the raw frame's (axis 0, axis 1) hold relative to the canonical (rows, cols) layout: rows,cols \| rows,-cols \| -rows,cols \| -rows,-cols \| cols,rows \| cols,-rows \| -cols,rows \| -cols,-rows. E.g. 'cols,-rows' = transposed with the second axis reversed. Adds the matching rotation and column flip to --rotation, and maps the default disk center onto the raw frame. Exclusive with --flip-cols. |
+
+**parallax frame processing (per frame, as frames arrive)**
+
+| parameter | default | description |
+|---|---|---|
+| `--subtract-frame-mean` | flag | Subtract each frame's mean over its bright-field pixels before it is added in (as the reference implementation does). This removes the amplitude contrast (mass-thickness, diffraction) over regions larger than about the probe, and the frame-to-frame changes in beam intensity. Default: off, the mean is kept. |
+
+**parallax readout (live channels and saved images)**
+
+| parameter | default | description |
+|---|---|---|
+| `--no-phase-flip` | flag | Don't add the phase-flipped (sign(sin chi(q))) channel. |
+| `--no-dc-correct` | flag | Don't remove each bright-field pixel's running scan mean (it removes the static bright-field pattern at the scan front and on upsampled grids). |
+| `--normalize` | flag | Divide by the per-pixel deposit count (tapered below 1% of its peak), so a partial scan reads at full brightness. |
+| `--coverage` | flag | Add the per-pixel deposit count as a channel. |
+| `--lowpass Q` |  | Butterworth low-pass cutoff (1/Å). |
+| `--highpass Q` |  | Butterworth high-pass cutoff (1/Å). |
+| `--butterworth-order N` | `12` | Steepness of the Butterworth low/high-pass edges. |
+| `--suppress-nyquist {auto,on,off}` | `auto` | Zero the Nyquist row/column of the output (auto: on when --upsampling > 1). |
+| `--band-limit` | flag | Clamp the low-pass at the parallax band limit 2*alpha/lambda. |
+
+## `python scripts/session_report.py`
+
+The standard analysis of a session of recordings (`sessions/README.md`): calibrate each recording, reconstruct it at ×1/2/4/8 and at the support and live settings, and write the same figures and `summary.json` for every session.
+
+```text
+usage: python scripts/session_report.py [-h]
+                                        [--steps {calibrate,recon,figures} [{calibrate,recon,figures} ...]]
+                                        [--device {auto,cuda,mps,cpu}] [--python PYTHON]
+                                        session
+```
+
+**arguments**
+
+| parameter | default | description |
+|---|---|---|
+| `session` | required | A session folder holding session.json. |
+
+**general**
+
+| parameter | default | description |
+|---|---|---|
+| `--steps {calibrate,recon,figures} [{calibrate,recon,figures} ...]` | `calibrate recon figures` | Which steps to run, in this order. |
+| `--device {auto,cuda,mps,cpu}` | `auto` | Torch device for the reconstructions. |
+| `--python PYTHON` | the Python running it | The interpreter that runs the calibration and run.py. |
 
 ## Demo scripts
 

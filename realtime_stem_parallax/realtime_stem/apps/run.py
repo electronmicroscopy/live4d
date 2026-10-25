@@ -133,6 +133,30 @@ def gpu_report() -> list[str]:
     return lines
 
 
+def batch_sink(app):
+    """The `BatchSink` driving an ingest app: the Python ingest's own, or the Holoscan graph's
+    sink operator's (made only when the graph starts; None before)."""
+    sink = getattr(app, "sink", None)
+    return getattr(sink, "core", sink)
+
+
+def wait_with_viewer(control, stop, algorithm, out_dir: Path) -> None:
+    """After the last scan, keep serving the viewer (and its live control: with --accumulate
+    latest every change still re-renders the frames held) until Ctrl-C or a stop signal. Results
+    tuned meanwhile are saved again on exit."""
+    print("[run] done; the viewer stays up for tuning (Ctrl-C to exit). Flags now: "
+          f"{control.state()['flags']}", flush=True)
+    seen = control.revision
+    try:
+        while not stop["requested"]:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    if control.revision != seen and control.acc is not None:
+        algorithm.save(control.acc, out_dir)          # the image as tuned
+    print(f"[run] exiting. Tuned flags: {control.state()['flags']}", flush=True)
+
+
 def check_batch_for_accumulate(args, acc) -> None:
     """`--accumulate latest` replaces each position's frame once per batch, so a batch must not
     hold the same position twice: refuse batches longer than the scan."""
@@ -202,13 +226,29 @@ def build_parser(algorithm: Algorithm) -> argparse.ArgumentParser:
                         "sleep up to 5 ms between checks for work (5-7 ms per batch).")
 
     g = p.add_argument_group("acquisition (one scan, a session of scans, continuous scanning)")
-    g.add_argument("--accumulate", choices=("scan", "latest", "all"), default="scan",
+    g.add_argument("--accumulate", choices=("scan", "latest", "all", "reset", "swap"),
+                   default="scan",
                    help="What the reconstruction holds. scan: one scan per detector series, ids "
                         "must stay within the scan (a fresh reconstruction per series with "
-                        "--continuous). latest: the newest frame at every scan position, kept "
-                        "across repeated scans and series (live tuning while the microscope scans "
-                        "continuously: the image follows the knobs within one scan pass). all: "
-                        "every frame of every repeat (averaging a settled condition).")
+                        "--continuous). For repeated scans of the same area (one long series, or "
+                        "a series per pass with --continuous): latest: the newest frame at every "
+                        "scan position (live tuning: the image follows the knobs within one "
+                        "pass; stores positions x bright-field pixels). all: every frame of "
+                        "every pass (averaging a settled condition). reset: a fresh image each "
+                        "pass, so the live view is the current pass filling in. swap: the "
+                        "current pass on the rows it has completed and the last completed pass "
+                        "elsewhere, never partial (with --pass-average, a running average of "
+                        "passes). reset and swap save the last completed pass and need no store.")
+    g.add_argument("--pass-average", type=float, default=1.0, metavar="BETA",
+                   help="With --accumulate swap: each completed pass is blended into the shown "
+                        "one with this weight, front = (1 - BETA) front + BETA pass (1 = no "
+                        "averaging; 0.3 averages over ~3 passes while following drift).")
+    g.add_argument("--save-passes", action="store_true",
+                   help="With repeated scans (--accumulate latest/all/reset/swap): save each "
+                        "completed pass's channels to <out-dir>/passes/, one file per pass and "
+                        "channel (a movie of the session), written off the hot path.")
+    g.add_argument("--save-passes-dtype", choices=("float32", "float16"), default="float32",
+                   help="Data type of the --save-passes files (float16 halves them).")
     g.add_argument("--continuous", action="store_true",
                    help="Don't exit after one stream: on the series 'end', save results and re-arm "
                         "for the next series (Ctrl-C / docker stop to end); with --accumulate scan "
@@ -227,6 +267,17 @@ def build_parser(algorithm: Algorithm) -> argparse.ArgumentParser:
     g.add_argument("--live-every-rows", type=int, default=0, metavar="N",
                    help="Publish a live snapshot every N scan rows instead of every --live-every "
                         "seconds (0 = time-based).")
+    g.add_argument("--viewer-port", type=int, default=0, metavar="PORT",
+                   help="Serve the browser viewer from this process on PORT (e.g. 8050), with live "
+                        "control of the reconstruction: the algorithm's parameters (parallax: "
+                        "C10, rotation, C12) start from the command line's and can be fine-tuned "
+                        "from the page, and the --accumulate mode switched. With --accumulate "
+                        "latest a change re-renders the frames held at once. The viewer stays up "
+                        "after the run until Ctrl-C. 0 = none (a separate viewer can still "
+                        "subscribe to --live-endpoint).")
+    g.add_argument("--viewer-host", default="127.0.0.1",
+                   help="Address the viewer listens on (0.0.0.0 for other machines; or forward "
+                        "the port over ssh).")
 
     g = p.add_argument_group("output")
     g.add_argument("--out-dir", type=Path, default=Path("."),
@@ -260,6 +311,13 @@ def main() -> None:
     parser = build_parser(algorithm)
     args = parser.parse_args(algorithm.preprocess_argv(argv))
     problems = algorithm.check_args(args)
+    if args.pass_average != 1.0 and args.accumulate != "swap":
+        problems.append("--pass-average needs --accumulate swap")
+    if not 0.0 < args.pass_average <= 1.0:
+        problems.append("--pass-average must be in (0, 1]")
+    if args.save_passes and args.accumulate == "scan":
+        problems.append("--save-passes needs repeated scans: --accumulate latest, all, reset or "
+                        "swap (with --accumulate scan --continuous every scan is saved anyway)")
     if problems:
         parser.error("\n".join(problems))
 
@@ -292,6 +350,31 @@ def main() -> None:
         publisher = LivePublisher(args.live_endpoint)
         print(f"[run] live preview PUB on {args.live_endpoint} (every {args.live_every}s)",
               flush=True)
+
+    saver = None
+    if args.save_passes:
+        from concurrent.futures import ThreadPoolExecutor
+        saver = ThreadPoolExecutor(max_workers=1, thread_name_prefix="save-passes")
+
+    def hook(acc):
+        """The runner's hooks on a new accumulator (also one a live control builds)."""
+        if saver is not None:
+            acc.on_pass_complete = (lambda k, acc=acc: algorithm.save_pass(
+                acc, args.out_dir, k, args.save_passes_dtype, executor=saver))
+
+    control = None
+    if args.viewer_port:
+        from realtime_stem.apps.control import LiveControl
+        from realtime_stem.streaming.live_stream import Fanout
+        from realtime_stem.streaming.web.server import FrameStore, StorePublisher, serve
+        store = FrameStore()
+        publisher = Fanout(publisher, StorePublisher(store))
+        control = LiveControl(algorithm, args, publisher=publisher, on_new_accumulator=hook)
+        viewer = serve(store, args.viewer_host, args.viewer_port, endpoint="run.py, in process",
+                       control=control)
+        host = "127.0.0.1" if args.viewer_host in ("", "0.0.0.0") else args.viewer_host
+        print(f"[run] viewer on http://{host}:{viewer.server_address[1]}/ with live control of "
+              f"the reconstruction", flush=True)
 
     # Ctrl-C (SIGINT) and `docker stop` (SIGTERM): Holoscan stops the running graph gracefully by
     # itself, and app.run() then returns as if the scan had ended. This flag tells the loop that
@@ -328,11 +411,15 @@ def main() -> None:
         stream = ZmqStream(args.endpoint, args.n_connections)
     rounds_done = 0
     acc = None
+    stopped = False
     try:
         while True:
             rounds_done += 1
+            if control is not None and control.acc is not None:
+                acc = control.acc             # the live control may have built a new one
             if acc is None or not persistent:
                 acc = algorithm.build(args)   # builds geometry + accumulator, prints a summary
+                hook(acc)
             elif hasattr(acc, "start_series"):
                 acc.start_series()            # ids of the new series continue the pass count
             if rounds_done == 1:
@@ -354,6 +441,8 @@ def main() -> None:
                 app = PythonIngest(acc, stream=stream, source=args.source,
                                    batch_size=args.batch_size, dtype=args.dtype,
                                    source_rate=args.source_rate, **live)
+            if control is not None:
+                control.attach(acc, lambda app=app: batch_sink(app))
             if continuous:
                 total = f"/{args.rounds}" if args.rounds else ""
                 print(f"[run] ── round {rounds_done}{total}: armed, waiting for a scan …",
@@ -362,23 +451,32 @@ def main() -> None:
             tag = f"scan{rounds_done:03d}" if continuous else ""
             if stop["requested"]:      # stopped between two scans: the last one is saved already
                 print("[run] stopped.", flush=True)
+                stopped = True
                 break
             try:
                 app.run()          # returns after the stream's `end` message, or on a stop signal
             except KeyboardInterrupt:
+                acc = control.acc if control is not None else acc
                 print("[run] interrupted — saving partial results.", flush=True)
                 finish_scan(app, acc, algorithm, args.out_dir, publisher, tag)
+                stopped = True
                 break
             except Exception:
+                acc = control.acc if control is not None else acc
                 # e.g. a frame id beyond --scan: keep what was reconstructed, then fail loudly.
                 print("[run] the pipeline stopped with an error — saving partial results.",
                       flush=True)
                 finish_scan(app, acc, algorithm, args.out_dir, publisher, tag)
                 raise
+            if control is not None:
+                acc = control.acc             # the mode may have changed during the scan
             if stop["requested"]:
                 print("[run] interrupted — saving partial results.", flush=True)
                 finish_scan(app, acc, algorithm, args.out_dir, publisher, tag)
+                stopped = True
                 break
+            if hasattr(acc, "end_series"):
+                acc.end_series()              # a pass that ended with the series is complete
             last = not continuous or (args.rounds and rounds_done >= args.rounds)
             # a persistent reconstruction is only final when the run ends (the next series keeps
             # updating the same image)
@@ -386,7 +484,11 @@ def main() -> None:
                         final=bool(last or not persistent))
             if last:
                 break
+        if control is not None and not stopped:
+            wait_with_viewer(control, stop, algorithm, args.out_dir)
     finally:
+        if saver is not None:
+            saver.shutdown(wait=True)         # every completed pass is on disk before exiting
         if publisher is not None:
             publisher.close()
         if stream is not None:
