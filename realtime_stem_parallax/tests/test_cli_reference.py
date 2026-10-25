@@ -22,8 +22,9 @@ def _generator():
 
 def test_cli_reference_is_current():
     gen = _generator()
-    assert (REPO / "docs" / "CLI.md").read_text() == gen.render(), (
-        "docs/CLI.md is stale: run python scripts/gen_cli_reference.py")
+    text = (REPO / "docs" / "CLI.md").read_text()
+    assert text == gen.render(), "docs/CLI.md is stale: run python scripts/gen_cli_reference.py"
+    assert sys.executable not in text, "docs/CLI.md names this machine's Python"   # same on every machine
 
 
 def test_every_parameter_is_described():

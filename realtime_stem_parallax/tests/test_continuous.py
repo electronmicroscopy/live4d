@@ -91,9 +91,11 @@ def test_latest_is_newest_frame_per_position(device, n_frames, upsampling_factor
 
     newest, pos = _newest_per_position(frames, ids)
     ref = _fresh(geo, newest, pos, device)
-    _close(acc.result(), ref.result())
+    # replaced deposits are subtracted in float32, in the device's (on mps varying) order: the
+    # rounding left over reaches ~2e-5 of the maximum after a few passes, as in the drift test
+    _close(acc.result(), ref.result(), rel=1e-4)
     for name, img in acc.channels().items():            # DC correction / phase flip stay exact
-        _close(img.cpu().numpy(), ref.channels()[name].cpu().numpy())
+        _close(img.cpu().numpy(), ref.channels()[name].cpu().numpy(), rel=1e-4)
 
 
 @pytest.mark.parametrize("device", DEVICES)

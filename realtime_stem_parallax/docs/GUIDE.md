@@ -167,10 +167,11 @@ docker run --rm --network host --gpus "device=<N>" --ulimit stack=33554432:33554
     --live-endpoint tcp://127.0.0.1:5601 --continuous
 ```
 
-On the host, watch it fill in:
+On the host, watch it fill in: run the browser viewer and open http://127.0.0.1:8050 (see
+"Watching in a browser"):
 
 ```bash
-python examples/viewer.py tcp://127.0.0.1:5601
+python -m realtime_stem.streaming.web tcp://127.0.0.1:5601
 ```
 
 `--continuous` re-arms after each scan's end (one container for a whole session); to tune the
@@ -234,6 +235,110 @@ the same sink. The reconstruction runs on `--device auto` (cuda, then Apple's `m
 
 `pip install -e ".[local,viz,replay]"` installs what this needs. Never install the `local` extra
 into the Holoscan container: it would replace the image's CUDA build of torch.
+
+## Watching in a browser
+
+`python -m realtime_stem.streaming.web tcp://<host>:5601` subscribes to the live stream and
+serves a page at http://127.0.0.1:8050.
+
+Or let `run.py --viewer-port 8050` serve the same page from inside the pipeline: one command
+instead of two, and the page then also tunes the reconstruction (below).
+
+### Tuning the reconstruction from the page (`run.py --viewer-port`)
+
+The command line's values stay the target, met by turning the microscope's knobs. The
+page's Reconstruction section fine-tunes what the knobs can't easily reach: the rotation above
+all, which would otherwise need a scan rotation.
+
+- **What it tunes:** C10, the rotation, and C12 as Cartesian components a = C12 cos 2φ12,
+  b = C12 sin 2φ12 (like stigmators; the polar values are shown). It can also switch the
+  `--accumulate` mode of a repeated scan.
+  - Each has a slider about its command-line value and a number field.
+  - "reset" goes back to the command line's values.
+  - "copy flags" gives the `run.py` flags of the values now in use.
+- **How a change is applied:** between batches (a lock shared with the ingest), and into the
+  run's arguments, so later scans and the saved results use it. A snapshot is published at
+  once, even with no frames arriving.
+  - `--accumulate latest` re-deposits every frame it holds with the new shifts: the image is
+    at once exactly what the new values give. On an M4 Pro that takes ~0.2 s for a 256² scan at
+    ×4.
+  - The other modes keep no frames, so their image restarts and fills in within a pass.
+  - A new mode starts a new image.
+- **After the run:** the viewer stays up until Ctrl-C. Tuned results are saved again on exit,
+  and the tuned flags are printed.
+  - So `run.py --source scan.dstream … --accumulate latest --viewer-port 8050` tunes a
+    recording offline.
+- **Under the hood:** the algorithm declares what is tunable (`Algorithm.live_params`,
+  `retune`, `tuned_flags`) and the runner stays algorithm-agnostic (`apps/control.py`). For
+  parallax, `ParallaxAccumulator.set_geometry` re-shifts. The bright-field pixels (centre,
+  semiangle, angular sampling) can't change while running.
+
+- **Only the screen crosses the wire.** The page asks for the region it shows, at the size it
+  shows it (`/view`).
+  - The server averages blocks of pixels down to about the screen's resolution, and sends native
+    pixels once zoomed in.
+  - So a 4096² snapshot (a 512² scan at ×8) costs the browser about what a 512² one does.
+  - On the Mac, a full-field view of a 4096² channel takes ~50 ms to prepare.
+- **Instant contrast.** The browser applies contrast, gamma, the colour map and invert on the GPU
+  (WebGL2), so the sliders don't round-trip.
+- **Controls:**
+  - **The image:** one reconstruction panel, the parallax image by default. Wheel to zoom, drag
+    to pan, double-click or `f` to fit, `1` for native pixels. A scale bar comes from the
+    snapshot's `sampling_A`.
+  - **Filters,** applied to the image and shown in its Fourier transform too:
+    - the phase flip, sign(sin χ(q)): the pipeline's `phase_flipped` channel, computed from the
+      same parallax sum;
+    - Butterworth high- and low-pass (display only), set by their cutoff period d_c in Å: the
+      high-pass removes spacings coarser than d_c, the low-pass those finer: H = 1/(1 +
+      (q/q_c)^2n) and its complement, ½ at q_c = 1/d_c, the filters of quantem and of the
+      pipeline's own `--lowpass` / `--highpass`. Order 12 by default, 2–16 in the "order" menu.
+      The sliders are logarithmic, the high-pass from 2 Å up to the field of view, the low-pass
+      from 0.3 to 50 Å. The Fourier transform marks each cutoff with a circle.
+  - **The Fourier transform panel** (optional) shows the visible square at native pixels, up to
+    2048², averaged to the panel's size.
+    - The server computes it, as a real FFT in float32: about 35 ms at 2048² on an M4 Pro.
+    - The page asks for it once the view has stopped moving.
+    - The page applies the filters itself (log P + 2 log₁₀|H(q)|), so moving a slider redraws it
+      at once.
+    - It shows q and the d-spacing under the cursor, and has a scale bar in Å⁻¹.
+    - A dashed outline on the image marks the square it transforms.
+    - The phase flip changes only signs, so it leaves the power spectrum as it is.
+    - While the image is still filling in (a scan's first pass, every pass of `reset`, an image
+      restarted mid-run by a mode switch or a retune), it uses
+      only the finished rows, from the snapshot's `complete_rows`. So does the frame's
+      histogram. Otherwise the blank part and the edge of the scan would dominate both.
+  - **Contrast:** limits from the whole frame's histogram, the visible view, or manual.
+    - Manual starts from the limits shown; dragging a line on the histogram switches to manual.
+    - Gamma, colour map and invert.
+  - **Status:** the pass / progress line, pause (space), and a history slider over the kept
+    snapshots (`--history-mb`, 512 MB by default).
+  - **Export:** one PNG of the view (the image and, if open, its Fourier transform, with scale
+    bars and a caption), and `.npy` of the shown channel at full resolution.
+  - **Record:** a video, 15 frames/s by default (5–30), through the browser's `MediaRecorder`.
+    - **page** (the default): the whole page with its controls, e.g. a supplementary video of
+      the tuning. The browser asks once per recording to share this tab, and records the page as
+      shown, at its own pixel size (up to 4K).
+      - Screen capture needs a secure page: `http://127.0.0.1` or `localhost`, also through
+        `ssh -L`. Elsewhere only "view" is offered.
+      - Ending the share from the browser's bar also stops the recording.
+    - **view:** the same composition as the PNG, redrawn at the chosen rate.
+      - The frame size is fixed when recording starts. Opening the Fourier transform later
+        letterboxes the composition into that size.
+      - Keep the tab visible: browsers slow the timers of a hidden tab to about once a second.
+    - **Format:** H.264 in `.mkv` in Chrome and Edge, VP9 `.webm` in Firefox, `.mp4` in Safari.
+      The page writes the duration into the `.mkv` / `.webm`, which the browser leaves out.
+- **Links:** URL parameters preset the controls, e.g.
+  `?flip=1&fft=1&hp=50&lp=1.5&order=12&cmap=inferno&view=1to1` (`hp`, `lp`: cutoff periods in Å)
+  (`ch=<channel>` picks another channel, e.g. `coverage`). `?snapshot[=seq]` shows one snapshot
+  without the live stream.
+- **Another computer:** keep the viewer next to the pipeline and forward its port
+  (`ssh -L 8050:127.0.0.1:8050 <server>`): only screen-sized images travel. Or serve it with
+  `--host 0.0.0.0`.
+- **No new dependencies:** Python's standard library, numpy and pyzmq. The page loads nothing from
+  the internet, since microscope computers are often offline.
+- **Publisher cost:** the stream itself still carries full float32 snapshots. At 4096² × 2
+  channels that is 134 MB per snapshot; on the Mac, `snapshot()` + `pack` take ~55 ms. Raise
+  `--live-every` if the ingest falls behind.
 
 ## Watching in a notebook
 
@@ -370,6 +475,47 @@ python -m realtime_stem.apps.run --accumulate latest --scan 256 256 --binned \
   "pass 3 at 47% (latest)". The final frame is published only when the run ends.
 - **`--accumulate all`** keeps every frame of every pass (averaging once the microscope is
   settled); the default `scan` is one reconstruction per series, as before.
+- **`--accumulate reset | swap`** start a fresh image with each pass (pass = `id // positions`)
+  and keep the last completed pass as the saved image. Neither needs `latest`'s store: one more
+  image instead (positions × bright-field pixels × 2 bytes → Ny·U × Nx·U × 4 bytes).
+  - `reset` shows the current pass alone, filling in.
+  - `swap` shows the current pass on the output rows it has completed and the last completed
+    pass elsewhere. A row is complete once every scan row whose shifted deposits land on it is
+    done, the torus wrap included. So the image is never partial, and the seam is no wider than
+    the parallax shifts.
+  - `--pass-average β` blends each completed pass into the shown one
+    (front ← (1 − β)·front + β·pass): a running average for movies of a settled area.
+  - Frames of a pass that arrive after the next one started (stragglers across connections) go
+    into the completed pass (`swap`) or are dropped (`reset`); the snapshot metadata counts them
+    (`late_frames`).
+- **Movies: `--save-passes`.**
+  - With any repeated-scan mode, each completed pass's channels are written to
+    `<out-dir>/passes/parallax_<channel>_passNNNN.npy` (float32, or `--save-passes-dtype
+    float16`), off the hot path.
+  - With `latest` the image at a pass boundary is exactly that pass.
+  - A pass completes when the next one starts, or when its series ends on its last position.
+- **Trying it on a recording.** `python -m tools.repeat_dstream scan.dstream loop.dstream
+  --passes 8` loops a recorded scan into one series of 8 passes (`--series per-pass` for a series
+  each, `--drift DY DX` to move the specimen between passes). Play it with `run.py --source
+  loop.dstream …`, or replay it over ZeroMQ. `scripts/compare_accumulate.py loop.dstream <flags>`
+  shows each mode's live image part-way through each pass, against the true pass images:
+  - On the binned Gd₂O₃ scan looped 4× with a (3, 4) px drift per pass, halfway through a pass
+    `latest` and `swap` correlate 0.51 / 0.49 with the pass in progress and 0.55 / 0.56 with the
+    one before.
+  - `reset` correlates 0.69 with the pass in progress, with half the image empty.
+  - `all` blurs the passes together.
+  - At each pass's end, every mode but `all` equals that pass.
+- **A focus walk on a recording** (for demos of live tuning).
+  `python -m tools.refocus_dstream scan.dstream walk.dstream --flags scan.flags
+  --defocus-schedule -500 -450 -400 -350 -300 -316 -316 -316` writes pass k as the recording would
+  look at microscope defocus C10_k.
+  - Under the parallax model a defocus change ΔC10 only moves each bright-field pixel's image by
+    ΔC10·α (rotated, flipped as the geometry says), so each pixel's image is moved by that, in
+    whole scan pixels.
+  - Reconstruct with the recording's own flags (the target) and the passes sharpen as the
+    schedule reaches it.
+  - Checked with the calibration: a pass written at −500 Å from a −316 Å recording measures
+    −501 Å.
 - **Batch size.** With `latest`, a batch must not hold the same position twice, so
   `--batch-size` ≤ scan positions (enforced).
 - **Cadence.** "Rows per update" is `--live-every-rows N`; the alternative is `--live-every`
@@ -439,9 +585,27 @@ What only the real system can show, in order:
    - Record one scan at a known defocus with
      `python3 tools/record_stream.py capture --ip <DCU_IP> --out s1.dstream` (with nothing else
      listening).
-   - Measure `--center` on the raw frames.
-   - Find `--detector-layout` / `--rotation` offline by replaying it (`run.py --source s1.dstream
-     …`) and comparing the 8 layouts and a rotation sweep.
+   - Measure it with `python -m tools.calibrate_parallax s1.dstream --scan … --energy …
+     --semiangle … --angular-sampling … --scan-sampling … --rotation-prior <the rotation used live>
+     --out s1_cal`.
+     - It gives the disk centre on the raw frames and the flagged pixels, with whether they fall in
+       the disk.
+     - It measures the shift of each small group of bright-field pixels and fits the parallax
+       geometry: column flip (the sign of the fit's determinant), rotation, C10 and C12. The 8
+       layouts are one flip or none plus a rotation.
+     - It checks the fit with the variance loss and writes `s1_cal.flags` for `run.py`, with a
+       diagnostic plot.
+     - It refines C10 on the lattice. The shifts are measured at low frequencies, where a support
+       film dominates. A range of ×4 reconstructions then picks the C10 at which the lattice spots
+       beyond the scan's Nyquist frequency stand out most, and `--defocus` gets that value.
+       Without a lattice it keeps the fit; `--no-refine` skips the step.
+     - The shifts can't tell (C10, θ) from (−C10, θ + 180°). `--rotation-prior` picks the twin, so
+       the sign of C10 rests on knowing the rotation within ±90°.
+     - A departure from a quadratic aberration surface (C30, C21, C23, or radial distortion of the
+       pattern) is reported but not used. Parallax keeps χ(k ± q) to first order in q, and only for
+       quadratic χ is the dropped term the same for every bright-field pixel.
+   - Or replay it (`run.py --source s1.dstream …`) and compare the 8 layouts and a rotation sweep
+     by eye.
 5. **Knob sign and scale.** Set the target C10 to the microscope's readout. Sweep the focus knob
    through it in known steps; the best image should sit at the readout. An offset or mirror tells
    you the defocus sign convention (C10 = −Δf in abTEM's convention) or a center/rotation error.
@@ -562,8 +726,8 @@ issues). For the end-to-end rate on a given machine, replay a recording with
   reports the scan as incomplete). The DCU counts
   them: `GET http://<DCU_IP>/stream/api/1.8.0/status/dropped`. In `--continuous` mode the
   connection stays open between scans.
-- **Continuous scanning assumes one frame per scan position.** `--accumulate latest | all` map
-  image id → position as `id % positions`. A scan generator that adds fly-back or settling
+- **Continuous scanning assumes one frame per scan position.** `--accumulate latest | all |
+  reset | swap` map image id → position as `id % positions`. A scan generator that adds fly-back or settling
   triggers between lines or passes breaks that mapping (commissioning test 3 detects it).
 - **`--accumulate latest` costs memory and time.** It keeps every position's newest frame on the
   device (positions × bright-field pixels × 2 bytes: 160 MB at 256², 2.6 GB at 1024²) and costs
@@ -607,12 +771,17 @@ realtime_stem/
   streaming/live_stream.py     pack/unpack + PUB/SUB (CONFLATE) transport
   streaming/display.py         PanelFigure: the live-frame rendering shared by the viewers
   streaming/notebook.py        LiveView: the Jupyter subscriber
+  streaming/web/               the browser viewer: server.py + static/index.html (WebGL2)
   apps/run.py                  the runner (transport flags + continuous/rounds loop)
 tools/                         .dstream CLI, stream recorders, replay feeder, npy→.dstream, 4D-STEM
                                simulator (incl. multi-pass focus walks), synthetic-capture generator,
+                               geometry calibration from a recording (calibrate_parallax.py),
                                DCU setup (detector_setup.py)
 scripts/                       machine check, replay demos (Docker / local), accumulator benchmark,
-                               CLI-reference generator
+                               continuous-mode comparison, the standard session analysis
+                               (session_report.py), CLI-reference generator
+(sessions/)                    recorded sessions, one folder each in one layout: in
+                               EM_Realtime_Processing, not in this folder
 examples/                      viewer, notebook (live_view.ipynb), headless probe, static result plot
 tests/                         parallax oracle tests, readout/orientation/codec/ingest/simulator
                                tests, streaming transport tests, runner CLI tests
@@ -645,7 +814,8 @@ skips cleanly without CUDA.
 - The ingest tests replay over ZMQ, including the multi-connection end race and back-to-back
   scans, and round-trip the recorder.
 - The continuous-scanning tests pin `--accumulate latest` / `all` (see "Commissioning on the
-  microscope"), the notebook-view tests the bounded history and pass-aware snapshots.
+  microscope"), `tests/test_pass_modes.py` `reset` / `swap` / `--pass-average` / `--save-passes`
+  and the looping tool, the notebook-view tests the bounded history and pass-aware snapshots.
 - `tests/test_cli_reference.py` fails if `docs/CLI.md` no longer matches the parsers, or a
   parameter has no description.
 - The simulator tests pin the shared conventions through the parallax variance criterion.

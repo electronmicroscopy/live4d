@@ -92,3 +92,28 @@ class Algorithm(ABC):
         `tag` is non-empty in continuous mode (e.g. "scan003"): then also keep a copy of this
         scan's result under a name containing it, so a session does not overwrite its scans.
         """
+
+    def save_pass(self, acc: Accumulator, out_dir: Path, k: int, dtype: str = "float32",
+                  executor=None) -> None:
+        """Write the image of completed pass `k` of a repeated scan (`--save-passes`), called
+        from the hot path when the pass completes: take the arrays now, and write them through
+        `executor` (a single-thread pool) when one is given. Optional (default: unsupported)."""
+        raise NotImplementedError(f"{self.name} does not save passes")
+
+    # ── live tuning (optional): the parameters a viewer may change while the pipeline runs ──
+
+    def live_params(self, args: argparse.Namespace) -> list[dict]:
+        """The reconstruction parameters a viewer may tune while running, each a dict with
+        `name`, `label`, `unit`, `value` (now), `step` and `span` (the slider's half range about
+        its starting value). Default: none."""
+        return []
+
+    def retune(self, acc: Accumulator, args: argparse.Namespace, values: dict) -> str:
+        """Apply new values of `live_params` (name → value): to `args`, so later rounds and the
+        saved results use them, and to the running `acc`. Called between batches. Returns what
+        happened, for the viewer."""
+        raise NotImplementedError(f"{self.name} has no live parameters")
+
+    def tuned_flags(self, args: argparse.Namespace) -> list[str]:
+        """The command-line flags that reproduce the current `live_params` values."""
+        return []

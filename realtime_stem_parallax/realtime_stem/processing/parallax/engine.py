@@ -61,6 +61,18 @@ one long series, or several series via `start_series()`, cover the scan again an
   contribution minus its stored one is deposited at the same (unchanged) output pixels, so the
   image is always exactly the reconstruction of the last full scan pass, and follows changes on
   the microscope within one pass. Costs an (positions × M) store and one extra gather per batch.
+- "reset": each pass starts a fresh image (pass k = ids k·positions … (k+1)·positions − 1); the
+  live view is the current pass filling in, the saved image the last completed pass. No store.
+- "swap": like "reset", but the live view shows the current pass only on the output rows it has
+  completed and the last completed pass elsewhere, so it is never partial or seamed by more than
+  the parallax shifts. With `pass_average` β < 1 the completed passes are blended,
+  front ← (1 − β)·front + β·pass. Costs one more image, not a store.
+
+Pass-aware modes split each batch at pass boundaries (one host sync per batch) and call
+`on_pass_complete(k)` when pass k is complete: the first frame of pass k + 1 arrived, or its series
+ended on its last position (`end_series()`). Frames that arrive after their pass was closed (a
+connection's stragglers) go into the completed pass ("swap"), are dropped ("reset"), or are
+deposited as usual; `late_frames` counts them.
 """
 
 from __future__ import annotations
@@ -74,6 +86,8 @@ import torch
 from realtime_stem.processing.parallax.readout import Readout, ReadoutConfig
 
 __all__ = ["ParallaxGeometry", "preprocess_geometry", "ParallaxAccumulator"]
+
+_NO_ID = 2 ** 62          # "no frame yet" for the smallest-id trackers
 
 
 # ── geometry (host NumPy, ported from the streaming reference) ─────────────────
@@ -275,9 +289,13 @@ class ParallaxAccumulator:
     def __init__(self, geometry: ParallaxGeometry, device: str | None = None,
                  measure: bool = False, readout: ReadoutConfig | None = None,
                  accumulate: str = "all", wrap_ids: bool = False,
-                 subtract_frame_mean: bool = False):
-        if accumulate not in ("all", "latest"):
-            raise ValueError(f"accumulate must be 'all' or 'latest', not {accumulate!r}")
+                 subtract_frame_mean: bool = False, track_passes: bool = False,
+                 pass_average: float = 1.0):
+        if accumulate not in ("all", "latest", "reset", "swap"):
+            raise ValueError(f"accumulate must be 'all', 'latest', 'reset' or 'swap', not "
+                             f"{accumulate!r}")
+        if not 0.0 < pass_average <= 1.0:
+            raise ValueError(f"pass_average must be in (0, 1], not {pass_average}")
         self.device = _pick_device(device)
         self.geometry = geometry
         self.subtract_frame_mean = bool(subtract_frame_mean)
@@ -308,7 +326,8 @@ class ParallaxAccumulator:
         self.n_positions = self.scan_shape[0] * self.scan_shape[1]
         self._visits = torch.zeros(self.n_positions, dtype=torch.float32, device=self.device)
         self._bf_sum = torch.zeros(geometry.n_bf, dtype=torch.float32, device=self.device)
-        self._n_frames = 0
+        self._n_frames = 0                                  # frames in the current image
+        self._n_total = 0                                   # frames received
 
         # Repeated scans: ids past the scan wrap onto it; `_id_offset` continues the count across
         # series whose ids restart at 0; `_max_id` (a device scalar, no per-batch sync) gives the
@@ -317,8 +336,25 @@ class ParallaxAccumulator:
         self.wrap_ids = bool(wrap_ids)
         self._id_offset = 0
         self._max_id = torch.full((), -1, dtype=torch.long, device=self.device)
+        # The smallest id deposited since the current image was last emptied (built, a pass
+        # restarted, a retune restarted it): where it began filling in, for `complete_rows`.
+        self._fill_min = torch.full((), _NO_ID, dtype=torch.long, device=self.device)
         self._store: torch.Tensor | None = None     # "latest": newest raw BF values per position
         self._store_kind: str | None = None
+
+        # Passes (one scan of the area each, in raster order): "reset" / "swap" restart the image
+        # at each pass and keep the last completed one as the front (`_close_pass`);
+        # `track_passes` reports completed passes in any mode (`on_pass_complete(k)`).
+        self._track = accumulate in ("reset", "swap") or bool(track_passes)
+        self.pass_average = float(pass_average)
+        self.on_pass_complete = None
+        self.passes_completed = 0
+        self.late_frames = 0
+        self._pass = -1
+        self._pass_closed = False
+        self._front: dict | None = None
+        self._row_source = self._rows_from(shifts)
+        self._sources = self._sources_from(shifts)
         self.readout_config = readout if readout is not None else ReadoutConfig()
         self._readout: Readout | None = None
 
@@ -436,15 +472,9 @@ class ParallaxAccumulator:
             g = g - g.mean(dim=1, keepdim=True)
         return g
 
-    def _accumulate_into(self, f: torch.Tensor, ids) -> None:
-        # Gather the M bright-field pixels of every frame (minus the frame's mean over them, if
-        # `subtract_frame_mean`), then scatter-add each contribution to its parallax-shifted,
-        # toroidally-wrapped output position. Independent % Ny / % Nx wraps = the correct scan-grid torus.
-        b = f.shape[0]
-        raw, kind = self._gather(f.reshape(b, -1))
-        i_bf = self._as_float(raw, kind)                       # (B, M)
-        self._n_frames += b
-
+    def _ids(self, ids) -> torch.Tensor:
+        """The batch's image ids on the device, continued across series (`start_series`); also
+        advances the scan cursor (`_max_id`, a device scalar: no sync)."""
         if isinstance(ids, torch.Tensor):
             # Device ids from the Holoscan sink — keep them on-device (no numpy round trip).
             idx = ids.to(device=self.device, dtype=torch.long, non_blocking=True)
@@ -452,10 +482,54 @@ class ParallaxAccumulator:
             idx = torch.as_tensor(np.asarray(ids), dtype=torch.long, device=self.device)
         if self.wrap_ids:
             idx = idx + self._id_offset
-            self._max_id = torch.maximum(self._max_id, idx.max())
-            idx = idx % self.n_positions
+        self._max_id = torch.maximum(self._max_id, idx.max())
+        return idx
+
+    def _accumulate_into(self, f: torch.Tensor, ids) -> None:
+        # Gather the M bright-field pixels of every frame (minus the frame's mean over them, if
+        # `subtract_frame_mean`), then scatter-add each contribution to its parallax-shifted,
+        # toroidally-wrapped output position. Independent % Ny / % Nx wraps = the correct scan-grid torus.
+        b = f.shape[0]
+        raw, kind = self._gather(f.reshape(b, -1))
+        idx = self._ids(ids)
+        self._n_total += b
+        if not self._track:
+            self._deposit(raw, kind, idx)
+            return
+        # Pass-aware: split the batch at pass boundaries (one host sync per batch; the sink makes
+        # one anyway). The first frame of a newer pass closes the current one.
+        passes = idx // self.n_positions
+        lo, hi = (int(v) for v in torch.stack((passes.min(), passes.max())).tolist())
+        for k in range(lo, hi + 1):
+            if lo == hi:
+                r, i = raw, idx
+            else:
+                sel = passes == k
+                r, i = raw[sel], idx[sel]
+                if i.numel() == 0:
+                    continue
+            if k > self._pass:
+                if self._pass >= 0 and not self._pass_closed:
+                    self._close_pass()
+                self._pass, self._pass_closed = k, False
+            if k < self._pass or self._pass_closed:
+                self._late(r, kind, i)
+            else:
+                self._deposit(r, kind, i)
+
+    def _deposit(self, raw: torch.Tensor, kind: str, idx: torch.Tensor,
+                 into: dict | None = None) -> None:
+        """Fold gathered bright-field pixels `raw` (B, M) of the frames at absolute ids `idx` into
+        the current image, or into the buffers `into` (`out`, `visits`, `bf_sum`, `n`)."""
+        i_bf = self._as_float(raw, kind)                       # (B, M)
+        pos = idx % self.n_positions if self.wrap_ids else idx
+        if into is None:
+            out, visits, bf_sum = self.out, self._visits, self._bf_sum
+            self._n_frames += raw.shape[0]
+            self._fill_min = torch.minimum(self._fill_min, idx.min())
         else:
-            self._max_id = torch.maximum(self._max_id, idx.max())
+            out, visits, bf_sum = into["out"], into["visits"], into["bf_sum"]
+            into["n"] += raw.shape[0]
 
         if self.accumulate == "latest":
             # Replace each position's previous frame: deposit (new − old) at the same pixels.
@@ -469,23 +543,125 @@ class ParallaxAccumulator:
             elif kind != self._store_kind or raw.dtype != self._store.dtype:
                 raise ValueError(f"frame dtype changed mid-stream ({raw.dtype}, {kind}) — "
                                  f"the stored frames are {self._store.dtype}")
-            i_bf = i_bf - self._as_float(self._store[idx], kind)
-            self._store[idx] = raw
-            self._visits[idx] = 1.0
+            i_bf = i_bf - self._as_float(self._store[pos], kind)
+            self._store[pos] = raw
+            visits[pos] = 1.0
         else:
-            self._visits.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
-        self._bf_sum += i_bf.sum(dim=0)
+            visits.index_add_(0, pos, torch.ones_like(pos, dtype=torch.float32))
+        bf_sum += i_bf.sum(dim=0)
 
-        yt = (idx // self._nx) * self._u                       # (B,)
-        xt = (idx % self._nx) * self._u
+        self._scatter(i_bf, pos, out)
+
+    def _scatter(self, i_bf: torch.Tensor, pos: torch.Tensor, out: torch.Tensor) -> None:
+        """Add each position's bright-field values (B, M) at its parallax-shifted output pixels,
+        wrapped on the output torus."""
+        yt = (pos // self._nx) * self._u                       # (B,)
+        xt = (pos % self._nx) * self._u
         oy = (yt.view(-1, 1) + self._sy.view(1, -1)) % self._nyu   # (B, M)
         ox = (xt.view(-1, 1) + self._sx.view(1, -1)) % self._nxu
         flat = (oy * self._nxu + ox).reshape(-1)               # (B*M,)
-        self.out.index_add_(0, flat, i_bf.reshape(-1))
+        out.index_add_(0, flat, i_bf.reshape(-1))
+
+    def _rows_from(self, shifts: np.ndarray) -> np.ndarray:
+        """"swap": for each output row, the last scan row whose shifted deposits land on it (the
+        torus wrap included; -1: none). The row is complete once the cursor is past that row."""
+        dys = np.unique(np.asarray(shifts)[:, 0])
+        y = np.arange(self._nyu)[:, None]
+        src = (y - dys[None, :]) % self._nyu
+        return np.where(src % self._u == 0, src // self._u, -1).max(axis=1)
+
+    def _sources_from(self, shifts: np.ndarray) -> np.ndarray:
+        """(output rows, scan rows) bool: which scan rows' shifted deposits land on each output
+        row, the torus wrap included."""
+        dys = np.unique(np.asarray(shifts)[:, 0])
+        src = (np.arange(self._nyu)[:, None] - dys[None, :]) % self._nyu
+        y, k = np.nonzero(src % self._u == 0)
+        m = np.zeros((self._nyu, self.scan_shape[0]), dtype=bool)
+        m[y, src[y, k] // self._u] = True
+        return m
+
+    def set_geometry(self, geometry: ParallaxGeometry, chunk: int = 4096) -> str:
+        """Re-shift with another geometry while running: new C10, C12 or rotation, with the same
+        bright-field pixels and output grid. "latest" re-deposits every frame it holds, so the
+        image is at once what the new geometry gives for them; the other modes keep no frames,
+        so their image (and "reset" / "swap"'s last completed pass) restarts. Returns which."""
+        if (not np.array_equal(np.asarray(geometry.bf_flat_inds),
+                               np.asarray(self.geometry.bf_flat_inds))
+                or tuple(geometry.upsampled_scan_gpts) != self.upsampled_scan_gpts):
+            raise ValueError("a new geometry must keep the bright-field pixels and the output "
+                             "grid: only C10, C12 and the rotation can change while running")
+        shifts = np.asarray(geometry.shifts)
+        self.geometry = geometry
+        self._sy = torch.as_tensor(shifts[:, 0], dtype=torch.long, device=self.device)
+        self._sx = torch.as_tensor(shifts[:, 1], dtype=torch.long, device=self.device)
+        self._row_source = self._rows_from(shifts)
+        self._sources = self._sources_from(shifts)
+        self._readout = None                                   # χ of the phase flip
+        self.out.zero_()
+        if self.accumulate == "latest" and self._store is not None:
+            held = torch.nonzero(self._visits > 0).squeeze(1)
+            for pos in held.split(chunk):
+                self._scatter(self._as_float(self._store[pos], self._store_kind), pos, self.out)
+            return f"re-rendered the {held.numel():,} frames held"
+        self._visits.zero_()
+        self._bf_sum.zero_()
+        self._n_frames = 0
+        self._fill_min.fill_(_NO_ID)
+        self._front = None
+        return "restarted the image (only --accumulate latest keeps the frames to re-render)"
+
+    def _late(self, raw: torch.Tensor, kind: str, idx: torch.Tensor) -> None:
+        """Frames of a pass already closed (a connection's stragglers past the boundary): into
+        the completed pass for "swap", dropped for "reset" (its image is the current pass),
+        deposited as usual for "latest" / "all"."""
+        self.late_frames += int(idx.numel())
+        if self.accumulate in ("reset", "swap"):
+            if self.accumulate == "swap" and self._front is not None:
+                self._deposit(raw, kind, idx, into=self._front)
+            return
+        self._deposit(raw, kind, idx)
+
+    def _close_pass(self) -> None:
+        """Pass `_pass` is complete (a newer one started, or its series ended on its last
+        position). "reset" / "swap": it becomes the front image (for "swap" with
+        `pass_average` β < 1, front ← (1 − β)·front + β·pass) and the current image restarts.
+        Then `on_pass_complete(k)` is called, while `images()` holds pass k."""
+        k = self._pass
+        if self.accumulate in ("reset", "swap"):
+            beta = self.pass_average if self.accumulate == "swap" else 1.0
+            if self._front is None or beta >= 1.0:
+                self._front = {"out": self.out.clone(), "visits": self._visits.clone(),
+                               "bf_sum": self._bf_sum.clone(), "n": self._n_frames}
+            else:
+                for key, cur in (("out", self.out), ("visits", self._visits),
+                                 ("bf_sum", self._bf_sum)):
+                    self._front[key].mul_(1.0 - beta).add_(cur, alpha=beta)
+                self._front["n"] = (1.0 - beta) * self._front["n"] + beta * self._n_frames
+            self.out.zero_()
+            self._visits.zero_()
+            self._bf_sum.zero_()
+            self._n_frames = 0
+            self._fill_min.fill_(_NO_ID)
+        self._pass_closed = True
+        self.passes_completed += 1
+        if self.on_pass_complete is not None:
+            self.on_pass_complete(k)
+
+    def end_series(self) -> None:
+        """The detector series ended (the runner calls this after each stream). In a pass-aware
+        mode a pass whose last position arrived is closed now, not when the next pass starts."""
+        if not self._track or self._pass < 0 or self._pass_closed:
+            return
+        max_id = int(self._max_id)
+        if max_id // self.n_positions == self._pass and \
+                max_id % self.n_positions == self.n_positions - 1:
+            self._close_pass()
 
     def result(self) -> np.ndarray:
-        """The raw parallax / tcBF sum as a (Ny*U, Nx*U) host array (no readout processing)."""
-        return self.out.reshape(self.upsampled_scan_gpts).cpu().numpy()
+        """The raw parallax / tcBF sum as a (Ny*U, Nx*U) host array (no readout processing): for
+        "reset" / "swap" the last completed pass, once there is one."""
+        out = self._front["out"] if self._front is not None else self.out
+        return out.reshape(self.upsampled_scan_gpts).cpu().numpy()
 
     def start_series(self) -> None:
         """A new detector series begins (the runner calls this per round). With `wrap_ids`, its
@@ -507,11 +683,71 @@ class ParallaxAccumulator:
             return int(self._visits.sum())
         return self._n_frames
 
-    def channels(self) -> dict[str, torch.Tensor]:
-        """The readout channels (`parallax`, `phase_flipped`, …) as device tensors."""
+    def _channels_of(self, out, visits, bf_sum, n_frames) -> dict[str, torch.Tensor]:
         if self._readout is None:
             self._readout = Readout(self.geometry, self.readout_config, self.device)
-        return self._readout.compute(self.out, self._visits, self._bf_sum, self._window_frames())
+        return self._readout.compute(out, visits, bf_sum, n_frames)
+
+    def _rows_done(self) -> int:
+        """Scan rows the current pass has completed (frames arrive in raster order)."""
+        max_id = int(self._max_id)
+        if max_id < 0 or max_id // self.n_positions != self._pass:
+            return 0
+        return (max_id % self.n_positions + 1) // self._nx
+
+    def complete_rows(self) -> list[int] | None:
+        """[r0, r1): the output rows of the live image that hold a finished image while it fills
+        in from empty, i.e. the longest run of rows whose depositing scan rows (`_sources`, the
+        torus wrap included) have all been received since the image was emptied. That is a
+        scan's first pass, every pass of "reset", and any image started mid-run: a mode switched
+        to, or restarted by a retune. The rest is blank or partly deposited. None once every row
+        is complete ("swap" shows the last completed pass on the others)."""
+        if self._front is not None and (self.accumulate == "swap" or self._n_frames == 0):
+            return None
+        max_id, start = int(self._max_id), int(self._fill_min)
+        if max_id < 0 or start > max_id:
+            return [0, 0]
+        span = max_id - start + 1                    # positions since the first, in raster order
+        if span >= self.n_positions:
+            return None
+        nx = self._nx
+        covered = (np.arange(self.scan_shape[0]) * nx - start) % self.n_positions + nx <= span
+        done = ~(self._sources & ~covered[None, :]).any(axis=1)
+        if done.all():
+            return None
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], done.astype(np.int8), [0]))))
+        if edges.size == 0:
+            return [0, 0]
+        starts, ends = edges[::2], edges[1::2]
+        k = int(np.argmax(ends - starts))
+        return [int(starts[k]), int(ends[k])]
+
+    def channels(self) -> dict[str, torch.Tensor]:
+        """The live readout channels (`parallax`, `phase_flipped`, …) as device tensors.
+
+        "reset": the current pass alone. "swap": the current pass on the output rows it has
+        completed (every scan row whose shifted deposits land there is done, the torus wrap
+        included) and the last completed pass elsewhere, each read out on its own. Both show the
+        last completed pass while the current one is empty."""
+        current = (self.out, self._visits, self._bf_sum, self._window_frames())
+        if self._front is None:
+            return self._channels_of(*current)
+        F = self._front
+        if self._n_frames == 0:
+            return self._channels_of(F["out"], F["visits"], F["bf_sum"], F["n"])
+        if self.accumulate == "reset":
+            return self._channels_of(*current)
+        back = self._channels_of(*current)
+        front = self._channels_of(F["out"], F["visits"], F["bf_sum"], F["n"])
+        done = torch.as_tensor(self._row_source < self._rows_done(), device=self.device)
+        return {k: torch.where(done.view(-1, 1), back[k], front[k]) for k in back}
+
+    def completed_channels(self) -> dict[str, torch.Tensor]:
+        """The channels of the last completed pass ("reset" / "swap"), else the live ones."""
+        if self._front is None:
+            return self.channels()
+        F = self._front
+        return self._channels_of(F["out"], F["visits"], F["bf_sum"], F["n"])
 
     def snapshot(self) -> tuple[np.ndarray, list[str], dict]:
         """The live channels as one (C, Ny*U, Nx*U) float32 host stack, their names, and metadata.
@@ -527,8 +763,12 @@ class ParallaxAccumulator:
             "C10": float(geo.aberration_coefs.get("C10", 0.0)),
             "rotation_deg": (0.0 if geo.rotation_angle is None
                              else round(float(np.rad2deg(geo.rotation_angle)), 6)),
+            "C12": float(geo.aberration_coefs.get("C12", 0.0)),
+            "phi12_deg": round(float(np.rad2deg(geo.aberration_coefs.get("phi12", 0.0))), 6),
             "upsampling": self._u,
-            "frames": self._n_frames,
+            # output pixel size (y, x) in Å: scale bars and d-spacings in the viewers
+            "sampling_A": [float(v) for v in geo.upsampled_scan_sampling],
+            "frames": self._n_total,
             "coverage": float((self._visits > 0).float().mean()),
             "accumulate": self.accumulate,
             "subtract_frame_mean": self.subtract_frame_mean,
@@ -536,12 +776,19 @@ class ParallaxAccumulator:
             "pass": max(max_id, 0) // self.n_positions,
             "progress": 0.0 if max_id < 0 else (max_id % self.n_positions + 1) / self.n_positions,
         }
+        rows = self.complete_rows()
+        if rows is not None:              # a partly filled image: e.g. the viewers' FFT uses these
+            meta["complete_rows"] = rows
+        if self._track:
+            meta["passes_completed"] = self.passes_completed
+            meta["late_frames"] = self.late_frames
         return stack, names, meta
 
     def images(self) -> dict[str, np.ndarray]:
-        """Every saved image as host arrays: the raw sum plus the readout channels."""
+        """Every saved image as host arrays: the raw sum plus the readout channels (for "reset" /
+        "swap", of the last completed pass once there is one)."""
         out = {"raw": self.result()}
-        out.update({k: v.float().cpu().numpy() for k, v in self.channels().items()})
+        out.update({k: v.float().cpu().numpy() for k, v in self.completed_channels().items()})
         return out
 
     def perf_stats(self) -> dict | None:

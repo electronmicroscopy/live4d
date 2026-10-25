@@ -57,5 +57,6 @@ guide to select a transport and configure the sender endpoint before acquisition
 | `holoscan_pipeline/` | The `live4d` application, numerical algorithms, typed ingest operators, and tests |
 | `docker/` | Unified HSDK 5/CUDA 13 container and compose service |
 | `dectris/` | Reusable imagemux protocol, handshake, native verbs backend, and ring ownership |
+| `realtime_stem_parallax/` | Live parallax / tcBF reconstruction with a browser viewer and live tuning; self-contained (its own Holoscan 4.4 image and ingest) |
 | `pipeline/` | Earlier Python/PyTorch experiments; separate dependencies and configuration from Live4D |
 | `simple_listener/` | Historical Stream2 decoding example with a hard-coded endpoint and older CBOR callback |

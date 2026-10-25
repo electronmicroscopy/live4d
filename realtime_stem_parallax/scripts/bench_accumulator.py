@@ -54,7 +54,7 @@ def bench(device: str, scan, batch: int, semiangle: float, repeats: int,
                               angular_sampling=(0.5, 0.5), aberration_coefs={"C10": -2000.0},
                               rotation_angle=np.deg2rad(-15))
     acc = ParallaxAccumulator(geo, device=device, accumulate=accumulate,
-                              wrap_ids=accumulate == "latest")
+                              wrap_ids=accumulate != "all")
     rng = np.random.default_rng(0)
     frames = torch.from_numpy(rng.integers(0, 20, size=(batch, 96, 96), dtype=np.uint16))
     frames = frames.to(dev) if dev.type == "cuda" else frames.to(torch.int32).to(dev)
@@ -69,7 +69,10 @@ def bench(device: str, scan, batch: int, semiangle: float, repeats: int,
     k = [0]
 
     def step():
-        acc.process(frames, ids[k[0] % len(ids)])
+        if accumulate in ("reset", "swap"):           # ids run on, so passes complete in the loop
+            acc.process(frames, torch.arange(k[0] * batch, (k[0] + 1) * batch, device=dev))
+        else:
+            acc.process(frames, ids[k[0] % len(ids)])
         k[0] += 1
 
     t_process = _timeit(step, dev, repeats)
@@ -101,7 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--semiangle", type=float, nargs="+", default=[2.0, 10.0],
                    help="mrad at 0.5 mrad/px: 2 → M≈50 (the binned default), 10 → M≈1250")
     p.add_argument("--repeats", type=int, default=50, help="Timed batches per measurement.")
-    p.add_argument("--accumulate", nargs="+", default=["all", "latest"], choices=("all", "latest"),
+    p.add_argument("--accumulate", nargs="+", default=["all", "latest"],
+                   choices=("all", "latest", "reset", "swap"),
                    help="Accumulation modes to time (run.py --accumulate).")
     return p
 

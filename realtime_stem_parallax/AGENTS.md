@@ -22,10 +22,13 @@ Three stages, each changeable on its own:
 |---|---|---|---|
 | ingest: receive + decompress | `operators/` (`ZmqRxOp`, `DecompressGpuOp`), wired in `realtime_stem/ingest/holoscan_graph.py`; or `ingest/python_ingest.py` + `codec.py` (CPU); both feed `ingest/sink.py` | C++/CUDA (operators), Python | operators: **yes**; the rest: no |
 | processing: the reconstruction | `realtime_stem/processing/` (`base.py` contracts, `registry.py`, `parallax/`) | Python + PyTorch | no |
-| stream-out + viewing | `realtime_stem/streaming/` (`live_stream.py`, `display.py`, `notebook.py`), `examples/viewer.py`, `examples/live_view.ipynb` | Python | no |
+| stream-out + viewing | `realtime_stem/streaming/` (`live_stream.py`, `display.py`, `notebook.py`, `web/`: the browser viewer), `examples/viewer.py`, `examples/live_view.ipynb` | Python (+ the viewer's page: JS/WebGL2) | no |
 
 - `realtime_stem/apps/run.py`: the program that is run. It owns the transport flags (endpoint,
   batch, scheduler, connections, live preview, `--continuous`) and never names an algorithm.
+  `--viewer-port` serves the browser viewer in process, with live control of the reconstruction
+  (`apps/control.py`; the algorithm declares what is tunable: `Algorithm.live_params` / `retune`).
+  Changes are applied under `ingest/sink.ACC_LOCK`, between batches.
 - `realtime_stem/processing/parallax/`: `config.py` (the physics flags and their units),
   `engine.py` (`preprocess_geometry`: bright-field pixels and their shifts, NumPy;
   `ParallaxAccumulator`: the scatter-add, `--accumulate` modes), `readout.py` (the live channels:
@@ -33,11 +36,20 @@ Three stages, each changeable on its own:
   `algorithm.py` (CLI wiring and saving results).
 - `tools/`: the `.dstream` recording format, a stream recorder (`record_stream.py`, host Python
   with pyzmq + cbor2; stop the pipeline while it records), a replay feeder (`replay_to_zmq.py`),
-  a 4D-STEM simulator (`simulate_4dstem.py`), recording converters/generators,
+  a 4D-STEM simulator (`simulate_4dstem.py`), the geometry calibration from a recording
+  (`calibrate_parallax.py`: centre, flip, rotation, C10/C12 as `run.py` flags, C10 refined on the
+  lattice rather than the support; read only, offline),
+  recording converters/generators,
   `check_gpu_copies.py` (a hardware check) and `detector_setup.py` (the DCU's settings over its
   REST API: `check`, `apply`, `arm`, `disarm`, `scan`; standard library only).
 - `scripts/check_install.sh`: the step-by-step machine check (DCU reachability and link speed,
   GPU, image, GPU copies, replays). `scripts/run_replay_demo.sh`: the no-detector demo.
+- `sessions/<date>_<specimen>/` (in [EM_Realtime_Processing](https://github.com/kucukogluberk/EM_Realtime_Processing/tree/v2.2.0/sessions), not in this folder):
+  recorded sessions, one layout each (`sessions/README.md`):
+  `session.json` (files, acquisition values, live flags), `data/` and `recon/` (not in git),
+  `calibration/`, `figures/`, `analysis/`. `scripts/session_report.py <session>` runs the standard
+  analysis: calibration, reconstructions, figures and `summary.json`. Take a new session's
+  acquisition values from that session, never from another one.
 - `docker/Dockerfile`: builds the image (NVIDIA's pinned Holoscan base + the compiled operators).
 - `tests/`: unit tests (parallax math against a float64 reference, the stream transport, the
   runner's CLI, the C frame parser).
@@ -137,8 +149,9 @@ changing anything used live.
 - `--batch-size` is capped at 2048 at compile time (`kMaxBatchSize`,
   `operators/cpp/common/constants.h`); 2048 is the tested default.
 - `--scheduler-threads 0` (single-threaded, default) is the tested, fastest setting.
-- `--accumulate latest | all` map image id → position as `id % positions`, so they need exactly
-  one frame per scan position; `latest` also needs `--batch-size` ≤ the scan positions.
+- `--accumulate latest | all | reset | swap` map image id → position as `id % positions` (pass =
+  `id // positions`), so they need exactly one frame per scan position; `latest` also needs
+  `--batch-size` ≤ the scan positions, and `swap`'s live composite assumes raster order.
 - A change to a command-line flag needs `python scripts/gen_cli_reference.py` (a test checks
   that `docs/CLI.md` is current).
 - The DCU's stream compression must be `bslz4`.
@@ -159,7 +172,9 @@ changing anything used live.
 - Building behind a proxy: configure the Docker daemon's proxy, and pass
   `--build-arg HTTP_PROXY=… --build-arg HTTPS_PROXY=…`.
 - Files the container writes belong to root; delete them with sudo or from a container.
-- Viewer on another computer: `ssh -L 5601:127.0.0.1:5601 <server>`, then
-  `python examples/viewer.py tcp://127.0.0.1:5601` there.
+- Viewer on another computer: run `python -m realtime_stem.streaming.web tcp://127.0.0.1:5601` on
+  the server, then `ssh -L 8050:127.0.0.1:8050 <server>` and open http://127.0.0.1:8050 there (only
+  screen-sized images travel). The matplotlib viewer works the same way through
+  `ssh -L 5601:127.0.0.1:5601`.
 
 Diagnosis: `docs/GUIDE.md`, "Known issues and limitations", and `scripts/check_install.sh`.
