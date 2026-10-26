@@ -362,17 +362,16 @@ static int extract_image_shape(const uint8_t* data, size_t size,
     const uint8_t* ptr = data;
     const uint8_t* end = data + size;
     while (ptr + 2 <= end) {
+        // Tag 40 bytes can also occur inside other values, e.g. image_id 55336 (0x19 0xD8 0x28);
+        // a candidate that is not a [[height, width], data] array is skipped.
         if (ptr[0] == 0xD8 && ptr[1] == 0x28) {
             const uint8_t* candidate = ptr + 2;
             uint64_t wrapper_size;
+            uint64_t shape_size, width, height;
             if (candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY ||
                 read_cbor_uint(&candidate, end, &wrapper_size) || wrapper_size != 2 ||
-                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY) {
-                ++ptr;  // the bytes D8 28 inside an earlier value (e.g. a timestamp), not tag 40
-                continue;
-            }
-            uint64_t shape_size, width, height;
-            if (read_cbor_uint(&candidate, end, &shape_size) || shape_size != 2 ||
+                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY ||
+                read_cbor_uint(&candidate, end, &shape_size) || shape_size != 2 ||
                 candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
                 read_cbor_uint(&candidate, end, &width) || width > UINT32_MAX ||
                 candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||

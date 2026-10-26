@@ -16,7 +16,7 @@ ARG CUDA_ARCHITECTURES=86;89;90;120
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential pkg-config libzmq3-dev libnvcomp5-dev-cuda-13 ninja-build python3-dev \
+      build-essential pkg-config libzmq3-dev libnvcomp5-dev-cuda-13 libhdf5-dev ninja-build python3-dev \
       python3-pip libibverbs-dev rdma-core ibverbs-providers ibverbs-utils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -25,7 +25,7 @@ RUN python3 -m pip install --no-cache-dir \
       torch==2.11.0+cu130 --index-url https://download.pytorch.org/whl/cu130
 # lz4 + dectris-compression: the pure-Python ingest (reading .dstream recordings) and its tests.
 RUN python3 -m pip install --no-cache-dir \
-      "numpy>=2.1,<3" pyyaml cbor2 cupy-cuda13x pyzmq pytest lz4 dectris-compression
+      "numpy>=2.1,<3" pyyaml cbor2 cupy-cuda13x pyzmq pytest h5py hdf5plugin lz4 dectris-compression
 
 WORKDIR /opt/live4d
 COPY holoscan_pipeline ./holoscan_pipeline

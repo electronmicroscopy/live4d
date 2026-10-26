@@ -17,6 +17,9 @@ class PipelineConfig:
     rdma: dict = field(default_factory=lambda: dict(remote_address="", local_address="", device="",
                                                  ring_memory="gpu", ring_mib=64, max_batch=512,
                                                  timeout=10.0))
+    writer: dict = field(default_factory=lambda: dict(enabled=False, output_dir="/data",
+                                                   name_pattern="series_$id",
+                                                   images_per_file=1000000, staging_batches=4))
 
     def __post_init__(self):
         defaults = dict(scan=dict(width=1000, height=1000),
@@ -24,7 +27,9 @@ class PipelineConfig:
                         execute=dict(mode="finite", seconds=0.0),
                         zmq=dict(endpoint="tcp://127.0.0.1:5555"),
                         rdma=dict(remote_address="", local_address="", device="", ring_memory="gpu",
-                                  ring_mib=64, max_batch=512, timeout=10.0))
+                                  ring_mib=64, max_batch=512, timeout=10.0),
+                        writer=dict(enabled=False, output_dir="/data", name_pattern="series_$id",
+                                    images_per_file=1000000, staging_batches=4))
         for name, values in defaults.items():
             given = getattr(self, name)
             if not isinstance(given, dict) or set(given) - set(values):
@@ -52,6 +57,20 @@ class PipelineConfig:
             raise ValueError("rdma.max_batch must be between 1 and 1024")
         if type(rdma["ring_mib"]) is not int or rdma["ring_mib"] < 1 or rdma["timeout"] <= 0:
             raise ValueError("RDMA ring size and timeout must be positive")
+        writer = self.writer
+        if type(writer["enabled"]) is not bool:
+            raise ValueError("writer.enabled must be true or false")
+        if not isinstance(writer["output_dir"], str) or not writer["output_dir"]:
+            raise ValueError("writer.output_dir must be a non-empty path")
+        pattern = writer["name_pattern"]
+        if (not isinstance(pattern, str) or not pattern or pattern.startswith("/")
+                or pattern.endswith("/") or ".." in pattern.split("/")
+                or pattern.split("/")[-1] == "."):
+            raise ValueError("writer.name_pattern must be a relative file name stem below output_dir")
+        if type(writer["images_per_file"]) is not int or writer["images_per_file"] < 1:
+            raise ValueError("writer.images_per_file must be a positive integer")
+        if type(writer["staging_batches"]) is not int or not 2 <= writer["staging_batches"] <= 64:
+            raise ValueError("writer.staging_batches must be an integer between 2 and 64")
         if self.transport == "rdma":
             host, sep, port = rdma["remote_address"].rpartition(":")
             if not host or not sep or not port.isdigit() or not 1 <= int(port) <= 65535 or not rdma["local_address"]:

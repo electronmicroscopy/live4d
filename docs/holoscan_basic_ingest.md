@@ -10,7 +10,7 @@ the series metadata.
 ```text
 ZMQ → pinned compressed batches → GPU BSLZ4 decode ─┐
                                                  ├→ DecodedBatch → scan positions → BF/ADF
-RDMA → registered ingress ring → GPU tensor loan ─┘
+RDMA → registered ingress ring → GPU tensor loan ─┘              └→ optional NXmx HDF5 writer
 ```
 
 ## Project structure and algorithms
@@ -25,7 +25,7 @@ RDMA → registered ingress ring → GPU tensor loan ─┘
 | `holoscan_pipeline/python/live4d/algorithms/virtual_detectors.py` | CuPy BF/ADF masks and per-frame integration |
 | `holoscan_pipeline/python/live4d/processing.py` | Scan placement and Holoscan processing operators, including CUDA synchronization and tensor lifetime |
 | `holoscan_pipeline/python/live4d/operators.py` | Python access to registered native ingest operators |
-| `holoscan_pipeline/cpp/` | ZMQ reception, GPU decompression, RDMA gathering, and bounded publication |
+| `holoscan_pipeline/cpp/` | ZMQ reception, GPU decompression, RDMA gathering, bounded publication, and NXmx HDF5 writing |
 | `holoscan_pipeline/schemas/` | Typed batch messages; CMake generates their Python and C++ bindings |
 | `dectris/` | Imagemux protocol, TCP handshake, native verbs backend, and registered-ring ownership |
 
@@ -49,8 +49,8 @@ docker build -f docker/Dockerfile.holoscan \
   --build-arg CUDA_ARCHITECTURES=121 -t dectris-holoscan:hsdk5 .
 ```
 
-The image includes Holoscan SDK 5.0.0, CUDA 13, nvCOMP, ZMQ, CuPy, and the reusable
-`imx-receiver` native verbs package. Its entry point is `python3 -m live4d`.
+The image includes Holoscan SDK 5.0.0, CUDA 13, nvCOMP, ZMQ, CuPy, HDF5 1.10 with h5py and
+hdf5plugin, and the reusable `imx-receiver` native verbs package. Its entry point is `python3 -m live4d`.
 
 Copy either `holoscan_pipeline/config/basic_ingest.yaml` or
 `holoscan_pipeline/config/rdma.yaml` to `pipeline.yaml` and edit the transport settings.
@@ -114,8 +114,8 @@ shipped ZMQ YAML.
 ## Configuration and batching
 
 `transport` selects `zmq` or `rdma`. The common settings are `batch_size`, `queue_depth`,
-`device`, `scan.width/height`, `detector.bf_radius/adf_inner/adf_outer`, and
-`execute.mode/seconds`. Unknown sections and keys are rejected. `batch_size` is between
+`device`, `scan.width/height`, `detector.bf_radius/adf_inner/adf_outer`,
+`execute.mode/seconds`, and `writer`. Unknown sections and keys are rejected. `batch_size` is between
 1 and 1000; `queue_depth` is between 2 and 16 per graph edge.
 
 The receiver publishes exactly `batch_size` images during an acquisition and flushes the
@@ -170,6 +170,58 @@ switching to binned images does not shrink the pool allocation.
 The two float32 scan maps use `8 * width * height` bytes of the series' raster, before temporary
 arrays, retained prior-series results, runtime tensors, and decoder scratch. The RDMA
 ring is additional storage. Scan size, batch size, and queue depth affect memory demand.
+
+## HDF5 output
+
+`writer.enabled: true` adds `H5WriterOp` as a second consumer of decoded batches. Each series
+is written as `<writer.output_dir>/<name>_master.h5` plus `<name>_data_NNNNNN.h5` data files,
+where `<name>` is `writer.name_pattern` (default `series_$id`) with `$id` replaced by the series ID.
+A non-empty string `name_pattern` in the START `header_appendix` overrides the configured pattern
+for that series; a missing or empty one keeps it. Either pattern must stay below `output_dir`:
+absolute paths, `..` components, and a trailing `/` or `.` are rejected, and a rejected or
+non-string appendix pattern fails the run. Subdirectories in the pattern are created. Existing
+files with the same names are overwritten. The `[h5-series]` record reports `name_source` as
+`header_appendix` or `config`.
+
+A boolean `enable_h5_writer` in the START `header_appendix` turns writing off for one series when
+`false`; `true` or a missing key writes the series. A disabled series creates no files, and its
+images skip GPU compression; its `[h5-series]` record has `"enabled": false`. A non-boolean value
+fails the run. The key cannot enable writing when `writer.enabled` is false, because the writer is
+then not part of the graph.
+The layout follows the imagemux filewriter's NXmx 2024 format: the master file holds START
+metadata (beam, detector, per-channel threshold energy, flatfield and pixel mask, detector
+translation, and goniometer axes when announced) and a virtual `/entry/data/data` of shape
+`(number_of_images, 1, height, width)` over the data files. Each data file holds up to
+`writer.images_per_file` images (default 1,000,000) in `/entry/data/data` with one chunk per
+image. Files appear under their final names when complete; `.tmp` names mark files in progress.
+Per-image `start_time` datasets are not written because batches carry no image timestamps.
+Unlike imagemux, which uses HDF5 1.14 format bounds, files use the HDF5 1.10 format.
+
+```yaml
+writer:
+  enabled: true
+  output_dir: /data          # mount a writable host directory here
+  name_pattern: series_$id
+  images_per_file: 1000000
+  staging_batches: 4         # pinned staging batches between GPU compression and disk
+```
+
+Chunks use the bitshuffle HDF5 filter (ID 32008) with zstd, filter options `(0, 5, 2, 0, 3)` as in
+imagemux, so any reader with the standard bitshuffle plugin decodes them, for example h5py with
+`import hdf5plugin`. The GPU bit-shuffles each image in 4096-element blocks, nvCOMP compresses
+the blocks with zstd (at its fixed default level), and a framing kernel writes the bitshuffle
+chunk headers into mapped pinned staging. One writer thread performs every HDF5 call and stores
+the chunks with `H5Dwrite_chunk`, without filtering on the host.
+
+The data layout uses START `number_of_images`, which the writer therefore requires. Images whose
+IDs fall outside it are counted as `dropped_images` and not written. Unwritten positions read as
+the fill value 65535. A series that announces zero images writes no files. A full staging ring
+delays the writer's window release, which pauses ingress like a slow detector; it does not drop
+images. END waits until the series' files are closed, and a write failure fails the run. In
+finite mode the later of the detector and writer requests completion, because requested
+completion does not drain queues. At END the writer prints an `[h5-series]` JSON record with
+written and dropped counts, data files, compressed bytes, and `written_fps` over the series'
+write interval.
 
 ## Shared messages and GPU ownership
 
@@ -245,7 +297,8 @@ passed into the container with `-e IMXRDMA_LOCAL_ADDR`; also pass `-e RDMA_TEST_
 to enable them in the HSDK image. Tests cover fixed batching, partial
 and empty acquisitions, consecutive series at both image sizes, size changes between
 series, geometry rejection, pixel values, scan clipping, BF/ADF results, readiness,
-credits, and shutdown. For ZMQ-only checks, omit the verbs device argument;
+credits, shutdown, and HDF5 output. The HDF5 tests read the files back with h5py and
+hdf5plugin in a separate interpreter, because h5py bundles its own HDF5 library. For ZMQ-only checks, omit the verbs device argument;
 RDMA tests will skip without their two opt-in variables. The ZMQ tests generate their own
 messages and do not require a detector or reference dataset. A green run with skipped RDMA
 tests is not RDMA acceptance. These application tests require the built image and GPU;
