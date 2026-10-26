@@ -43,6 +43,8 @@ class BatchSink:
             from realtime_stem.streaming.live_stream import Throttle   # lazy: no zmq otherwise
             self._throttle = Throttle(live_every)
         self._start = None
+        self._last = None          # when the last batch was folded in
+        self._first_frames = 0     # frames of the first batch (they arrived before _start)
         self._batches = 0
         self._frames = 0
         self._last_pub_frames = 0
@@ -92,8 +94,11 @@ class BatchSink:
             self.acc.process(frames, ids)
         self._mark_seen(ids)
 
+        if self._batches == 0:
+            self._first_frames = n
         self._batches += 1
         self._frames += n
+        self._last = time.perf_counter()
         if self._batches % self.print_every == 0:
             elapsed = max(time.perf_counter() - self._start, 1e-9)
             print(f"[sink] batches={self._batches} frames={self._frames} "
@@ -143,8 +148,13 @@ class BatchSink:
                        f"positions received ({', '.join(parts)}).")
 
     def summary(self) -> str:
+        """Frames, batches, and the rate from the first to the last batch: the time spent waiting
+        for the series' end afterwards does not count, nor do the first batch's frames (they
+        arrived before the clock started)."""
         if self._start is None:
             return "[sink] no batches received"
-        elapsed = max(time.perf_counter() - self._start, 1e-9)
+        elapsed = max(self._last - self._start, 1e-9)
+        rate = (f"{(self._frames - self._first_frames) / elapsed / 1e3:,.1f} kHz"
+                if self._batches > 1 else "n/a (one batch)")
         return (f"[sink] TOTAL frames={self._frames} batches={self._batches} "
-                f"elapsed={elapsed:.2f}s rate={self._frames / elapsed / 1e3:,.1f} kHz")
+                f"elapsed={elapsed:.2f}s rate={rate}")

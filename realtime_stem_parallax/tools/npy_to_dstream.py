@@ -27,14 +27,14 @@ def convert(src: Path, out: Path, dtype: str = "uint16", block_bytes: int = 8192
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "wb") as fh:
         write_magic(fh)
-        write_record(fh, codec.encode_control_message("start"))
+        write_record(fh, codec.encode_start_message(frames.shape[-2:], len(frames), dtype))
         for i in range(len(frames)):
             f = np.asarray(frames[i])
             if f.dtype.kind == "f":
                 f = np.rint(f)
             f = np.clip(f, info.min, info.max).astype(dtype)
             write_record(fh, codec.encode_image_message(i, f, block_bytes))
-        write_record(fh, codec.encode_control_message("end"))
+        write_record(fh, codec.encode_end_message())
     return len(frames)
 
 

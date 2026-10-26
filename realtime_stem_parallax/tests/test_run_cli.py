@@ -171,9 +171,8 @@ def _args(argv):
 
 
 def test_resolve_ingest():
-    """--source is Python-only; auto takes Holoscan only where its modules import (not here)."""
-    import importlib.util
-    have_holoscan = all(importlib.util.find_spec(m) for m in run_mod._HOLOSCAN_MODULES)
+    """--source is Python-only; auto takes Holoscan only where its modules import (a container)."""
+    have_holoscan = run_mod.holoscan_generation() is not None
     assert run_mod.resolve_ingest(_args(["--source", "x.dstream"])) == "python"
     assert run_mod.resolve_ingest(_args(["--ingest", "python"])) == "python"
     assert run_mod.resolve_ingest(_args(["--ingest", "holoscan"])) == "holoscan"
@@ -182,6 +181,14 @@ def test_resolve_ingest():
     import pytest
     with pytest.raises(SystemExit):
         run_mod.resolve_ingest(_args(["--ingest", "holoscan", "--source", "x.npy"]))
+    rdma = ["--transport", "rdma", "--rdma-remote", "10.0.0.2:31003", "--rdma-local", "10.0.0.1"]
+    with pytest.raises(SystemExit):
+        run_mod.resolve_ingest(_args(rdma + ["--source", "x.npy"]))
+    if run_mod.holoscan_generation() == 5:
+        assert run_mod.resolve_ingest(_args(rdma)) == "holoscan"
+    else:   # RDMA needs the Holoscan 5 image
+        with pytest.raises(SystemExit):
+            run_mod.resolve_ingest(_args(rdma))
 
 
 def test_readout_flags_map_to_config():

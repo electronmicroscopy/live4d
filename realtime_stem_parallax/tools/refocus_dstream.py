@@ -107,7 +107,9 @@ def refocus(src: Path, dst: Path, flags: list[str], schedule: list[float], serie
                     moved[:, :, sel] = np.roll(bf[:, :, sel], (-dy, -dx), axis=(0, 1))
             moved = moved.reshape(n_pos, -1)
             if series == "per-pass" or k == 0:
-                write_record(fh, start if start is not None else codec.encode_control_message("start"))
+                n_images = n_pos if series == "per-pass" else n_pos * len(schedule)
+                write_record(fh, start if start is not None
+                             else codec.encode_start_message(data.shape[1:], n_images, str(data.dtype)))
             offset = k * n_pos if series == "one" else 0
             frame = np.empty_like(flat[0])
             for i in range(n_pos):
@@ -115,7 +117,7 @@ def refocus(src: Path, dst: Path, flags: list[str], schedule: list[float], serie
                 frame[pixels] = moved[i]
                 write_record(fh, codec.encode_image_message(offset + i, frame.reshape(data.shape[1:])))
             if series == "per-pass" or k == len(schedule) - 1:
-                write_record(fh, end if end is not None else codec.encode_control_message("end"))
+                write_record(fh, end if end is not None else codec.encode_end_message())
             log(f"[refocus] pass {k}: C10 {target:g} Å (Δ {target - c10:+g} Å, moves up to "
                 f"{np.abs(shift).max()} scan px)", flush=True)
     return {"passes": len(schedule), "positions": n_pos, "recording_c10": c10,

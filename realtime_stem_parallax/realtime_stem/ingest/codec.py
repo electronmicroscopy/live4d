@@ -28,7 +28,7 @@ import struct
 import numpy as np
 
 __all__ = ["decode_message", "bslz4_decode", "bslz4_encode", "encode_image_message",
-           "encode_control_message"]
+           "encode_control_message", "encode_start_message", "encode_end_message"]
 
 _HEADER = struct.Struct(">QI")
 _BLOCK_SIZE = struct.Struct(">I")
@@ -198,3 +198,18 @@ def encode_control_message(mtype: str, series_id: int = 1, **fields) -> bytes:
 
     return cbor2.dumps(cbor2.CBORTag(_SELF_DESCRIBE, {"type": mtype, "series_id": series_id,
                                                       **fields}))
+
+
+def encode_start_message(shape: tuple[int, int], n_images: int, dtype: str = "uint16",
+                         series_id: int = 1) -> bytes:
+    """A Stream2 `start` with the fields a DCU always sends and receivers rely on: the frame
+    size (`image_size_y`, `image_size_x`), `image_dtype` and `number_of_images` (the Holoscan 5
+    receiver takes the geometry from it)."""
+    return encode_control_message("start", series_id, series_unique_id=f"simulated-{series_id}",
+                                  image_size_x=int(shape[1]), image_size_y=int(shape[0]),
+                                  image_dtype=str(dtype), number_of_images=int(n_images))
+
+
+def encode_end_message(series_id: int = 1) -> bytes:
+    """A Stream2 `end`, as a DCU sends it (with the series' unique id)."""
+    return encode_control_message("end", series_id, series_unique_id=f"simulated-{series_id}")
