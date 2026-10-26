@@ -96,7 +96,7 @@ expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
       active_ = true;
       series_images_ = 0;
       metadata_.start_metadata.assign(data, data + bytes);
-      dectris::log_header_appendix(start_metadata.series_id, data, bytes);
+      ::dectris::log_header_appendix(start_metadata.series_id, data, bytes);
       return emit_batch(true);
     }
     if (type == ZMQ_MSG_END) {

@@ -17,6 +17,7 @@ find_package(nvcomp 5 REQUIRED CONFIG
 # Debian's development symlink and runtime SONAME live in separate directories.
 file(REAL_PATH "${nvcomp_LIBRARY_DIR}/libnvcomp.so" NVCOMP_RUNTIME_LIBRARY)
 get_filename_component(NVCOMP_RUNTIME_DIR "${NVCOMP_RUNTIME_LIBRARY}" DIRECTORY)
+find_package(HDF5 REQUIRED COMPONENTS C)
 find_path(ZMQ_INCLUDE_DIR NAMES zmq.h REQUIRED)
 find_library(ZMQ_LIBRARY NAMES zmq REQUIRED)
 set(IMXRX_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
@@ -40,18 +41,20 @@ endforeach()
 add_library(dectris_holoscan_ops SHARED
   cpp/bindings/dectris_holoscan_ops.cpp
   cpp/common/fast_cbor_parse.c cpp/common/batch_window.cpp cpp/common/bitshuffle_kernel_gpu.cu
+  cpp/common/cbor_value.cpp cpp/common/nxmx_writer.cpp
   cpp/operators/zmq_rx_operator.cu cpp/operators/decompress_gpu_operator.cu
-  cpp/operators/rdma_rx_operator.cu)
+  cpp/operators/rdma_rx_operator.cu cpp/operators/h5_writer_operator.cu)
 set_target_properties(dectris_holoscan_ops PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON
   BUILD_RPATH "${NVCOMP_RUNTIME_DIR}"
   LIBRARY_OUTPUT_DIRECTORY ${PYTHON_BUILD_DIR}/live4d)
 target_include_directories(dectris_holoscan_ops PRIVATE
-  cpp/common cpp/operators ${ZMQ_INCLUDE_DIR})
+  cpp/common cpp/operators ${ZMQ_INCLUDE_DIR} ${HDF5_C_INCLUDE_DIRS})
 target_compile_options(dectris_holoscan_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)
 target_compile_definitions(dectris_holoscan_ops PRIVATE ENABLE_STATUS_VERIFICATION)
 target_link_libraries(dectris_holoscan_ops PRIVATE holoscan::core holoscan::logger
-  CUDA::cudart nvcomp::nvcomp ${ZMQ_LIBRARY} imxrx compressed_batch_schema decoded_batch_schema)
+  CUDA::cudart nvcomp::nvcomp ${ZMQ_LIBRARY} ${HDF5_C_LIBRARIES} imxrx compressed_batch_schema
+  decoded_batch_schema)
 
 add_custom_target(copy_live4d_python ALL
   COMMAND ${CMAKE_COMMAND} -E copy_directory

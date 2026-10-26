@@ -60,18 +60,19 @@ class BatchWindow:
 
         library_path = Path(operators.__file__).with_name("libdectris_holoscan_ops.so")
         self.library = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
-        self.library.dectris_batch_window_create.argtypes = [ctypes.c_uint32]
+        self.library.dectris_batch_window_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
         self.library.dectris_batch_window_create.restype = ctypes.c_void_p
         self.library.dectris_batch_window_destroy.argtypes = [ctypes.c_void_p]
         self.library.dectris_batch_window_destroy.restype = None
-        self.library.dectris_batch_window_release.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        self.library.dectris_batch_window_release.argtypes = [ctypes.c_void_p, ctypes.c_uint64,
+                                                             ctypes.c_uint32]
         self.library.dectris_batch_window_release.restype = None
-        self.handle = self.library.dectris_batch_window_create(capacity)
+        self.handle = self.library.dectris_batch_window_create(capacity, 1)
         if not self.handle:
             raise RuntimeError("native batch window allocation failed")
 
     def release(self, batch_id):
-        self.library.dectris_batch_window_release(self.handle, batch_id)
+        self.library.dectris_batch_window_release(self.handle, batch_id, 0)
 
     def close(self):
         if self.handle:
