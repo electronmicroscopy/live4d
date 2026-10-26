@@ -62,7 +62,19 @@ from realtime_stem.processing import registry   # noqa: E402
 from realtime_stem.processing.base import Algorithm   # noqa: E402
 from realtime_stem.ingest.sink import publish_snapshot   # noqa: E402
 
-_HOLOSCAN_MODULES = ("holoscan", "dectris_holoscan_ops")
+
+
+def holoscan_generation() -> int | None:
+    """Which Holoscan ingest this environment has: 5 in the Holoscan 5 image
+    (`docker/Dockerfile.hsdk5`: ZMQ and RDMA), 4 in the Holoscan 4 image (`docker/Dockerfile`:
+    ZMQ), None outside a container."""
+    if importlib.util.find_spec("holoscan") is None:
+        return None
+    if importlib.util.find_spec("live4d") is not None:
+        return 5
+    if importlib.util.find_spec("dectris_holoscan_ops") is not None:
+        return 4
+    return None
 
 
 def endpoint_warning(endpoint: str, timeout: float = 2.0) -> str | None:
@@ -176,12 +188,16 @@ def resolve_ingest(args) -> str:
     """Which ingest drives this run: "holoscan" or "python".
 
     `--source` (a file) is only read by the Python ingest. `auto` takes Holoscan when its modules
-    are importable (inside the container) and the device can be CUDA, else the Python ingest.
+    are importable (inside a container) and the device can be CUDA, else the Python ingest.
+    `--transport rdma` needs the Holoscan 5 image.
     """
     if args.transport == "rdma":
         if args.source is not None or args.ingest == "python":
             raise SystemExit("--transport rdma is received by the Holoscan 5 ingest only; drop "
                              "--source / --ingest python.")
+        if holoscan_generation() != 5:
+            raise SystemExit("--transport rdma needs the Holoscan 5 image "
+                             "(docker/Dockerfile.hsdk5).")
         return "holoscan"
     if args.source is not None:
         if args.ingest == "holoscan":
@@ -190,7 +206,7 @@ def resolve_ingest(args) -> str:
         return "python"
     if args.ingest != "auto":
         return args.ingest
-    have_holoscan = all(importlib.util.find_spec(m) is not None for m in _HOLOSCAN_MODULES)
+    have_holoscan = holoscan_generation() is not None
     return "holoscan" if have_holoscan and args.device in ("auto", "cuda") else "python"
 
 
@@ -352,30 +368,31 @@ def main() -> None:
         parser.error("\n".join(problems))
 
     ingest = resolve_ingest(args)
+    generation = holoscan_generation() if ingest == "holoscan" else None
     if args.transport == "rdma":
         problems = [f"--transport rdma needs {flag}" for flag, value in
                     (("--rdma-remote HOST:PORT", args.rdma_remote), ("--rdma-local IP", args.rdma_local))
                     if not value]
-        if args.dtype != "uint16":
-            problems.append("--transport rdma receives uint16 frames only")
         if problems:
             parser.error("\n".join(problems))
-        if args.device not in ("auto", "cuda"):
-            raise SystemExit(f"--transport rdma hands frames over as CUDA tensors; --device "
-                             f"{args.device} is not possible.")
-        args.device = "cuda"
-        from realtime_stem.ingest.rdma_graph import MAX_BATCH, RdmaSession
-        if args.batch_size > MAX_BATCH:
-            print(f"[run] --batch-size {args.batch_size} > {MAX_BATCH}, the RDMA receiver's "
-                  f"largest: using {MAX_BATCH}", flush=True)
-            args.batch_size = MAX_BATCH
-        print(f"[run] realtime-stem {__version__}, Holoscan 5 RDMA ingest", flush=True)
-    elif ingest == "holoscan":
+    if ingest == "holoscan":
         if args.device not in ("auto", "cuda"):
             raise SystemExit(f"the Holoscan ingest hands frames over as CUDA tensors; --device "
                              f"{args.device} needs --ingest python.")
         args.device = "cuda"
+    if generation == 5:
+        if args.dtype != "uint16":
+            raise SystemExit("the Holoscan 5 ingest receives uint16 frames only (fast scans); "
+                             "for uint32 (long dwells) use the Holoscan 4 image.")
         # holoscan lives only in the container — import lazily so --help / tests need none of it.
+        from realtime_stem.ingest.hsdk5_graph import MAX_BATCH, Hsdk5Session
+        if args.batch_size > MAX_BATCH:
+            print(f"[run] --batch-size {args.batch_size} > {MAX_BATCH}, the Holoscan 5 receivers' "
+                  f"largest: using {MAX_BATCH}", flush=True)
+            args.batch_size = MAX_BATCH
+        print(f"[run] realtime-stem {__version__}, Holoscan 5 {args.transport.upper()} ingest",
+              flush=True)
+    elif ingest == "holoscan":
         from realtime_stem.ingest.holoscan_graph import OPERATORS_VERSION, IngestApp
         print(f"[run] realtime-stem {__version__}, operators {OPERATORS_VERSION or 'before 2.0'}",
               flush=True)
@@ -457,8 +474,8 @@ def main() -> None:
     stream = None
     if ingest == "python" and args.source is None:
         stream = ZmqStream(args.endpoint, args.n_connections)
-    # RDMA: one connection to the DCU for the whole run; each scan is a round on it.
-    rdma = None
+    # Holoscan 5: one connection to the DCU and one graph for the whole run; each scan is a round.
+    session = None
     rounds_done = 0
     acc = None
     stopped = False
@@ -482,24 +499,26 @@ def main() -> None:
                         f"detector {acc.detector_shape} {args.dtype}, batch {args.batch_size}")
                 if args.transport == "zmq":
                     line += f", connections {args.n_connections}"
-                if ingest == "holoscan" and args.transport == "zmq":
+                if generation == 4:
                     line += ", scheduler " + ("single-threaded" if args.scheduler_threads <= 0
                                               else f"{args.scheduler_threads} threads")
                 print(line, flush=True)
             live = dict(live_publisher=publisher, live_every=args.live_every,
                         live_every_rows=args.live_every_rows)
-            if args.transport == "rdma":
-                if rdma is None:
-                    rdma = RdmaSession(remote=args.rdma_remote, local=args.rdma_local,
-                                       detector_shape=acc.detector_shape,
-                                       batch_size=args.batch_size, rdma_device=args.rdma_device,
-                                       ring_memory=args.rdma_ring_memory,
-                                       ring_mib=args.rdma_ring_mib, timeout=args.rdma_timeout)
+            if generation == 5:
+                if session is None:
+                    session = Hsdk5Session(
+                        transport=args.transport, detector_shape=acc.detector_shape,
+                        batch_size=args.batch_size, endpoint=args.endpoint,
+                        n_connections=args.n_connections, remote=args.rdma_remote,
+                        local=args.rdma_local, rdma_device=args.rdma_device,
+                        ring_memory=args.rdma_ring_memory, ring_mib=args.rdma_ring_mib,
+                        timeout=args.rdma_timeout)
                     try:
-                        rdma.open()
+                        session.open()
                     except ConnectionError as exc:
                         raise SystemExit(f"[run] {exc}") from None
-                app = rdma.round(acc, should_stop=lambda: stop["requested"], **live)
+                app = session.round(acc, should_stop=lambda: stop["requested"], **live)
             elif ingest == "holoscan":
                 app = IngestApp(args.endpoint, args.batch_size, args.scheduler_threads, acc,
                                 dtype=args.dtype, n_connections=args.n_connections, **live)
@@ -553,8 +572,8 @@ def main() -> None:
         if control is not None and not stopped:
             wait_with_viewer(control, stop, algorithm, args.out_dir)
     finally:
-        if rdma is not None:
-            rdma.close()
+        if session is not None:
+            session.close()
         if saver is not None:
             saver.shutdown(wait=True)         # every completed pass is on disk before exiting
         if publisher is not None:

@@ -13,8 +13,9 @@ file replays through `run.py --source` and through `tools/replay_to_zmq.py` into
 
 - `--series one` (default): one start, the passes with ids running on (pass k adds
   k × positions), one end. A single arm for many passes; plays with `--source`.
-- `--series per-pass`: start / images / end per pass with ids restarting at 0, as when every
-  pass is armed separately; replay it over ZeroMQ to `run.py --continuous`.
+- `--series per-pass`: start / images / end per pass with ids restarting at 0 and the
+  `series_id` going up by one per pass, as when every pass is armed separately (the DCU numbers
+  each arm); replay it over ZeroMQ to `run.py --continuous`.
 - `--drift DY DX`: the specimen moves by (DY, DX) scan pixels per pass (integers, wrapping round
   the field). Pass k places the frame recorded at position q at q + k·(DY, DX) and sends pass k in
   raster order; without it each pass keeps the recorded arrival order.
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # repo root → `
 from realtime_stem.ingest.dstream import iter_records, write_magic, write_record  # noqa: E402
 
 _KEY = b"\x68image_id"                      # CBOR text string "image_id"
+_SERIES_KEY = b"\x69series_id"              # CBOR text string "series_id"
 _TYPE_IMAGE = b"\x65image"                  # "image" (the value of "type")
 
 
@@ -69,6 +71,27 @@ def with_image_id(raw: bytes, new_id: int) -> bytes:
     j = raw.find(_KEY) + len(_KEY)
     n = _uint_len(raw[j])
     return raw[:j] + _encode_uint(int(new_id)) + raw[j + n:]
+
+
+def with_series_id(raw: bytes, new_id: int) -> bytes:
+    """The message with its `series_id` replaced (every message carries one), other bytes
+    unchanged; a message without it is returned as is."""
+    j = raw.find(_SERIES_KEY)
+    if j < 0:
+        return raw
+    j += len(_SERIES_KEY)
+    n = _uint_len(raw[j])
+    return raw[:j] + _encode_uint(int(new_id)) + raw[j + n:]
+
+
+def series_id(raw: bytes) -> int | None:
+    j = raw.find(_SERIES_KEY)
+    if j < 0:
+        return None
+    j += len(_SERIES_KEY)
+    n = _uint_len(raw[j])
+    body = raw[j:j + n]
+    return body[0] & 0x1F if n == 1 else int.from_bytes(body[1:], "big")
 
 
 def repeat(src: Path, dst: Path, passes: int, series: str = "one",
@@ -114,18 +137,24 @@ def repeat(src: Path, dst: Path, passes: int, series: str = "one",
             if q in images:
                 yield with_image_id(images[q], p + offset)
 
+    first_series = series_id(start) or 0
+
+    def numbered(msg: bytes, k: int) -> bytes:
+        """Per pass, a new series_id, as the DCU gives every arm."""
+        return with_series_id(msg, first_series + k) if series == "per-pass" else msg
+
     t0 = time.perf_counter()
     n_out = 0
     with open(dst, "wb") as fh:
         write_magic(fh)
         for k in range(passes):
             if series == "per-pass" or k == 0:
-                write_record(fh, start)
+                write_record(fh, numbered(start, k))
             for msg in pass_messages(k):
-                write_record(fh, msg)
+                write_record(fh, numbered(msg, k))
                 n_out += 1
             if (series == "per-pass" or k == passes - 1) and end is not None:
-                write_record(fh, end)
+                write_record(fh, numbered(end, k))
     return {"passes": passes, "positions": positions, "images": n_out, "series": series,
             "drift": drift, "bytes": dst.stat().st_size, "seconds": time.perf_counter() - t0}
 

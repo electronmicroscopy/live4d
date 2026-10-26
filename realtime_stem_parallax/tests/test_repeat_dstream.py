@@ -66,6 +66,12 @@ def test_repeat_per_pass_series_and_drift(tmp_path):
     types, images = _read(tmp_path / "p.dstream")
     assert types.count("start") == 2 and types.count("end") == 2
     assert [i for i, _ in images] == list(range(_NPOS)) * 2
+    # Each pass is its own series, numbered as the DCU numbers its arms.
+    from realtime_stem.ingest.dstream import iter_records
+    from tools.repeat_dstream import series_id
+    ids = [series_id(raw) for raw in iter_records(tmp_path / "p.dstream")]
+    first = ids[0]
+    assert ids == [first] * (_NPOS + 2) + [first + 1] * (_NPOS + 2)
     main([str(tmp_path / "s.dstream"), str(tmp_path / "d.dstream"), "--passes", "3",
           "--scan", *map(str, _SCAN), "--drift", "1", "2"])
     _, images = _read(tmp_path / "d.dstream")

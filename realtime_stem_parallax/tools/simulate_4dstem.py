@@ -289,7 +289,7 @@ def write(p: SimParams, out: Path, formats=("npy", "dstream"), device=None,
             raise ValueError("a .dstream carries integer counts: give a dose > 0")
         fh = open(out.with_suffix(".dstream"), "wb")
         write_magic(fh)
-        write_record(fh, codec.encode_control_message("start"))
+        write_record(fh, codec.encode_start_message(raw_shape, p.passes * p.scan[0] * p.scan[1]))
     t0 = time.perf_counter()
     sim = Simulation(p, device=device)
     try:
@@ -300,7 +300,7 @@ def write(p: SimParams, out: Path, formats=("npy", "dstream"), device=None,
                 for i, f in enumerate(frames):
                     write_record(fh, codec.encode_image_message(start + i, f))
         if fh is not None:
-            write_record(fh, codec.encode_control_message("end"))
+            write_record(fh, codec.encode_end_message())
     finally:
         if fh is not None:
             fh.close()
