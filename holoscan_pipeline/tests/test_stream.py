@@ -1,5 +1,7 @@
 """Public ZMQ series, decoded pixels, and shared 4D-STEM output contracts."""
 import signal
+import json
+from datetime import datetime, timezone
 import threading
 import time
 
@@ -159,7 +161,7 @@ def test_order_pixels_and_end_of_series(count):
     assert result["adf_sum"] == 5428 * sum(range(1, placed + 1))
 
 
-def test_consecutive_empty_partial_series_and_scan_gaps():
+def test_consecutive_empty_partial_series_and_scan_gaps(capfd):
     observed, results, _, batch_shapes = run_series(
         [(1, []), (2, [0, 3, 6, 9, 10], (192, 192)), (3, [0]),
          (4, [], (192, 192)), (5, [0, 1])], service=True)
@@ -184,6 +186,28 @@ def test_consecutive_empty_partial_series_and_scan_gaps():
     adf_pixels = ((radius_squared >= 24 ** 2) & (radius_squared <= 48 ** 2)).sum()
     assert results[1]["adf_sum"] == adf_pixels * (1 + 4 + 7)
     assert results[2]["adf_sum"] == 5428
+    records = []
+    for line in capfd.readouterr().out.splitlines():
+        if line.startswith(("[series-start] ", "[series-end] ", "[series-result] ")):
+            event, payload = line.split(" ", 1)
+            records.append((event, json.loads(payload)))
+    assert len(records) == 15
+    for index, count in enumerate((0, 5, 1, 0, 2)):
+        sid = index + 1
+        entries = [(event, row) for event, row in records if row["series_id"] == sid]
+        assert [event for event, _ in entries] == [
+            "[series-start]", "[series-end]", "[series-result]"]
+        start, end, result = [row for _, row in entries]
+        assert start["image_shape"] == ([192, 192] if sid in (2, 4) else [96, 96])
+        assert (start["scan_width"], start["scan_height"]) == (4, 2)
+        assert start["announced_images"] == end["received_images"] == count
+        assert result["processed_images"] == result["images"] == count
+        assert end["positions"] == result["positions"] == results[index]["positions"]
+        assert all(row["device"] == 0 for _, row in entries)
+        assert start["stage"] == end["stage"] == "processing"
+        timestamps = [datetime.fromisoformat(row["timestamp_utc"]) for _, row in entries]
+        assert all(stamp.utcoffset() == timezone.utc.utcoffset(stamp) for stamp in timestamps)
+        assert timestamps == sorted(timestamps)
 
 
 def test_deferred_readback_preserves_many_batches_and_totals():

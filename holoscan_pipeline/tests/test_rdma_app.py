@@ -1,5 +1,6 @@
 """Application-level acquisition rotation against a local imagemux protocol peer."""
 import queue
+import json
 import socket
 import threading
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from test_rdma_batches import LOCAL_ADDR, Loopback, RingWriter, _start, _image, 
 
 
 @pytest.mark.parametrize("devices", [(0,), (0, 0), (0, 1)])
-def test_application_routes_complete_acquisitions_and_reuses_branches(devices):
+def test_application_routes_complete_acquisitions_and_reuses_branches(devices, capfd):
     import cupy as cp
     import numpy as np
     from dectris import imxrdma
@@ -134,6 +135,22 @@ def test_application_routes_complete_acquisitions_and_reuses_branches(devices):
                 assert d == device and tuple(pixels.shape) == (len(ids), *shape)
                 np.testing.assert_array_equal(pixels, np.full(pixels.shape, value, np.uint16))
         assert len(set(registrations.values())) == len(devices)
+        records = []
+        for line in capfd.readouterr().out.splitlines():
+            if line.startswith(("[series-start] ", "[series-end] ", "[series-result] ")):
+                event, payload = line.split(" ", 1)
+                records.append((event, json.loads(payload)))
+        assert len(records) == 3 * len(acquisitions)
+        for index, (shape, count) in enumerate(acquisitions):
+            entries = [(event, row) for event, row in records
+                       if row["series_id"] == 501 + index]
+            assert [event for event, _ in entries] == [
+                "[series-start]", "[series-end]", "[series-result]"]
+            start, end, result = [row for _, row in entries]
+            assert start["image_shape"] == list(shape)
+            assert start["announced_images"] == end["received_images"] == count
+            assert result["processed_images"] == result["images"] == count
+            assert all(row["device"] == devices[index % len(devices)] for _, row in entries)
         with pytest.raises(RuntimeError, match="new RDMA PipelineApp"):
             app.run()
     finally:

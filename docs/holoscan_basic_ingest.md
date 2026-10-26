@@ -57,6 +57,12 @@ Copy either `holoscan_pipeline/config/basic_ingest.yaml` or
 The RDMA example uses documentation-only addresses; replace them with reachable addresses
 on the sender and receiver RoCE interfaces.
 
+`holoscan_pipeline/config/buffle_rdma.yaml` configures the live Spark-to-Buffle link:
+sender `10.10.10.2:31003` on Spark's `enp1s0f0np0`, receiver `10.10.10.1` on Buffle's
+`enp185s0f0np0` / `mlx5_0`, a 64 MiB mapped-host ring, and a 1000×1000 raster in service
+mode. CUDA device 0 is relative to the GPUs exposed to the container. Mount this YAML
+as the application config to use that deployment.
+
 ```bash
 # Choose one starting configuration:
 cp holoscan_pipeline/config/basic_ingest.yaml pipeline.yaml
@@ -334,8 +340,18 @@ running the whole suite on a CPU-only host does not automatically skip every GPU
 
 ### Interpreting results
 
+`[series-start]` and `[series-end]` log accepted START/END boundaries at the shared
+processing operator, with UTC timestamps and the CUDA device and series ID. START includes
+the image shape, announced image count, and configured raster dimensions. END includes
+received image, placed position, and batch counts. These timestamps describe arrival at
+the processing stage, after transport and any decompression; END does not imply that GPU
+work has completed. There is no per-image or per-batch logging.
+
 At each completed series, `[series-result]` reports received/placed images, continuity gaps,
-batch sizes, BF/ADF totals, and delivered throughput. `delivered_fps` uses host timestamps at
+batch sizes, BF/ADF totals, and delivered throughput. Its UTC timestamp and explicit
+`processed_images` count are emitted after the GPU totals copy completes; `images` retains
+the same count for compatibility. Images outside the raster still count as processed;
+`positions` counts the images placed in the BF/ADF maps. `delivered_fps` uses host timestamps at
 BF/ADF batch submission, from the first image batch to the last, excluding the first batch
 from its numerator. GPU work may still be queued at either timestamp, so this rate does not
 measure completed GPU processing throughput. Completed-series totals are copied to the CPU

@@ -1,5 +1,6 @@
 """Place decoded GPU images in a raster scan and integrate virtual detectors."""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import cbor2
 import json
 import time
@@ -11,6 +12,12 @@ import numpy as np
 from dectris.messages import IMAGE_SHAPE, ScanShape, parse_start, scan_positions
 from .algorithms import virtual_detectors
 from .schemas.decoded_batch import DecodedBatch
+
+
+def _log_series(event, values):
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    print(f"[{event}] " + json.dumps(dict(values, timestamp_utc=timestamp), sort_keys=True),
+          flush=True)
 
 
 @dataclass
@@ -159,6 +166,11 @@ class VirtualDetectorOp(hs.Operator):
                 self.first_batch_count = 0
                 self.batches = 0
                 self.batch_sizes = {}
+                _log_series("series-start", dict(
+                    series_id=int(batch.series_id), device=self.device_id,
+                    image_shape=self.series.shape, announced_images=self.announced_images,
+                    scan_width=self.scan.width, scan_height=self.scan.height,
+                    stage="processing"))
             count = len(batch.image_ids)
             if count:
                 if self.first is None:
@@ -205,13 +217,18 @@ class VirtualDetectorOp(hs.Operator):
                               if elapsed and self.batches > 1 else None)
                 if int(batch.series_images) != self.received:
                     raise ValueError("END image count does not match delivered images")
+                _log_series("series-end", dict(
+                    series_id=int(batch.series_id), device=self.device_id,
+                    received_images=self.received, announced_images=self.announced_images,
+                    positions=self.placed, batches=self.batches, stage="processing"))
                 image = self.image
 
                 def finish(values):
-                    result.update(bf_sum=values[0], adf_sum=values[1], device=self.device_id)
+                    result.update(bf_sum=values[0], adf_sum=values[1], device=self.device_id,
+                                  processed_images=result["images"])
                     self.last = (batch.series_id, image, result)
                     positioned.result = result
-                    print("[series-result] " + json.dumps(result, sort_keys=True), flush=True)
+                    _log_series("series-result", result)
                     if self.observer is not None:
                         self.observer(batch, positioned)
 

@@ -29,6 +29,9 @@ def test_shipped_configs():
     root = Path(__file__).resolve().parents[1] / "config"
     assert load_config(root / "basic_ingest.yaml").transport == "zmq"
     assert load_config(root / "rdma.yaml").transport == "rdma"
+    buffle = load_config(root / "buffle_rdma.yaml")
+    assert buffle.transport == "rdma" and buffle.execute["mode"] == "service"
+    assert buffle.scan == dict(width=1000, height=1000)
 
 
 def test_device_list_and_legacy_scalar_share_normalized_selection():

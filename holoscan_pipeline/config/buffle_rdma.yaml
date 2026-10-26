@@ -1,0 +1,25 @@
+# Live detector: Spark enp1s0f0np0 (10.10.10.2) -> Buffle mlx5_0 (10.10.10.1).
+# CUDA device 0 refers to the GPU exposed by the container launch command.
+transport: rdma
+batch_size: 512
+queue_depth: 4
+device: 0
+execute:
+  mode: service
+  seconds: 0
+# Raster dimensions are configured here; detector image dimensions come from START.
+scan:
+  width: 1000
+  height: 1000
+detector:
+  bf_radius: 16.0
+  adf_inner: 24.0
+  adf_outer: 48.0
+rdma:
+  remote_address: 10.10.10.2:31003
+  local_address: 10.10.10.1
+  device: mlx5_0
+  ring_memory: host_mapped
+  ring_mib: 64
+  max_batch: 512
+  timeout: 10
