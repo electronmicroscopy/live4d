@@ -1,5 +1,6 @@
 """Place decoded GPU images in a raster scan and integrate virtual detectors."""
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import cbor2
 import json
 import time
@@ -11,6 +12,12 @@ import numpy as np
 from dectris.messages import IMAGE_SHAPE, ScanShape, parse_start, scan_positions
 from .algorithms import virtual_detectors
 from .schemas.decoded_batch import DecodedBatch
+
+
+def _log_series(event, values):
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    print(f"[{event}] " + json.dumps(dict(values, timestamp_utc=timestamp), sort_keys=True),
+          flush=True)
 
 
 @dataclass
@@ -159,6 +166,11 @@ class VirtualDetectorOp(hs.Operator):
                 self.first_batch_count = 0
                 self.batches = 0
                 self.batch_sizes = {}
+                _log_series("series-start", dict(
+                    series_id=int(batch.series_id), device=self.device_id,
+                    image_shape=self.series.shape, announced_images=self.announced_images,
+                    scan_width=self.scan.width, scan_height=self.scan.height,
+                    stage="processing"))
             count = len(batch.image_ids)
             if count:
                 if self.first is None:
@@ -191,6 +203,12 @@ class VirtualDetectorOp(hs.Operator):
                 self.observer(batch, positioned)
             positioned.images = None
             if batch.end_of_series:
+                if int(batch.series_images) != self.received:
+                    raise ValueError("END image count does not match delivered images")
+                _log_series("series-end", dict(
+                    series_id=int(batch.series_id), device=self.device_id,
+                    received_images=self.received, announced_images=self.announced_images,
+                    positions=self.placed, batches=self.batches, stage="processing"))
                 # Preserve float32 processing and report a float64 aggregate of the stored values.
                 totals = cp.asnumpy(self.image.sum(axis=(1, 2), dtype=cp.float64)).tolist()
                 elapsed = (self.last_image - self.first) if self.first is not None else 0.0
@@ -199,15 +217,14 @@ class VirtualDetectorOp(hs.Operator):
                               positions=self.placed, scan_positions=self.scan.size,
                               gap_events=self.gaps, missing_images=self.missing, batches=self.batches,
                               batch_sizes=self.batch_sizes, bf_sum=totals[0], adf_sum=totals[1],
+                              device=self.device_id, processed_images=self.received,
                               processing_dtype="float32", totals_dtype="float64",
                               delivered_interval_s=elapsed,
                               delivered_fps=(self.received - self.first_batch_count) / elapsed
                               if elapsed and self.batches > 1 else None)
-                if int(batch.series_images) != self.received:
-                    raise ValueError("END image count does not match delivered images")
                 self.last = (batch.series_id, self.image, result)
                 positioned.result = result
-                print("[series-result] " + json.dumps(result, sort_keys=True), flush=True)
+                _log_series("series-result", result)
                 if self.observer is not None:
                     self.observer(batch, positioned)
                 self.series = self.image = None
