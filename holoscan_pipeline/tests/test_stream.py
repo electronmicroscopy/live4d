@@ -2,6 +2,9 @@
 import signal
 import json
 from datetime import datetime, timezone
+from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 
@@ -49,14 +52,21 @@ def start_message(series_id, count, shape=(96, 96), dtype="uint16", appendix=Non
     return message
 
 
-def image_message(image_id, value, shape=(96, 96)):
+def image_message(image_id, value, shape=(96, 96), pixels=None):
     height, width = shape
     elements_left = height * width
     data = bytearray((height * width * 2).to_bytes(8, "big") + (8192).to_bytes(4, "big"))
+    flat = None if pixels is None else np.ascontiguousarray(pixels, dtype=np.uint16).ravel()
     while elements_left:
         elements = min(4096, elements_left)
-        shuffled = b"".join(bytes([255 if (value >> bit) & 1 else 0]) * (elements // 8)
-                             for bit in range(16))
+        if flat is None:
+            shuffled = b"".join(bytes([255 if (value >> bit) & 1 else 0]) * (elements // 8)
+                                 for bit in range(16))
+        else:
+            # Bit plane b holds bit b of consecutive elements, least significant element first.
+            block = flat[height * width - elements_left:][:elements]
+            planes = (block[None, :] >> np.arange(16, dtype=np.uint16)[:, None]) & 1
+            shuffled = np.packbits(planes.astype(np.uint8), axis=1, bitorder="little").tobytes()
         length = len(shuffled) - 15
         block = bytes([0xf0]) + bytes([255]) * (length // 255) + bytes([length % 255]) + shuffled
         data += len(block).to_bytes(4, "big") + block
@@ -68,7 +78,7 @@ def image_message(image_id, value, shape=(96, 96)):
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
-               appendices=None, placements=None):
+               appendices=None, placements=None, writer=None, pixels=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
     appendices = appendices or {}
     context = zmq.Context()
@@ -100,7 +110,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
     config = PipelineConfig(batch_size=batch_size, queue_depth=queue_depth,
                             scan=dict(width=scan[0], height=scan[1]),
                             execute=dict(mode="service" if service else "finite", seconds=3 if service else 10),
-                            zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"))
+                            zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"),
+                            writer=dict(writer or {}, enabled=writer is not None))
     app = PipelineApp(config, observer=observer)
     stopping = threading.Event()
 
@@ -122,7 +133,9 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
             sender.send(cbor2.dumps(cbor2.CBORTag(
                 55799, start_message(sid, len(ids), shape, dtype, appendices.get(sid)))))
             for image_id in ids:
-                sender.send(cbor2.dumps(image_message(image_id, image_id + 1, image_shape)))
+                sender.send(cbor2.dumps(image_message(
+                    image_id, image_id + 1, image_shape,
+                    None if pixels is None else pixels(sid, image_id, image_shape))))
                 if delay:
                     time.sleep(0.005)
             sender.send(cbor2.dumps(dict(type="end", series_id=sid)))
@@ -276,8 +289,11 @@ def test_unsupported_start_geometry_is_rejected(shape, dtype):
     ((192, 192), (96, 96)),
     ((96, 96), (192, 48)),
 ])
-def test_image_geometry_must_match_start(start_shape, image_shape):
-    run_series([(10, [0], start_shape, image_shape)], expect_error=True)
+@pytest.mark.parametrize("writing", [False, True])
+def test_image_geometry_must_match_start(start_shape, image_shape, writing, tmp_path):
+    run_series([(10, [0], start_shape, image_shape)], expect_error=True,
+               writer=dict(output_dir=str(tmp_path)) if writing else None)
+    assert not list(tmp_path.glob("*_data_*.h5"))
 
 
 def test_announced_scan_follows_each_series(capfd):
@@ -312,3 +328,178 @@ def test_announced_scan_follows_each_series(capfd):
                                       {"scan_width": "4", "scan_height": 2}])
 def test_invalid_announced_scan_is_rejected(appendix):
     run_series([(11, [0])], appendices={11: appendix}, expect_error=True)
+
+
+def series_pixels(sid, image_id, shape):
+    rng = np.random.default_rng(1000 * sid + image_id)
+    pixels = rng.poisson(2.0, shape).astype(np.uint16)
+    pixels[0, :3] = [image_id, 65534, 4096]
+    return pixels
+
+
+# Read in a separate interpreter: h5py bundles its own HDF5, and the pipeline library has the
+# system HDF5 loaded globally. hdf5plugin is the standard bitshuffle/zstd decoder.
+READ_SERIES = """
+import json, sys
+import h5py, hdf5plugin, numpy as np
+prefix, out = sys.argv[1], sys.argv[2]
+with h5py.File(prefix + "_master.h5", "r") as m:
+    d = m["/entry/data/data"]
+    sources = sorted({s.file_name for s in d.virtual_sources()})
+    meta = dict(shape=list(d.shape), virtual=d.is_virtual, sources=sources,
+                axes=[str(a) for a in m["/entry/data"].attrs["axes"]],
+                definition=m["/entry/definition"][()].decode(),
+                frame_time=float(m["/entry/instrument/detector/frame_time"][()]))
+    np.save(out, d[()])
+filters = {}
+for name in sources:
+    try:
+        with h5py.File(prefix.rsplit("/", 1)[0] + "/" + name, "r") as f:
+            fid, _, cd, _ = f["/entry/data/data"].id.get_create_plist().get_filter(0)
+            filters[name] = [fid, list(cd), f["/entry/data/data"].chunks]
+    except FileNotFoundError:
+        pass
+meta["filters"] = filters
+print(json.dumps(meta))
+"""
+
+
+def read_series(prefix, tmp_path):
+    out = tmp_path / (prefix.name + ".npy")
+    result = subprocess.run([sys.executable, "-I", "-c", READ_SERIES, str(prefix), str(out)],
+                            check=True, capture_output=True, text=True)
+    return json.loads(result.stdout), np.load(out)
+
+
+def h5_series_records(text):
+    # Under fd capture, print() writes text and newline separately, so a record from the
+    # writer thread can land mid-line; decode each record wherever it starts.
+    decoder, records, at = json.JSONDecoder(), [], text.find("[h5-series] ")
+    while at >= 0:
+        record, end = decoder.raw_decode(text, at + len("[h5-series] "))
+        records.append(record)
+        at = text.find("[h5-series] ", end)
+    return records
+
+
+def test_hdf5_writer_both_sizes_partial_empty_and_dropped_images(tmp_path, capfd):
+    # Series 1: 96x96, ten images in three data files of four, batches 4+4+2.
+    # Series 2: empty. Series 3: 192x192 with a missing image 1 and image 3 beyond the
+    # announced count of three (start_message announces len(ids)).
+    series = [(1, list(range(10))), (2, []), (3, [0, 2, 3], (192, 192))]
+    observed, results, _, _ = run_series(
+        series, service=True, pixels=series_pixels,
+        writer=dict(output_dir=str(tmp_path), images_per_file=4, name_pattern="run_$id"))
+    assert [r["images"] for r in results] == [10, 0, 3]
+
+    meta, data = read_series(tmp_path / "run_1", tmp_path)
+    assert meta["shape"] == [10, 1, 96, 96] and meta["virtual"]
+    assert meta["sources"] == [f"run_1_data_{n:06d}.h5" for n in (1, 2, 3)]
+    assert meta["axes"] == ["image_id", "channel", ".", "."] and meta["definition"] == "NXmx"
+    assert meta["frame_time"] == 0.001
+    assert all(f == [32008, [0, 5, 2, 0, 3], [1, 1, 96, 96]] for f in meta["filters"].values())
+    assert len(meta["filters"]) == 3
+    for image_id in range(10):
+        np.testing.assert_array_equal(data[image_id, 0], series_pixels(1, image_id, (96, 96)))
+
+    assert not list(tmp_path.glob("run_2_*"))  # an empty series announces no images
+
+    meta, data = read_series(tmp_path / "run_3", tmp_path)
+    assert meta["shape"] == [3, 1, 192, 192]
+    assert meta["filters"] == {"run_3_data_000001.h5": [32008, [0, 5, 2, 0, 3], [1, 1, 192, 192]]}
+    np.testing.assert_array_equal(data[0, 0], series_pixels(3, 0, (192, 192)))
+    np.testing.assert_array_equal(data[1, 0], np.full((192, 192), 65535, np.uint16))
+    np.testing.assert_array_equal(data[2, 0], series_pixels(3, 2, (192, 192)))
+
+    records = h5_series_records(capfd.readouterr().out)
+    assert [(r["series_id"], r["written_images"], r["dropped_images"], r["data_files"],
+             r["image_shape"], r["ended"]) for r in records] == [
+        (1, 10, 0, 3, [96, 96], True), (2, 0, 0, 0, [96, 96], True),
+        (3, 2, 1, 1, [192, 192], True)]
+    assert records[1]["master_file"] is None
+    assert sorted(p.name for p in tmp_path.glob("*.h5")) == sorted(
+        ["run_1_master.h5", "run_1_data_000001.h5", "run_1_data_000002.h5",
+         "run_1_data_000003.h5", "run_3_master.h5", "run_3_data_000001.h5"])
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_hdf5_writer_finite_mode_completes_after_last_write(tmp_path, capfd):
+    # A slow detector and a writer both see END; completion waits for the later one.
+    count = 33
+    _, results, _, _ = run_series([(5, list(range(count)))], pixels=series_pixels,
+                                  processing_delay=0.02, queue_depth=2,
+                                  writer=dict(output_dir=str(tmp_path)))
+    assert results[0]["images"] == count
+    meta, data = read_series(tmp_path / "series_5", tmp_path)
+    assert meta["shape"] == [count, 1, 96, 96] and meta["sources"] == ["series_5_data_000001.h5"]
+    for image_id in range(count):
+        np.testing.assert_array_equal(data[image_id, 0], series_pixels(5, image_id, (96, 96)))
+    record, = h5_series_records(capfd.readouterr().out)
+    assert record["written_images"] == count and record["ended"]
+
+
+def test_hdf5_writer_name_pattern_from_header_appendix(tmp_path, capfd):
+    # A non-empty header_appendix name_pattern overrides writer.name_pattern for its series;
+    # an empty or missing one keeps the configured pattern.
+    _, results, _, _ = run_series(
+        [(1, [0, 1]), (2, [0]), (3, [0, 1, 2], (192, 192)), (4, [0])], service=True,
+        pixels=series_pixels, appendices={
+            1: {"name_pattern": "runA/scan_$id"}, 2: {"name_pattern": ""},
+            3: {"name_pattern": "custom", "scan_width": 3, "scan_height": 1}},
+        writer=dict(output_dir=str(tmp_path), name_pattern="cfg_$id"))
+    assert [r["images"] for r in results] == [2, 1, 3, 1]
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*.h5")) == sorted([
+        "runA/scan_1_master.h5", "runA/scan_1_data_000001.h5",
+        "cfg_2_master.h5", "cfg_2_data_000001.h5",
+        "custom_master.h5", "custom_data_000001.h5",
+        "cfg_4_master.h5", "cfg_4_data_000001.h5"])
+    meta, data = read_series(tmp_path / "runA" / "scan_1", tmp_path)
+    assert meta["shape"] == [2, 1, 96, 96]
+    for image_id in range(2):
+        np.testing.assert_array_equal(data[image_id, 0], series_pixels(1, image_id, (96, 96)))
+    meta, data = read_series(tmp_path / "custom", tmp_path)
+    assert meta["shape"] == [3, 1, 192, 192]
+    np.testing.assert_array_equal(data[2, 0], series_pixels(3, 2, (192, 192)))
+    records = h5_series_records(capfd.readouterr().out)
+    assert [(r["series_id"], r["name_source"], r["master_file"]) for r in records] == [
+        (1, "header_appendix", f"{tmp_path}/runA/scan_1_master.h5"),
+        (2, "config", f"{tmp_path}/cfg_2_master.h5"),
+        (3, "header_appendix", f"{tmp_path}/custom_master.h5"),
+        (4, "config", f"{tmp_path}/cfg_4_master.h5")]
+
+
+@pytest.mark.parametrize("pattern", ["../escape_$id", "/tmp/absolute_$id", "runs/..", ".", 5])
+def test_hdf5_writer_rejects_unsafe_header_appendix_name_pattern(pattern, tmp_path):
+    output = tmp_path / "out"
+    run_series([(12, [0])], appendices={12: {"name_pattern": pattern}}, expect_error=True,
+               writer=dict(output_dir=str(output)))
+    assert not list(tmp_path.rglob("*.h5"))
+    assert not list(Path("/tmp").glob("absolute_12*"))
+
+
+def test_hdf5_writer_disabled_per_series_by_header_appendix(tmp_path, capfd):
+    # enable_h5_writer false skips a series; true or missing writes it.
+    _, results, _, _ = run_series(
+        [(1, [0, 1, 2]), (2, [0, 1], (192, 192)), (3, [0])], service=True, pixels=series_pixels,
+        appendices={1: {"enable_h5_writer": False, "name_pattern": "skipped_$id"},
+                    2: {"enable_h5_writer": True}},
+        writer=dict(output_dir=str(tmp_path)))
+    assert [r["images"] for r in results] == [3, 2, 1]
+    assert sorted(p.name for p in tmp_path.rglob("*.h5")) == sorted([
+        "series_2_master.h5", "series_2_data_000001.h5",
+        "series_3_master.h5", "series_3_data_000001.h5"])
+    meta, data = read_series(tmp_path / "series_2", tmp_path)
+    assert meta["shape"] == [2, 1, 192, 192]
+    for image_id in range(2):
+        np.testing.assert_array_equal(data[image_id, 0], series_pixels(2, image_id, (192, 192)))
+    records = h5_series_records(capfd.readouterr().out)
+    assert [(r["series_id"], r["enabled"], r["written_images"], r["series_images"])
+            for r in records] == [(1, False, 0, 3), (2, True, 2, 2), (3, True, 1, 1)]
+    assert records[0]["master_file"] is None and records[0]["name_source"] is None
+
+
+@pytest.mark.parametrize("flag", ["false", 0, 1, None])
+def test_hdf5_writer_rejects_non_boolean_enable_h5_writer(flag, tmp_path):
+    run_series([(13, [0])], appendices={13: {"enable_h5_writer": flag}}, expect_error=True,
+               writer=dict(output_dir=str(tmp_path)))
+    assert not list(tmp_path.rglob("*.h5"))

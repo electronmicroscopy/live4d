@@ -11,7 +11,8 @@ import time
 import holoscan as hs
 
 from .config import PipelineConfig, load_config
-from .operators import DecompressGpuOp, RdmaRxOp, ZmqRxOp, _PublicationWindow
+from .operators import (DecompressGpuOp, H5WriterOp, RdmaRxOp, ZmqRxOp, _CompletionLatch,
+                        _PublicationWindow)
 from .processing import ScanTensorOp, VirtualDetectorOp
 
 
@@ -20,8 +21,13 @@ class PipelineApp:
                  ring_device_address=None, observer=None):
         self.config = config
         self.ready = threading.Event()
+        writing = config.writer["enabled"]
+        finite = config.execute["mode"] == "finite"
         # One spare queue slot covers a released input until its callback commits consumption.
-        self.decoded_window = _PublicationWindow(config.queue_depth - 1)
+        # The HDF5 writer is a second decoded consumer and releases the window as consumer 1.
+        self.decoded_window = _PublicationWindow(config.queue_depth - 1, 2 if writing else 1)
+        # Requested completion does not drain queues; the last END consumer requests it.
+        self.completion = _CompletionLatch(2) if writing and finite else None
         self.graph = hs.Graph("dectris-4dstem", default_clock=hs.RealtimeClock)
         graph = self.graph
         if config.transport == "zmq":
@@ -49,12 +55,13 @@ class PipelineApp:
         scan = graph.op(ScanTensorOp, "scan", scan_width=config.scan["width"],
                         scan_height=config.scan["height"])
         graph.add_flow(decoded.output, scan.input, queue_depth=config.queue_depth)
-        ready, finite = self.ready, config.execute["mode"] == "finite"
+        ready, completion = self.ready, self.completion
         release = self.decoded_window.release
 
         class BoundDetector(VirtualDetectorOp):
             def __init__(self):
-                super().__init__(ready=ready, finite=finite, observer=observer, release=release)
+                super().__init__(ready=ready, finite=finite, observer=observer, release=release,
+                                 completion=completion)
 
         detector = graph.op(BoundDetector, "detector", device_id=config.device,
                             scan_width=config.scan["width"], scan_height=config.scan["height"],
@@ -63,6 +70,16 @@ class PipelineApp:
         graph.add_flow(scan.output, detector.positions, queue_depth=config.queue_depth)
         graph.partition("scan").add(scan)
         graph.partition("detector").add(detector)
+        if writing:
+            writer = H5WriterOp(graph, "h5_writer", output_dir=config.writer["output_dir"],
+                                name_pattern=config.writer["name_pattern"],
+                                images_per_file=config.writer["images_per_file"],
+                                staging_batches=config.writer["staging_batches"],
+                                batch_size=config.batch_size, device=config.device,
+                                publication_window=self.decoded_window.handle, window_consumer=1,
+                                completion_latch=self.completion.handle if self.completion else 0)
+            graph.add_flow(decoded.output, writer.input, queue_depth=config.queue_depth)
+            graph.partition("writer").add(writer)
         deployment = hs.execution.DeploymentBinding()
         deployment.bind_tensor_output_device(
             operator_path="decompress_gpu" if config.transport == "zmq" else "rdma_rx",

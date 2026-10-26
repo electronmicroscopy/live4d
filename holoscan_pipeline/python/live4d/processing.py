@@ -86,10 +86,11 @@ class VirtualDetectorOp(hs.Operator):
     adf_inner = hs.Param(24.0)
     adf_outer = hs.Param(48.0)
 
-    def __init__(self, *, ready=None, finite=True, observer=None, release=None):
+    def __init__(self, *, ready=None, finite=True, observer=None, release=None, completion=None):
         super().__init__()
         self.ready = ready
         self.finite = finite
+        self.completion = completion
         self.observer = observer
         self.release = release
         self.last = None
@@ -235,7 +236,7 @@ class VirtualDetectorOp(hs.Operator):
                     self.observer(batch, positioned)
                 self.series = self.image = None
                 self.announced_images = None
-                if self.finite:
+                if self.finite and (self.completion is None or self.completion.arrive()):
                     ctx.request_completion()
             if self.release is not None:
                 self.release(int(batch.batch_id))
