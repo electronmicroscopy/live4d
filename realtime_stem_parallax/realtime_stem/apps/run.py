@@ -26,6 +26,12 @@ and the offline replay demo (no detector required).
 After every scan the runner reports whether each scan position received exactly one frame
 ("COMPLETE" or "WARNING: INCOMPLETE SCAN"); the result is saved either way.
 
+With `--transport rdma` (Holoscan 5 image, `docker/Dockerfile.hsdk5`) the frames come over the
+DCU's imagemux RDMA instead, uncompressed (DCU compression `none`), straight into GPU memory:
+
+    python3 -m realtime_stem.apps.run --transport rdma --rdma-remote <DCU_RDMA_IP>:31003 \
+      --rdma-local <this machine's RoCE IP> --binned --scan 256 256 ... --out-dir /out
+
 Two ingests feed the same processing and stream-out (`--ingest`): the compiled Holoscan graph
 (NVIDIA GPU, full detector rate, inside the container) and a pure-Python one (CPU decode, any torch
 device incl. Apple's mps, tens of kHz) that also reads captures directly (`--source`):
@@ -172,6 +178,11 @@ def resolve_ingest(args) -> str:
     `--source` (a file) is only read by the Python ingest. `auto` takes Holoscan when its modules
     are importable (inside the container) and the device can be CUDA, else the Python ingest.
     """
+    if args.transport == "rdma":
+        if args.source is not None or args.ingest == "python":
+            raise SystemExit("--transport rdma is received by the Holoscan 5 ingest only; drop "
+                             "--source / --ingest python.")
+        return "holoscan"
     if args.source is not None:
         if args.ingest == "holoscan":
             raise SystemExit("--source (a capture file) is read by the Python ingest; "
@@ -200,6 +211,11 @@ def build_parser(algorithm: Algorithm) -> argparse.ArgumentParser:
     g.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto",
                    help="Torch device for the reconstruction (auto: cuda, then mps, then cpu). "
                         "The Holoscan ingest needs cuda.")
+    g.add_argument("--transport", choices=("zmq", "rdma"), default="zmq",
+                   help="How frames arrive. zmq: the DCU's stream (port 31001), bslz4-compressed. "
+                        "rdma: the DCU's imagemux RDMA (handshake port 31003), uncompressed (DCU "
+                        "compression none), straight into GPU memory; needs the Holoscan 5 image "
+                        "(docker/Dockerfile.hsdk5) and an RDMA network card.")
     g.add_argument("--endpoint", default="tcp://127.0.0.1:5555",
                    help="ZMQ PULL endpoint (DCU: tcp://<dcu-ip>:31001; replay demo: localhost).")
     g.add_argument("--n-connections", type=int, default=3,
@@ -212,6 +228,20 @@ def build_parser(algorithm: Algorithm) -> argparse.ArgumentParser:
     g.add_argument("--source-rate", type=float, default=0.0, metavar="HZ",
                    help="With --source: replay at this many frames/s (0 = as fast as possible), "
                         "so the live view fills in as it would during a scan.")
+    g.add_argument("--rdma-remote", default="", metavar="HOST:PORT",
+                   help="--transport rdma: the DCU's RDMA handshake address, e.g. 10.10.10.2:31003.")
+    g.add_argument("--rdma-local", default="", metavar="IP",
+                   help="--transport rdma: this machine's address on the RDMA (RoCE) network.")
+    g.add_argument("--rdma-device", default="",
+                   help="--transport rdma: the verbs device (e.g. mlx5_0); empty = found from "
+                        "--rdma-local.")
+    g.add_argument("--rdma-ring-memory", choices=("gpu", "host_mapped"), default="gpu",
+                   help="--transport rdma: where the DCU writes the frames. gpu = GPUDirect RDMA "
+                        "into GPU memory; host_mapped = pinned host memory the GPU reads.")
+    g.add_argument("--rdma-ring-mib", type=int, default=64,
+                   help="--transport rdma: size of the receive ring, in MiB.")
+    g.add_argument("--rdma-timeout", type=float, default=10.0, metavar="S",
+                   help="--transport rdma: seconds to wait for the DCU's handshake.")
     g.add_argument("--dtype", choices=("uint16", "uint32"), default="uint16",
                    help="Pixel dtype of the stream (ARINA can send uint32 in long-dwell modes).")
     g.add_argument("--batch-size", type=int, default=2048,
@@ -322,7 +352,25 @@ def main() -> None:
         parser.error("\n".join(problems))
 
     ingest = resolve_ingest(args)
-    if ingest == "holoscan":
+    if args.transport == "rdma":
+        problems = [f"--transport rdma needs {flag}" for flag, value in
+                    (("--rdma-remote HOST:PORT", args.rdma_remote), ("--rdma-local IP", args.rdma_local))
+                    if not value]
+        if args.dtype != "uint16":
+            problems.append("--transport rdma receives uint16 frames only")
+        if problems:
+            parser.error("\n".join(problems))
+        if args.device not in ("auto", "cuda"):
+            raise SystemExit(f"--transport rdma hands frames over as CUDA tensors; --device "
+                             f"{args.device} is not possible.")
+        args.device = "cuda"
+        from realtime_stem.ingest.rdma_graph import MAX_BATCH, RdmaIngestApp
+        if args.batch_size > MAX_BATCH:
+            print(f"[run] --batch-size {args.batch_size} > {MAX_BATCH}, the RDMA receiver's "
+                  f"largest: using {MAX_BATCH}", flush=True)
+            args.batch_size = MAX_BATCH
+        print(f"[run] realtime-stem {__version__}, Holoscan 5 RDMA ingest", flush=True)
+    elif ingest == "holoscan":
         if args.device not in ("auto", "cuda"):
             raise SystemExit(f"the Holoscan ingest hands frames over as CUDA tensors; --device "
                              f"{args.device} needs --ingest python.")
@@ -341,7 +389,7 @@ def main() -> None:
     if args.device in ("auto", "cuda"):
         for line in gpu_report():
             print(line, flush=True)
-    if args.source is None:
+    if args.source is None and args.transport == "zmq":
         watch_endpoint(args.endpoint)
 
     publisher = None
@@ -425,16 +473,26 @@ def main() -> None:
             if rounds_done == 1:
                 check_batch_for_accumulate(args, acc)
                 origin = args.source if args.source is not None else f"listening on {args.endpoint}"
+                if args.transport == "rdma":
+                    origin = (f"RDMA from {args.rdma_remote} to {args.rdma_local} "
+                              f"({args.rdma_ring_memory} ring)")
                 line = (f"[run] {ingest} ingest, {origin}, scan {acc.scan_shape}, "
-                        f"detector {acc.detector_shape} {args.dtype}, batch {args.batch_size}, "
-                        f"connections {args.n_connections}")
-                if ingest == "holoscan":
+                        f"detector {acc.detector_shape} {args.dtype}, batch {args.batch_size}")
+                if args.transport == "zmq":
+                    line += f", connections {args.n_connections}"
+                if ingest == "holoscan" and args.transport == "zmq":
                     line += ", scheduler " + ("single-threaded" if args.scheduler_threads <= 0
                                               else f"{args.scheduler_threads} threads")
                 print(line, flush=True)
             live = dict(live_publisher=publisher, live_every=args.live_every,
                         live_every_rows=args.live_every_rows)
-            if ingest == "holoscan":
+            if args.transport == "rdma":
+                app = RdmaIngestApp(acc, remote=args.rdma_remote, local=args.rdma_local,
+                                    batch_size=args.batch_size, rdma_device=args.rdma_device,
+                                    ring_memory=args.rdma_ring_memory,
+                                    ring_mib=args.rdma_ring_mib, timeout=args.rdma_timeout,
+                                    should_stop=lambda: stop["requested"], **live)
+            elif ingest == "holoscan":
                 app = IngestApp(args.endpoint, args.batch_size, args.scheduler_threads, acc,
                                 dtype=args.dtype, n_connections=args.n_connections, **live)
             else:

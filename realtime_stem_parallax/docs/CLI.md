@@ -37,10 +37,14 @@ The pipeline: ingest → reconstruction → live stream-out → saved results. T
 ```text
 usage: python -m realtime_stem.apps.run [-h] [--algorithm {parallax}]
                                         [--ingest {auto,holoscan,python}]
-                                        [--device {auto,cuda,mps,cpu}] [--endpoint ENDPOINT]
-                                        [--n-connections N_CONNECTIONS] [--source PATH]
-                                        [--source-rate HZ] [--dtype {uint16,uint32}]
-                                        [--batch-size BATCH_SIZE]
+                                        [--device {auto,cuda,mps,cpu}] [--transport {zmq,rdma}]
+                                        [--endpoint ENDPOINT] [--n-connections N_CONNECTIONS]
+                                        [--source PATH] [--source-rate HZ]
+                                        [--rdma-remote HOST:PORT] [--rdma-local IP]
+                                        [--rdma-device RDMA_DEVICE]
+                                        [--rdma-ring-memory {gpu,host_mapped}]
+                                        [--rdma-ring-mib RDMA_RING_MIB] [--rdma-timeout S]
+                                        [--dtype {uint16,uint32}] [--batch-size BATCH_SIZE]
                                         [--scheduler-threads SCHEDULER_THREADS]
                                         [--accumulate {scan,latest,all,reset,swap}]
                                         [--pass-average BETA] [--save-passes]
@@ -72,10 +76,17 @@ usage: python -m realtime_stem.apps.run [-h] [--algorithm {parallax}]
 |---|---|---|
 | `--ingest {auto,holoscan,python}` | `auto` | Frame ingest: the compiled Holoscan graph (NVIDIA GPU, full rate) or the pure-Python one (CPU decode, any device). auto = Holoscan when available. |
 | `--device {auto,cuda,mps,cpu}` | `auto` | Torch device for the reconstruction (auto: cuda, then mps, then cpu). The Holoscan ingest needs cuda. |
+| `--transport {zmq,rdma}` | `zmq` | How frames arrive. zmq: the DCU's stream (port 31001), bslz4-compressed. rdma: the DCU's imagemux RDMA (handshake port 31003), uncompressed (DCU compression none), straight into GPU memory; needs the Holoscan 5 image (docker/Dockerfile.hsdk5) and an RDMA network card. |
 | `--endpoint ENDPOINT` | `tcp://127.0.0.1:5555` | ZMQ PULL endpoint (DCU: tcp://<dcu-ip>:31001; replay demo: localhost). |
 | `--n-connections N_CONNECTIONS` | `3` | TCP connections to the stream. The DCU paces each connection (about 60k beam-on binned frames/s each), so 120 kHz needs 3; larger (unbinned) frames can need more. |
 | `--source PATH` |  | Read a capture instead of a ZMQ stream: a .dstream recording or a .npy array of frames, (..., H, W). Implies the Python ingest. |
 | `--source-rate HZ` | `0.0` | With --source: replay at this many frames/s (0 = as fast as possible), so the live view fills in as it would during a scan. |
+| `--rdma-remote HOST:PORT` | `` | --transport rdma: the DCU's RDMA handshake address, e.g. 10.10.10.2:31003. |
+| `--rdma-local IP` | `` | --transport rdma: this machine's address on the RDMA (RoCE) network. |
+| `--rdma-device RDMA_DEVICE` | `` | --transport rdma: the verbs device (e.g. mlx5_0); empty = found from --rdma-local. |
+| `--rdma-ring-memory {gpu,host_mapped}` | `gpu` | --transport rdma: where the DCU writes the frames. gpu = GPUDirect RDMA into GPU memory; host_mapped = pinned host memory the GPU reads. |
+| `--rdma-ring-mib RDMA_RING_MIB` | `64` | --transport rdma: size of the receive ring, in MiB. |
+| `--rdma-timeout S` | `10.0` | --transport rdma: seconds to wait for the DCU's handshake. |
 | `--dtype {uint16,uint32}` | `uint16` | Pixel dtype of the stream (ARINA can send uint32 in long-dwell modes). |
 | `--batch-size BATCH_SIZE` | `2048` | Frames per ingest batch (any size works; the last, partial batch of a scan is processed too). The compiled ingest caps this (kMaxBatchSize in the operators' constants.h; larger values are clamped, with a warning in the log). With --accumulate latest it must not exceed the scan positions. |
 | `--scheduler-threads SCHEDULER_THREADS` | `0` | Holoscan ingest: 0 = the single-threaded (greedy) scheduler, the fastest here; N > 0 = MultiThreadScheduler with N workers, whose idle workers sleep up to 5 ms between checks for work (5-7 ms per batch). |
