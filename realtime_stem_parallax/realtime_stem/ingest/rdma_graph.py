@@ -8,17 +8,19 @@ the live stream and the viewer are unchanged.
 
 The DCU side: `bstream/config/mode` = `cbor-rdma`, `detector/config/compression` = `none` (the
 receiver refuses compressed frames), `bstream/config/rdma_batch_size` images per RDMA write.
-`tools/detector_setup.py --transport rdma` sets them.
 
-One `RdmaIngestApp` = one series, like the ZMQ `IngestApp`: it connects (TCP handshake on the
-DCU's port 31003, then RDMA), runs until the series' END (or a stop), and disconnects.
-Runs inside the Holoscan 5 container only (holoscan, live4d and dectris come from the image).
+One `RdmaSession` = one connection for the whole run (as the shared `live4d` app's service mode):
+it connects once (TCP handshake on the DCU's port 31003, then RDMA) and one graph receives every
+series. Each scan is a `round(acc)`: the next series' START waits until a round has handed over its
+accumulator, so a series never lands in the previous scan's reconstruction, and no reconnect falls
+between two scans. Runs inside the Holoscan 5 container only (holoscan, live4d and dectris come
+from the image).
 """
 
 from __future__ import annotations
 
+import socket
 import threading
-import time
 
 import numpy as np
 import torch
@@ -45,19 +47,13 @@ def _torch_stream(runtime_stream) -> torch.cuda.ExternalStream:
 
 
 class GenericSinkOp(hs.Operator):
-    """Feed each `DecodedBatch` into the shared `BatchSink`, on the runtime's CUDA stream."""
+    """Feed each `DecodedBatch` into the current round's `BatchSink`, on the runtime's CUDA stream."""
     inp = hs.Input("input", DecodedBatch)
 
-    def __init__(self, *, core: BatchSink, detector_shape, ready: threading.Event, release,
-                 ended: threading.Event):
+    def __init__(self, *, session: "RdmaSession"):
         super().__init__()
-        self.core = core
-        self.detector_shape = tuple(int(n) for n in detector_shape)
-        self.ready = ready
-        self.release = release
-        self.ended = ended
-        self.series_id = None
-        self.announced = None
+        self.session = session
+        self.core: BatchSink | None = None
 
     def setup(self, spec):
         spec.input(self.inp)
@@ -69,30 +65,37 @@ class GenericSinkOp(hs.Operator):
         batch = self.inp.receive().data
         try:
             with torch.cuda.stream(_torch_stream(ctx.stream())):
-                self._handle(batch, ctx)
+                self._handle(batch)
         finally:
-            self.release(int(batch.batch_id))
+            self.session.release(int(batch.batch_id))
 
-    def _handle(self, batch, ctx) -> None:
+    def _handle(self, batch) -> None:
+        s = self.session
         if batch.pipeline_ready:
             torch.from_dlpack(batch.frames)          # exercise the tensor handoff before a scan
             torch.cuda.current_stream().synchronize()
             print("[holoscan] ready (RDMA receiver connected)", flush=True)
-            self.ready.set()
+            s.ready.set()
             return
         if batch.start_of_series:
             import cbor2
-            self.series_id = int(batch.series_id)
-            self.announced = cbor2.loads(bytes(batch.start_metadata)).get("number_of_images")
-            print(f"[rdma] series {self.series_id} started ({self.announced} images announced)",
+            self.core = s.take_round()               # waits for run.py to arm the next scan
+            if self.core is None:                    # stopping
+                return
+            announced = cbor2.loads(bytes(batch.start_metadata)).get("number_of_images")
+            print(f"[rdma] series {int(batch.series_id)} started ({announced} images announced)",
                   flush=True)
+        if self.core is None:
+            if len(batch.image_ids):
+                raise ValueError("RDMA images arrived before their series' START")
+            return
         count = len(batch.image_ids)
         if count:
             frames = torch.from_dlpack(batch.frames)
-            if tuple(frames.shape[1:]) != self.detector_shape:
+            if tuple(frames.shape[1:]) != s.detector_shape:
                 raise ValueError(
                     f"the DCU sends {tuple(frames.shape[1:])} frames but the reconstruction "
-                    f"expects {self.detector_shape}: check --binned / --detector against the "
+                    f"expects {s.detector_shape}: check --binned / --detector against the "
                     f"DCU's binning_mode.")
             # Only the first `count` images are valid (RDMA tensors keep the full batch capacity).
             frames = frames[:count]
@@ -104,23 +107,39 @@ class GenericSinkOp(hs.Operator):
                 print(f"[rdma] WARNING: the DCU reports {int(batch.series_images)} images in "
                       f"series {int(batch.series_id)}, {self.core.frames} reached the sink",
                       flush=True)
-            self.ended.set()
-            ctx.request_completion()
+            torch.cuda.current_stream().synchronize()   # the scan's GPU work is done
+            self.core = None
+            s.series_ended.set()
 
 
-class RdmaIngestApp:
-    """One series over RDMA: connect, receive until the series' END (or a stop), disconnect.
+class RdmaRound:
+    """One scan on the session: same surface as the ZMQ `IngestApp` for `apps/run.py`, `run()`
+    and `sink` (`summary()`, `completeness()`)."""
 
-    Same surface as the ZMQ `IngestApp` for `apps/run.py`: `run()` and `sink` (`summary()`,
-    `completeness()`)."""
+    def __init__(self, session: "RdmaSession", sink: BatchSink, should_stop):
+        self.session = session
+        self.sink = sink
+        self.should_stop = should_stop
 
-    def __init__(self, acc: Accumulator, *, remote: str, local: str, batch_size: int,
+    def run(self) -> None:
+        """Returns after the series' END or a stop; raises when the connection or graph fails."""
+        s = self.session
+        s.arm(self.sink)
+        while not s.series_ended.wait(0.05):
+            if self.should_stop():
+                return
+            if s.finished.is_set():
+                s.raise_failure()
+
+
+class RdmaSession:
+    """One RDMA connection and one running graph for the whole run."""
+
+    def __init__(self, *, remote: str, local: str, detector_shape, batch_size: int,
                  rdma_device: str = "", ring_memory: str = "gpu", ring_mib: int = 64,
-                 max_batch: int = 512, timeout: float = 10.0, queue_depth: int = 4,
-                 live_publisher=None, live_every: float = 0.2, live_every_rows: int = 0,
-                 should_stop=None):
-        self.acc = acc
+                 max_batch: int = 512, timeout: float = 10.0, queue_depth: int = 4):
         self.remote, self.local = remote, local
+        self.detector_shape = tuple(int(n) for n in detector_shape)
         self.batch_size = min(int(batch_size), MAX_BATCH)
         self.rdma_device = rdma_device
         self.ring_memory = ring_memory
@@ -128,30 +147,83 @@ class RdmaIngestApp:
         self.max_batch = int(max_batch)
         self.timeout = float(timeout)
         self.queue_depth = int(queue_depth)
-        self.should_stop = should_stop or (lambda: False)
-        self.core = BatchSink(acc, live_publisher=live_publisher, live_every=live_every,
-                              live_every_rows=live_every_rows)
-        # run.py reads `sink` for the end-of-scan report (BatchSink has summary/completeness).
-        self.sink = self.core
         self.ready = threading.Event()
-        self.ended = threading.Event()
+        self.series_ended = threading.Event()
+        self.finished = threading.Event()
+        self.failure: BaseException | None = None
+        self._armed: BatchSink | None = None
+        self._cond = threading.Condition()
+        self._stopping = threading.Event()
+        self._thread = self.verbs = self.link = self.closing = self.sender_gone = None
+        self.release = None
 
-    def _compile(self, conn, ring, credit, ring_device_address):
+    # ── one scan ──────────────────────────────────────────────────────────────────────────────
+    def round(self, acc: Accumulator, *, should_stop=None, live_publisher=None,
+              live_every: float = 0.2, live_every_rows: int = 0) -> RdmaRound:
+        if tuple(acc.detector_shape) != self.detector_shape:
+            raise ValueError(f"accumulator detector {acc.detector_shape} != {self.detector_shape}")
+        sink = BatchSink(acc, live_publisher=live_publisher, live_every=live_every,
+                         live_every_rows=live_every_rows)
+        return RdmaRound(self, sink, should_stop or (lambda: False))
+
+    def arm(self, sink: BatchSink) -> None:
+        with self._cond:
+            self.series_ended.clear()
+            self._armed = sink
+            self._cond.notify_all()
+
+    def take_round(self) -> BatchSink | None:
+        """Called at a START: the armed scan's sink (waits for it), or None when stopping."""
+        with self._cond:
+            while self._armed is None and not self._stopping.is_set():
+                self._cond.wait(0.05)
+            sink, self._armed = self._armed, None
+            return sink
+
+    # ── the connection and the graph ──────────────────────────────────────────────────────────
+    def open(self) -> None:
+        """Connect to the DCU, start the graph, and wait for the receiver to be ready."""
+        from dectris import ImagemuxCodec, LocalInfo, TcpConnector, VerbsConn, watch_liveness
+        host, _, port = self.remote.rpartition(":")
+        self.verbs = VerbsConn(self.local, torch.cuda.current_device(), self.ring_mib << 20,
+                               self.rdma_device or None, ring_memory=self.ring_memory)
+        verbs = self.verbs
+        try:
+            self.link = TcpConnector(host, ImagemuxCodec(),
+                                     lambda: LocalInfo(verbs.ring, verbs.endpoint),
+                                     verbs.connect, port=int(port), timeout_s=self.timeout).connect()
+        except OSError as exc:
+            self.close()
+            raise ConnectionError(
+                f"no RDMA sender answers at {self.remote} ({exc}). Check --rdma-remote (the "
+                f"DCU's RDMA address, port 31003), that the DCU's bstream mode is cbor-rdma, "
+                f"and --rdma-local (this machine's address on the same RDMA network).") from None
+        self.closing, self.sender_gone = watch_liveness(self.link)
+        # The connection, the ring and the window must outlive the running graph.
+        self._plan, self._window = self._compile()
+        self.release = self._window.release
+        self._thread = threading.Thread(target=self._run, name="rdma-graph", daemon=True)
+        self._thread.start()
+        while not self.ready.wait(0.05):
+            if self.finished.is_set():
+                self.raise_failure()
+
+    def _compile(self):
         window = _PublicationWindow(self.queue_depth - 1)
         graph = hs.Graph("realtime-stem-rdma", default_clock=hs.RealtimeClock)
-        rx = RdmaRxOp(graph, "rdma_rx", qp_handle=conn.native_handle,
-                      ring_address=ring.addr, ring_device_address=ring_device_address,
-                      ring_bytes=ring.length, ring_memory=self.ring_memory,
-                      credit_address=credit.addr, credit_rkey=credit.rkey,
+        rx = RdmaRxOp(graph, "rdma_rx", qp_handle=self.link.conn.native_handle,
+                      ring_address=self.verbs.ring.addr,
+                      ring_device_address=self.verbs.ring_device_address,
+                      ring_bytes=self.verbs.ring.length, ring_memory=self.ring_memory,
+                      credit_address=self.link.peer.credit.addr,
+                      credit_rkey=self.link.peer.credit.rkey,
                       batch_size=self.batch_size, max_batch=self.max_batch,
                       device=torch.cuda.current_device(), publication_window=window.handle)
-        core, shape, ready, ended = self.core, self.acc.detector_shape, self.ready, self.ended
-        release = window.release
+        session = self
 
         class BoundSink(GenericSinkOp):
             def __init__(self):
-                super().__init__(core=core, detector_shape=shape, ready=ready, release=release,
-                                 ended=ended)
+                super().__init__(session=session)
 
         sink = graph.op(BoundSink, "sink")
         # Ports are addressed by their names ("input"), as in live4d.app.
@@ -167,38 +239,45 @@ class RdmaIngestApp:
             raise RuntimeError(plan.summary())
         return plan, window
 
-    def run(self) -> None:
-        from dectris import ImagemuxCodec, LocalInfo, TcpConnector, VerbsConn, watch_liveness
-        host, _, port = self.remote.rpartition(":")
-        verbs = VerbsConn(self.local, torch.cuda.current_device(), self.ring_mib << 20,
-                          self.rdma_device or None, ring_memory=self.ring_memory)
+    def _run(self) -> None:
         try:
-            link = TcpConnector(host, ImagemuxCodec(), lambda: LocalInfo(verbs.ring, verbs.endpoint),
-                                verbs.connect, port=int(port), timeout_s=self.timeout).connect()
-            closing, sender_gone = watch_liveness(link)
-            try:
-                self.run_on(link.conn, verbs.ring, link.peer.credit, verbs.ring_device_address,
-                            sender_gone)
-            finally:
-                closing.set()
-                link.close()
+            with hs.run_async(self._plan) as session:
+                while not session.wait(timeout=0.05):
+                    if self._stopping.is_set() or self.sender_gone.is_set():
+                        session.request_stop()
+                if self.sender_gone.is_set() and not self._stopping.is_set():
+                    self.failure = ConnectionError("the DCU closed the RDMA connection")
+                elif session.termination not in (hs.RunTermination.REQUESTED_COMPLETED,
+                                                 hs.RunTermination.COMPLETED,
+                                                 hs.RunTermination.STOPPED):
+                    self.failure = RuntimeError(f"Holoscan run failed: {session.summary()}")
+        except BaseException as exc:   # reported by the waiting round
+            self.failure = exc
         finally:
-            verbs.close()
+            self.finished.set()
 
-    def run_on(self, conn, ring, credit, ring_device_address, sender_gone=None) -> None:
-        """Receive one series on an already connected queue pair (`run`, or a loopback test:
-        `tools/rdma_loopback.py`). Returns after the series' END, a stop, or the sender leaving."""
-        sender_gone = sender_gone or threading.Event()
-        # The connection, the ring and the window must outlive the running graph.
-        plan, window = self._compile(conn, ring, credit, ring_device_address)
-        with hs.run_async(plan) as session:
-            while not session.wait(timeout=0.05):
-                if self.should_stop() or sender_gone.is_set():
-                    if sender_gone.is_set():
-                        print("[rdma] the DCU closed the connection", flush=True)
-                    session.request_stop()
-            if session.termination not in (hs.RunTermination.REQUESTED_COMPLETED,
-                                           hs.RunTermination.COMPLETED,
-                                           hs.RunTermination.STOPPED):
-                raise RuntimeError(f"Holoscan run failed: {session.summary()}")
-        del window
+    def raise_failure(self) -> None:
+        raise self.failure or RuntimeError("the RDMA receiver stopped")
+
+    def close(self) -> None:
+        """Stop the graph, then hang up and release the ring (in that order)."""
+        self._stopping.set()
+        with self._cond:
+            self._cond.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=10)
+        if self.link is not None:
+            self.closing.set()
+            # Link.close is the socket's close(); shut it down first so the DCU sees the hang-up
+            # at once (a plain close waits for the liveness thread's pending recv).
+            sock = getattr(self.link.close, "__self__", None)
+            if isinstance(sock, socket.socket):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            self.link.close()
+            self.link = None
+        if self.verbs is not None:
+            self.verbs.close()
+            self.verbs = None

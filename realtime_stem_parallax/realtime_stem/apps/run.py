@@ -364,7 +364,7 @@ def main() -> None:
             raise SystemExit(f"--transport rdma hands frames over as CUDA tensors; --device "
                              f"{args.device} is not possible.")
         args.device = "cuda"
-        from realtime_stem.ingest.rdma_graph import MAX_BATCH, RdmaIngestApp
+        from realtime_stem.ingest.rdma_graph import MAX_BATCH, RdmaSession
         if args.batch_size > MAX_BATCH:
             print(f"[run] --batch-size {args.batch_size} > {MAX_BATCH}, the RDMA receiver's "
                   f"largest: using {MAX_BATCH}", flush=True)
@@ -457,6 +457,8 @@ def main() -> None:
     stream = None
     if ingest == "python" and args.source is None:
         stream = ZmqStream(args.endpoint, args.n_connections)
+    # RDMA: one connection to the DCU for the whole run; each scan is a round on it.
+    rdma = None
     rounds_done = 0
     acc = None
     stopped = False
@@ -487,11 +489,17 @@ def main() -> None:
             live = dict(live_publisher=publisher, live_every=args.live_every,
                         live_every_rows=args.live_every_rows)
             if args.transport == "rdma":
-                app = RdmaIngestApp(acc, remote=args.rdma_remote, local=args.rdma_local,
-                                    batch_size=args.batch_size, rdma_device=args.rdma_device,
-                                    ring_memory=args.rdma_ring_memory,
-                                    ring_mib=args.rdma_ring_mib, timeout=args.rdma_timeout,
-                                    should_stop=lambda: stop["requested"], **live)
+                if rdma is None:
+                    rdma = RdmaSession(remote=args.rdma_remote, local=args.rdma_local,
+                                       detector_shape=acc.detector_shape,
+                                       batch_size=args.batch_size, rdma_device=args.rdma_device,
+                                       ring_memory=args.rdma_ring_memory,
+                                       ring_mib=args.rdma_ring_mib, timeout=args.rdma_timeout)
+                    try:
+                        rdma.open()
+                    except ConnectionError as exc:
+                        raise SystemExit(f"[run] {exc}") from None
+                app = rdma.round(acc, should_stop=lambda: stop["requested"], **live)
             elif ingest == "holoscan":
                 app = IngestApp(args.endpoint, args.batch_size, args.scheduler_threads, acc,
                                 dtype=args.dtype, n_connections=args.n_connections, **live)
@@ -545,6 +553,8 @@ def main() -> None:
         if control is not None and not stopped:
             wait_with_viewer(control, stop, algorithm, args.out_dir)
     finally:
+        if rdma is not None:
+            rdma.close()
         if saver is not None:
             saver.shutdown(wait=True)         # every completed pass is on disk before exiting
         if publisher is not None:
