@@ -166,6 +166,17 @@ def test_order_pixels_and_end_of_series(count):
     assert result["adf_sum"] == 5428 * sum(range(1, placed + 1))
 
 
+def test_image_id_containing_tag_40_bytes_is_accepted():
+    # 55336 is CBOR 0x19 0xD8 0x28; the shape scan must not take it for the tag-40 array.
+    sender_ids = [55335, 55336, 55337]
+    observed, results, _, _ = run_series([(8, sender_ids)], scan=(55338, 1))
+    assert [ids for _, ids, _ in observed] == [sender_ids]
+    for _, ids, pixels in observed:
+        np.testing.assert_array_equal(
+            pixels, np.broadcast_to((np.array(ids) + 1).astype(np.uint16)[:, None, None], pixels.shape))
+    assert results[0]["images"] == 3
+
+
 def test_consecutive_empty_partial_series_and_scan_gaps(capfd):
     observed, results, _, batch_shapes = run_series(
         [(1, []), (2, [0, 3, 6, 9, 10], (192, 192)), (3, [0]),
