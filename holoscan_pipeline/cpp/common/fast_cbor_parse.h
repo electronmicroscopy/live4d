@@ -58,6 +58,9 @@ zmq_message_type_t fast_detect_message_type(
 // Read the unsigned series_id from a tagged or bare Stream2 map.
 int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id);
 
+// Read an unsigned top-level field (e.g. "number_of_images") from a tagged or bare Stream2 map.
+int fast_extract_uint_field(const uint8_t* data, size_t size, const char* key, uint64_t* value);
+
 // Validate a START map for 96x96 or 192x192 uint16 images and extract its ID and dimensions.
 int fast_extract_start_metadata(const uint8_t* data, size_t size,
                                 dectris_start_metadata_t* metadata);
