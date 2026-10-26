@@ -13,7 +13,8 @@ follow the series, while pool capacity covers the larger images. BF/ADF
 radii remain configured in input-image pixels; they do not scale automatically.
 
 Read [README.md](README.md) and [the pipeline guide](docs/holoscan_basic_ingest.md)
-before changing the pipeline. Use this repository's documented build and test
+before changing the pipeline. `realtime_stem_parallax/` is a separate application built on
+these receivers; read its own [AGENTS.md](realtime_stem_parallax/AGENTS.md) before working there. Use this repository's documented build and test
 commands.
 
 Use the [Holoscan SDK 5 documentation](https://docs.nvidia.com/holoscan/sdk-user-guide/)

@@ -12,7 +12,7 @@
 #              wrong address shows up before anything waits for frames from it.
 #   GPU        which GPU the pipeline uses, as numbered by nvidia-smi. Required when the machine
 #              has more than one GPU.
-#   IMAGE      the Docker image (default realtime-stem:latest)
+#   IMAGE      the Docker image (default realtime-stem:latest; realtime-stem:hsdk5 for Holoscan 5)
 #   RECORDING + SCAN (+ BINNED=1 for 96x96 frames) + FLAGS (the recording's acquisition values:
 #              --energy --semiangle --angular-sampling --scan-sampling --defocus --rotation
 #              --center; the
@@ -113,20 +113,24 @@ echo "== 3. Docker can use the GPU, and the image exists"
 if docker image inspect "$IMAGE" >/dev/null 2>&1; then
   pass "image $IMAGE"
 else
-  fail "image $IMAGE not found: build it (docker build -t $IMAGE -f docker/Dockerfile .) or docker load it"
+  fail "image $IMAGE not found: build it (README, Install step 3) or docker load it"
   built=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep realtime-stem)
   [ -n "$built" ] && echo "      images on this machine: $(echo $built); choose one with IMAGE=<name:tag>"
   echo "Stopping: the remaining checks need the image."; exit 1
 fi
 if seen=$(in_image -c "$(cat <<'PY'
-import torch, dectris_holoscan_ops, holoscan
+import importlib.util, torch, holoscan
 from realtime_stem import __version__
 p = torch.cuda.get_device_properties(0)
-ops = getattr(dectris_holoscan_ops, "__version__", "before 2.0")
+if importlib.util.find_spec("live4d"):   # the Holoscan 5 image: the shared ZMQ / RDMA receivers
+    ops = "Holoscan 5 ingest"
+else:
+    import dectris_holoscan_ops
+    ops = "operators " + getattr(dectris_holoscan_ops, "__version__", "before 2.0")
 print(f"      {p.name}, compute capability {p.major}.{p.minor}, {p.total_memory / 2**30:.0f} GiB")
 print(f"      torch {torch.__version__} (CUDA {torch.version.cuda}), "
       f"holoscan {getattr(holoscan, '__version__', '?')}")
-print(f"      realtime-stem {__version__}, operators {ops}")
+print(f"      realtime-stem {__version__}, {ops}")
 torch.ones(1, device="cuda").add_(1)
 bus = getattr(p, "pci_bus_id", None)
 print(f"BUS={bus:02X}" if isinstance(bus, int) else "BUS=")

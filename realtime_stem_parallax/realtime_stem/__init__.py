@@ -7,4 +7,4 @@ turns batches of frames into a reconstruction behind a small `Accumulator` contr
 example; new algorithms drop in behind the same contract (see `processing.registry`).
 """
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"

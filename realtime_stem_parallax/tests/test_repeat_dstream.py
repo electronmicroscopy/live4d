@@ -115,6 +115,7 @@ def test_repeated_ids_parse_in_the_c_receiver(tmp_path):
 def test_a_per_pass_loop_replays_as_separate_series(tmp_path):
     """`tools/replay_to_zmq.py` sends each series' end in order (not only one at the end of the
     file), so a per-pass loop reaches `run.py --continuous` as one series per pass."""
+    import socket
     import threading
 
     import zmq
@@ -126,11 +127,11 @@ def test_a_per_pass_loop_replays_as_separate_series(tmp_path):
     _capture(tmp_path / "s.dstream", n=20)
     main([str(tmp_path / "s.dstream"), str(tmp_path / "p.dstream"), "--passes", "3",
           "--series", "per-pass"])
-    ctx = zmq.Context.instance()
-    pull = ctx.socket(zmq.PULL)
-    port = pull.bind_to_random_port("tcp://127.0.0.1")
-    pull.close()                                          # free the port for the feeder
+    with socket.socket() as s:      # a free port; a closed zmq socket frees it only later
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
     endpoint = f"tcp://127.0.0.1:{port}"
+    ctx = zmq.Context.instance()
     feeder = threading.Thread(target=replay_dstream, args=(str(tmp_path / "p.dstream"), endpoint),
                               kwargs={"linger_s": 0.5}, daemon=True)
     feeder.start()

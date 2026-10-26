@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "realtime-stem"
-version = "2.2.0"
+version = "3.0.0"
 description = "Real-time STEM processing: a modular ingest → processing → stream-out pipeline (parallax/tcBF)."
 requires-python = ">=3.10"
 # Core, always needed: numpy (arrays) and pyzmq (the stream-out transport).
