@@ -23,7 +23,8 @@ IMAGE_BYTES = IMAGE_SHAPE[0] * IMAGE_SHAPE[1] * np.dtype(IMAGE_DTYPE).itemsize  
 # Series of the imagemux bstream output: bookmarked by a start and an end frame.
 #
 # The start message (Stream2, CBOR) carries ``series_id``, ``image_size_x/y``, ``image_dtype`` and
-# ``number_of_images``. The image shape is fixed within each series. The number of images that
+# ``number_of_images``. Its ``header_appendix`` map may announce the scan as ``scan_width`` and
+# ``scan_height``. The image shape is fixed within each series. The number of images that
 # arrive between START and END is what counts; ``number_of_images`` is a size hint. The messages
 # below carry the series boundary markers and its images through the pipeline.
 #
@@ -37,6 +38,7 @@ class Series:
     expected_images: int | None = None  # number_of_images of the start message; a hint only
     frame_time: float | None = None  # frame_time (s) of the start message: the announced rate
     shape: tuple[int, int] = IMAGE_SHAPE
+    scan: "ScanShape | None" = None  # announced in header_appendix; None when not announced
 
 
 @dataclass(frozen=True)
@@ -73,8 +75,8 @@ class End:
 # Scan
 #
 # A 4D-STEM scan is a raster of ``height`` rows of ``width`` probe positions; image id ``i`` of a
-# series is at row ``i // width``, column ``i % width``. The shape is configured, not announced by
-# the sender. Images beyond ``width * height`` have no position.
+# series is at row ``i // width``, column ``i % width``. The START header_appendix may announce the
+# shape; otherwise it is configured. Images beyond ``width * height`` have no position.
 # ---------------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -135,4 +137,18 @@ def parse_start(data) -> Series:
     frame_time = msg.get("frame_time")
     return Series(series_id, int(expected) if isinstance(expected, int) and expected > 0 else None,
                   float(frame_time) if isinstance(frame_time, (int, float)) and frame_time > 0
-                  else None, shape=shape)
+                  else None, shape=shape, scan=_announced_scan(msg.get("header_appendix")))
+
+
+def _announced_scan(appendix) -> ScanShape | None:
+    """Scan of a ``header_appendix`` map with ``scan_width`` and ``scan_height``; None when the
+    appendix announces neither. Raises ValueError for a partial or invalid announcement."""
+    if not isinstance(appendix, Mapping):
+        return None
+    dimensions = [appendix.get(key) for key in ("scan_width", "scan_height")]
+    if dimensions == [None, None]:
+        return None
+    if any(not isinstance(value, int) or isinstance(value, bool)
+           or not 1 <= value <= 2147483647 for value in dimensions):
+        raise ValueError("header_appendix scan_width and scan_height must be positive int32 values")
+    return ScanShape(*dimensions)

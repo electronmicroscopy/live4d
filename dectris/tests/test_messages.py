@@ -56,6 +56,25 @@ class ParseStartTest(unittest.TestCase):
         self.assertIsNone(parse_start(start_message(frame_time=0.0)).frame_time)
         self.assertIsNone(parse_start(start_message(frame_time="fast")).frame_time)
 
+    def test_announced_scan(self):
+        appendix = {"scan_width": 256, "scan_height": 128, "user": "x"}
+        series = parse_start(start_message(header_appendix=appendix))
+        self.assertEqual(series.scan, ScanShape(256, 128))
+        self.assertEqual(series.shape, (96, 96))
+        self.assertIsNone(parse_start(start_message()).scan)
+        self.assertIsNone(parse_start(start_message(header_appendix={"user": "x"})).scan)
+        self.assertIsNone(parse_start(start_message(header_appendix='{"scan_width": 4}')).scan)
+
+    def test_rejects_invalid_announced_scan(self):
+        for appendix in [{"scan_width": 256}, {"scan_height": 128},
+                         {"scan_width": 0, "scan_height": 128},
+                         {"scan_width": "256", "scan_height": 128},
+                         {"scan_width": 256.0, "scan_height": 128},
+                         {"scan_width": True, "scan_height": 128},
+                         {"scan_width": 2 ** 31, "scan_height": 1}]:
+            with self.assertRaises(ValueError):
+                parse_start(start_message(header_appendix=appendix))
+
     def test_accepts_bytes_like(self):
         parse_start(memoryview(start_message()))
 

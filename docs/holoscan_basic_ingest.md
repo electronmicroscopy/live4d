@@ -142,8 +142,10 @@ Transport settings have separate meanings:
 | `rdma.timeout` | TCP handshake timeout in seconds, positive; default 10 |
 
 Default downstream settings are 512 images/batch, queue depth 4, CUDA device 0, and a
-1000×1000 raster. Set the scan dimensions explicitly for each experiment: they are not
-inferred from acquisition metadata. The RDMA example selects `host_mapped`, while an
+1000×1000 raster. When the START `header_appendix` map contains integer `scan_width` and
+`scan_height`, that series uses them instead of `scan.width/height`; otherwise it uses the
+configured raster. A START that announces only one of them, or a non-positive or non-integer
+value, is rejected. The configured raster also sizes the READY warm-up. The RDMA example selects `host_mapped`, while an
 omitted `rdma.ring_memory` defaults to `gpu`. An omitted `detector` section uses BF radius
 16 and ADF inner/outer radii 24/48.
 
@@ -165,7 +167,7 @@ tensor pools reserve 70.3 MiB per slot for the maximum supported 1000×192×192 
 batch. The compiled graph determines the slot count. Smaller tensors use the same slots;
 switching to binned images does not shrink the pool allocation.
 
-The two float32 scan maps use `8 * scan.width * scan.height` bytes, before temporary
+The two float32 scan maps use `8 * width * height` bytes of the series' raster, before temporary
 arrays, retained prior-series results, runtime tensors, and decoder scratch. The RDMA
 ring is additional storage. Scan size, batch size, and queue depth affect memory demand.
 
@@ -193,7 +195,7 @@ output batches. Reads that fill a partial batch can complete and release ring cr
 that batch is full.
 
 Scan placement uses each image ID: row `id // width`, column `id % width`. Images outside
-the configured scan are counted as received but omitted from BF/ADF placement. The decoded
+the series' scan are counted as received but omitted from BF/ADF placement. The decoded
 output feeds both operators through typed inputs. The scan operator sends position metadata;
 the detector pairs it with the original batch using its event time and checks the batch ID.
 GPU tensors remain visible to runtime capacity and readiness tracking. CuPy views are created
@@ -253,7 +255,8 @@ running the whole suite on a CPU-only host does not automatically skip every GPU
 
 `[series-start]` and `[series-end]` log accepted START/END boundaries at the shared
 processing operator, with UTC timestamps and the CUDA device and series ID. START includes
-the image shape, announced image count, and configured raster dimensions. END includes
+the image shape, announced image count, and raster dimensions, with `scan_source`
+`header_appendix` or `config`. END includes
 received image, placed position, and batch counts. These timestamps describe arrival at
 the processing stage, after transport and any decompression; END does not imply that GPU
 work has completed. There is no per-image or per-batch logging.
@@ -300,7 +303,7 @@ or independently validate BF/ADF sums. `--report` can save its JSON to a writabl
 | RDMA fails before readiness | Verify the sender handshake service, remote host/port, receiver RoCE address/device, locked-memory limit, and ring registration support. `host_mapped` is an alternative when GPU registration is unavailable. |
 | Ready, but no series result | Confirm sender transport/compression and endpoint, trigger acquisition after readiness, and check that the sender emits END. `seconds: 0` allows an indefinite wait. |
 | Unsupported image or START error | Both routes require 96×96 or 192×192 uint16 images matching START metadata; ZMQ additionally requires BSLZ4. START metadata must fit within 16 KiB. |
-| Fewer placed images than received | Check `scan.width * scan.height` against image IDs; out-of-scan IDs are intentionally excluded from maps. |
+| Fewer placed images than received | Check the series' `scan_width * scan_height` against image IDs; out-of-scan IDs are intentionally excluded from maps. |
 | Missing modules or old behavior after edits | Build the unified image again; source-only `PYTHONPATH` does not supply native operators or generated schemas. |
 
 When recording a benchmark, retain the Git revision, image identity, GPU/NIC and topology,
