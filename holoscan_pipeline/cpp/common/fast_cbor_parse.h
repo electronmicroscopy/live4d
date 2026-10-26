@@ -62,6 +62,14 @@ int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id
 int fast_extract_start_metadata(const uint8_t* data, size_t size,
                                 dectris_start_metadata_t* metadata);
 
+// Receives one header_appendix entry as CBOR diagnostic text. key is NULL when
+// header_appendix is not a map; the whole value is then passed as one entry.
+typedef void (*header_appendix_visitor_t)(void* context, const char* key, const char* value);
+
+// Visit header_appendix in a START map. Returns 0 when visited, 1 when absent, -1 on error.
+int fast_visit_header_appendix(const uint8_t* data, size_t size,
+                               header_appendix_visitor_t visit, void* context);
+
 /**
  * Fast extraction of compressed BSLZ4 data from Dectris IMAGE message.
  *

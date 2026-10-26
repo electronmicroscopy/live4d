@@ -15,6 +15,7 @@
 
 #include "constants.h"
 #include "fast_cbor_parse.h"
+#include "header_appendix_log.hpp"
 
 namespace holoscan::ops {
 namespace {
@@ -568,6 +569,8 @@ expected<void, Error> RdmaRxOp::read_next_frame(uint32_t immediate) {
         start_metadata.series_id != header.series_id) {
       return make_unexpected(make_error(ErrorCode::kProtocolError, "Invalid START image geometry"));
     }
+    dectris::log_header_appendix(start_metadata.series_id, pending_start_metadata_.data(),
+                                 pending_start_metadata_.size());
     active_width_ = start_metadata.image_size_x;
     active_height_ = start_metadata.image_size_y;
     active_image_bytes_ = static_cast<size_t>(active_width_) * active_height_ * sizeof(uint16_t);
