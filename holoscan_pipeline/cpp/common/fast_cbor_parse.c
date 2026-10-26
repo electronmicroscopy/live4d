@@ -1,7 +1,10 @@
 #include "fast_cbor_parse.h"
 
-#include <string.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // CBOR major types (top 3 bits)
 #define CBOR_MAJOR_TYPE_MASK 0xE0
@@ -164,6 +167,170 @@ int fast_extract_start_metadata(const uint8_t* data, size_t size,
     const uint32_t dim = metadata->image_size_x;
     if (metadata->image_size_y != dim || (dim != 96 && dim != 192)) return -1;
     return 0;
+}
+
+typedef struct {
+    char* ptr;
+    size_t left;  // Includes the terminating NUL.
+} text_out_t;
+
+static void text_append(text_out_t* out, const char* text, size_t size) {
+    if (out->left <= 1) return;
+    if (size > out->left - 1) size = out->left - 1;
+    memcpy(out->ptr, text, size);
+    out->ptr += size;
+    out->left -= size;
+    *out->ptr = '\0';
+}
+
+static void text_printf(text_out_t* out, const char* format, ...) {
+    char buffer[64];
+    va_list args;
+    va_start(args, format);
+    const int size = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    if (size > 0) text_append(out, buffer, (size_t)size < sizeof(buffer) ? (size_t)size
+                                                                          : sizeof(buffer) - 1);
+}
+
+static void text_double(text_out_t* out, double value) {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.15g", value);
+    if (strtod(buffer, NULL) != value) snprintf(buffer, sizeof(buffer), "%.17g", value);
+    text_append(out, buffer, strlen(buffer));
+}
+
+static double half_to_double(uint16_t half) {
+    const int exponent = (half >> 10) & 0x1F;
+    const int mantissa = half & 0x3FF;
+    const double value = exponent == 0  ? ldexp(mantissa, -24)
+                         : exponent == 31 ? (mantissa ? NAN : INFINITY)
+                                          : ldexp(mantissa + 1024, exponent - 25);
+    return (half & 0x8000) ? -value : value;
+}
+
+// Render one definite-length CBOR item in diagnostic notation, truncating long output.
+static int render_cbor(const uint8_t** ptr, const uint8_t* end, text_out_t* out, unsigned depth) {
+    if (*ptr >= end || depth > 32) return -1;
+    const uint8_t major = **ptr >> 5;
+    const uint8_t info = **ptr & CBOR_ADDL_INFO_MASK;
+    uint64_t n;
+    if (read_cbor_uint(ptr, end, &n)) return -1;
+    switch (major) {
+    case 0:
+        text_printf(out, "%llu", (unsigned long long)n);
+        return 0;
+    case 1:
+        if (n < (uint64_t)INT64_MAX) text_printf(out, "%lld", -1LL - (long long)n);
+        else text_printf(out, "-1-%llu", (unsigned long long)n);
+        return 0;
+    case 2:
+        if (n > (uint64_t)(end - *ptr)) return -1;
+        text_append(out, "h'", 2);
+        for (uint64_t i = 0; i < n; ++i) text_printf(out, "%02x", (*ptr)[i]);
+        text_append(out, "'", 1);
+        *ptr += n;
+        return 0;
+    case 3:
+        if (n > (uint64_t)(end - *ptr)) return -1;
+        text_append(out, "\"", 1);
+        for (uint64_t i = 0; i < n; ++i) {
+            const uint8_t c = (*ptr)[i];
+            if (c == '"' || c == '\\') text_printf(out, "\\%c", c);
+            else if (c < 0x20 || c == 0x7F) text_printf(out, "\\x%02x", c);
+            else text_append(out, (const char*)&c, 1);
+        }
+        text_append(out, "\"", 1);
+        *ptr += n;
+        return 0;
+    case 4:
+    case 5:
+        text_append(out, major == 4 ? "[" : "{", 1);
+        for (uint64_t i = 0; i < n; ++i) {
+            if (i) text_append(out, ", ", 2);
+            if (render_cbor(ptr, end, out, depth + 1)) return -1;
+            if (major == 5) {
+                text_append(out, ": ", 2);
+                if (render_cbor(ptr, end, out, depth + 1)) return -1;
+            }
+        }
+        text_append(out, major == 4 ? "]" : "}", 1);
+        return 0;
+    case 6:
+        text_printf(out, "%llu(", (unsigned long long)n);
+        if (render_cbor(ptr, end, out, depth + 1)) return -1;
+        text_append(out, ")", 1);
+        return 0;
+    default:
+        if (info == 20) text_append(out, "false", 5);
+        else if (info == 21) text_append(out, "true", 4);
+        else if (info == 22) text_append(out, "null", 4);
+        else if (info == 23) text_append(out, "undefined", 9);
+        else if (info <= 24) text_printf(out, "simple(%llu)", (unsigned long long)n);
+        else if (info == 25) text_double(out, half_to_double((uint16_t)n));
+        else if (info == 26) {
+            const uint32_t bits = (uint32_t)n;
+            float value;
+            memcpy(&value, &bits, sizeof(value));
+            text_double(out, value);
+        } else {
+            double value;
+            memcpy(&value, &n, sizeof(value));
+            text_double(out, value);
+        }
+        return 0;
+    }
+}
+
+int fast_visit_header_appendix(const uint8_t* data, size_t size,
+                               header_appendix_visitor_t visit, void* context) {
+    if (data == NULL || visit == NULL) return -1;
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
+    uint64_t n;
+    while (ptr < end && (*ptr >> 5) == 6)
+        if (read_cbor_uint(&ptr, end, &n)) return -1;
+    if (ptr >= end || (*ptr >> 5) != 5 || read_cbor_uint(&ptr, end, &n)) return -1;
+    while (n--) {
+        uint64_t len;
+        if (ptr >= end || (*ptr >> 5) != 3 || read_cbor_uint(&ptr, end, &len)
+            || len > (uint64_t)(end - ptr)) return -1;
+        const int matches = len == 15 && memcmp(ptr, "header_appendix", 15) == 0;
+        ptr += len;
+        if (!matches) {
+            if (skip_cbor(&ptr, end, 0)) return -1;
+            continue;
+        }
+
+        char key[256], value[1024];
+        text_out_t key_out = {key, sizeof(key)};
+        text_out_t value_out = {value, sizeof(value)};
+        key[0] = value[0] = '\0';
+        if (ptr >= end || (*ptr >> 5) != 5) {
+            if (render_cbor(&ptr, end, &value_out, 0)) return -1;
+            visit(context, NULL, value);
+            return 0;
+        }
+        uint64_t entries;
+        if (read_cbor_uint(&ptr, end, &entries)) return -1;
+        while (entries--) {
+            key_out = (text_out_t){key, sizeof(key)};
+            value_out = (text_out_t){value, sizeof(value)};
+            key[0] = value[0] = '\0';
+            // Show text keys bare; other key types keep their diagnostic form.
+            if (ptr < end && (*ptr >> 5) == 3) {
+                if (read_cbor_uint(&ptr, end, &len) || len > (uint64_t)(end - ptr)) return -1;
+                text_append(&key_out, (const char*)ptr, (size_t)len);
+                ptr += len;
+            } else if (render_cbor(&ptr, end, &key_out, 0)) {
+                return -1;
+            }
+            if (render_cbor(&ptr, end, &value_out, 0)) return -1;
+            visit(context, key, value);
+        }
+        return 0;
+    }
+    return 1;
 }
 
 static int extract_image_shape(const uint8_t* data, size_t size,
