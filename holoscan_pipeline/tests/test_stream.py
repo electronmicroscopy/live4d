@@ -40,10 +40,13 @@ def test_virtual_detector_algorithms_match_independent_sums(shape):
     np.testing.assert_array_equal(actual, expected)
 
 
-def start_message(series_id, count, shape=(96, 96), dtype="uint16"):
-    return dict(type="start", series_id=series_id, image_size_x=shape[1], image_size_y=shape[0],
-                image_dtype=dtype, number_of_images=count, frame_time=0.001,
-                channels=["threshold_1"], acquisition_note="preserved")
+def start_message(series_id, count, shape=(96, 96), dtype="uint16", appendix=None):
+    message = dict(type="start", series_id=series_id, image_size_x=shape[1], image_size_y=shape[0],
+                   image_dtype=dtype, number_of_images=count, frame_time=0.001,
+                   channels=["threshold_1"], acquisition_note="preserved")
+    if appendix is not None:
+        message["header_appendix"] = appendix
+    return message
 
 
 def image_message(image_id, value, shape=(96, 96)):
@@ -64,8 +67,10 @@ def image_message(image_id, value, shape=(96, 96)):
 
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
-               processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False):
+               processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
+               appendices=None, placements=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
+    appendices = appendices or {}
     context = zmq.Context()
     sender = context.socket(zmq.PUSH)
     sender.setsockopt(zmq.LINGER, 0)
@@ -77,6 +82,10 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                              bool(batch.end_of_series), tuple(batch.frames.shape)))
         if batch.start_of_series:
             starts.append(bytes(batch.start_metadata))
+        if placements is not None and len(batch.image_ids):
+            ids = np.asarray(batch.image_ids)[positioned.selected].tolist()
+            placements.extend((int(batch.series_id), image_id, tuple(position))
+                              for image_id, position in zip(ids, positioned.positions.tolist()))
         if len(batch.image_ids):
             if defer_readback:
                 pixels = cp.array(positioned.images, copy=True)
@@ -111,7 +120,7 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
             image_shape = entry[3] if len(entry) > 3 else shape
             dtype = entry[4] if len(entry) > 4 else "uint16"
             sender.send(cbor2.dumps(cbor2.CBORTag(
-                55799, start_message(sid, len(ids), shape, dtype))))
+                55799, start_message(sid, len(ids), shape, dtype, appendices.get(sid)))))
             for image_id in ids:
                 sender.send(cbor2.dumps(image_message(image_id, image_id + 1, image_shape)))
                 if delay:
@@ -126,7 +135,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
         assert starts == [cbor2.dumps(cbor2.CBORTag(
             55799, start_message(entry[0], len(entry[1]),
                                  entry[2] if len(entry) > 2 else (96, 96),
-                                 entry[4] if len(entry) > 4 else "uint16")))
+                                 entry[4] if len(entry) > 4 else "uint16",
+                                 appendices.get(entry[0]))))
                           for entry in series]
         if defer_readback:
             observed[:] = [(batch_id, sid, ids, cp.asnumpy(pixels))
@@ -195,6 +205,7 @@ def test_consecutive_empty_partial_series_and_scan_gaps(capfd):
         start, end, result = [row for _, row in entries]
         assert start["image_shape"] == ([192, 192] if sid in (2, 4) else [96, 96])
         assert (start["scan_width"], start["scan_height"]) == (4, 2)
+        assert start["scan_source"] == "config"
         assert start["announced_images"] == end["received_images"] == count
         assert result["processed_images"] == result["images"] == count
         assert end["positions"] == result["positions"] == results[index]["positions"]
@@ -256,3 +267,37 @@ def test_unsupported_start_geometry_is_rejected(shape, dtype):
 ])
 def test_image_geometry_must_match_start(start_shape, image_shape):
     run_series([(10, [0], start_shape, image_shape)], expect_error=True)
+
+
+def test_announced_scan_follows_each_series(capfd):
+    # Scan shapes change between series and image sizes independently of each other.
+    placements = []
+    _, results, _, _ = run_series(
+        [(1, [0, 1, 2, 3, 4, 5, 6]), (2, [0, 3, 6, 9, 10], (192, 192)), (3, [0, 5, 7, 8]),
+         (4, [], (192, 192)), (5, [0, 1, 2], (192, 192))],
+        appendices={1: {"scan_width": 3, "scan_height": 2, "operator": "x"},
+                    2: {"scan_width": 5, "scan_height": 2}, 3: {"operator": "x"},
+                    4: {"scan_width": 7, "scan_height": 7}, 5: {"scan_width": 1, "scan_height": 2}},
+        service=True, placements=placements)
+    # Independent reference: row-major placement in the announced scan, else config (4, 2).
+    scans = {1: (3, 2), 2: (5, 2), 3: (4, 2), 4: (7, 7), 5: (1, 2)}
+    sent = {1: range(7), 2: [0, 3, 6, 9, 10], 3: [0, 5, 7, 8], 4: [], 5: range(3)}
+    expected = [(sid, i, (i // scans[sid][0], i % scans[sid][0]))
+                for sid in sent for i in sent[sid] if i < scans[sid][0] * scans[sid][1]]
+    assert placements == expected
+    assert [result["scan_positions"] for result in results] == [6, 10, 8, 49, 2]
+    assert [result["positions"] for result in results] == [6, 4, 3, 0, 2]
+    assert [result["images"] for result in results] == [7, 5, 4, 0, 3]
+    assert results[0]["bf_sum"] == 812 * sum(range(1, 7))
+    assert results[2]["bf_sum"] == 812 * (1 + 6 + 8)
+    starts = [json.loads(line.split(" ", 1)[1]) for line in capfd.readouterr().out.splitlines()
+              if line.startswith("[series-start] ")]
+    assert [(row["scan_width"], row["scan_height"], row["scan_source"]) for row in starts] == [
+        (3, 2, "header_appendix"), (5, 2, "header_appendix"), (4, 2, "config"),
+        (7, 7, "header_appendix"), (1, 2, "header_appendix")]
+
+
+@pytest.mark.parametrize("appendix", [{"scan_width": 4}, {"scan_width": 0, "scan_height": 2},
+                                      {"scan_width": "4", "scan_height": 2}])
+def test_invalid_announced_scan_is_rejected(appendix):
+    run_series([(11, [0])], appendices={11: appendix}, expect_error=True)

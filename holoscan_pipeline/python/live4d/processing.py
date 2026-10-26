@@ -46,6 +46,7 @@ class ScanTensorOp(hs.Operator):
     def start(self):
         self.scan = ScanShape(self.scan_width, self.scan_height)
         self.series = None
+        self.series_scan = self.scan
 
     def compute(self, ctx):
         sample = self.inp.receive()
@@ -55,10 +56,12 @@ class ScanTensorOp(hs.Operator):
             if self.series is not None or series.id != batch.series_id:
                 raise ValueError("Invalid ordered series boundary")
             self.series = series
+            # A scan announced in START overrides the configured scan for this series.
+            self.series_scan = series.scan or self.scan
         elif not batch.pipeline_ready and (self.series is None or self.series.id != batch.series_id):
             raise ValueError("Image batch has no matching START")
         ids = np.asarray(batch.image_ids, dtype=np.uint64)
-        positions, valid = scan_positions(ids, self.scan)
+        positions, valid = scan_positions(ids, self.series_scan)
         if batch.end_of_series:
             self.series = None
         positioned = PositionedBatch(int(batch.batch_id), positions, np.flatnonzero(valid))
@@ -153,13 +156,15 @@ class VirtualDetectorOp(hs.Operator):
                 self.announced_images = cbor2.loads(start_metadata).get("number_of_images")
                 if self.series.id != batch.series_id:
                     raise ValueError("Invalid ordered series boundary")
+                self.series_scan = self.series.scan or self.scan
             if self.series is None or self.series.id != batch.series_id:
                 raise ValueError("Image batch has no matching START")
             if tuple(batch.frames.shape[1:]) != self.series.shape:
                 raise ValueError("Image geometry does not match START")
             self.masks = self.masks_by_shape[self.series.shape]
             if batch.start_of_series:
-                self.image = cp.zeros((2, self.scan.height, self.scan.width), dtype=cp.float32)
+                scan = self.series_scan
+                self.image = cp.zeros((2, scan.height, scan.width), dtype=cp.float32)
                 self.received = self.placed = self.gaps = self.missing = 0
                 self.next_id = 0
                 self.first = self.last_image = None
@@ -169,7 +174,8 @@ class VirtualDetectorOp(hs.Operator):
                 _log_series("series-start", dict(
                     series_id=int(batch.series_id), device=self.device_id,
                     image_shape=self.series.shape, announced_images=self.announced_images,
-                    scan_width=self.scan.width, scan_height=self.scan.height,
+                    scan_width=scan.width, scan_height=scan.height,
+                    scan_source="header_appendix" if self.series.scan else "config",
                     stage="processing"))
             count = len(batch.image_ids)
             if count:
@@ -214,7 +220,7 @@ class VirtualDetectorOp(hs.Operator):
                 elapsed = (self.last_image - self.first) if self.first is not None else 0.0
                 result = dict(series_id=int(batch.series_id), images=self.received,
                               announced_images=self.announced_images,
-                              positions=self.placed, scan_positions=self.scan.size,
+                              positions=self.placed, scan_positions=self.series_scan.size,
                               gap_events=self.gaps, missing_images=self.missing, batches=self.batches,
                               batch_sizes=self.batch_sizes, bf_sum=totals[0], adf_sum=totals[1],
                               device=self.device_id, processed_images=self.received,
