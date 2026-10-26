@@ -87,15 +87,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    import cbor2
+    from realtime_stem.ingest import codec
 
     p = build_parser()
     args = p.parse_args()
 
     shape = (args.height, args.width)
     rng = np.random.default_rng(args.seed)
-    start = cbor2.dumps(cbor2.CBORTag(_SELF_DESCRIBE, {"type": "start", "series_id": 1}))
-    end = cbor2.dumps(cbor2.CBORTag(_SELF_DESCRIBE, {"type": "end", "series_id": 1}))
+    # START and END as a DCU sends them: the Holoscan 5 receivers take the geometry from START.
+    start = codec.encode_start_message(shape, args.n_frames, args.dtype)
+    end = codec.encode_end_message()
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "wb") as fh:

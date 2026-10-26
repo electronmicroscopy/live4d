@@ -1,20 +1,21 @@
 # realtime-stem
 
-> **About this folder.** realtime-stem 2.2.0: real-time parallax / tilt-corrected bright-field
+> **About this folder.** realtime-stem 3.0.0: real-time parallax / tilt-corrected bright-field
 > (tcBF) reconstruction for 4D-STEM on a DECTRIS ARINA, with a browser viewer that can fine-tune
-> the reconstruction while the scan runs. It is the version after the first live sessions in
-> October 2026; its history, and the recorded sessions with their analysis, are in
+> the reconstruction while the scan runs. 3.0.0 runs on **Holoscan SDK 5** and receives the
+> frames through this repository's shared ingest ([`holoscan_pipeline/`](../holoscan_pipeline/),
+> [`dectris/`](../dectris/)), over **ZMQ** (compressed) or **RDMA** (uncompressed, straight into
+> GPU memory). The Holoscan 4 version (2.2.0, the one used in the first live sessions in October
+> 2026) still builds from this folder with its own ingest (`operators/`); its history and the
+> recorded sessions are in
 > [kucukogluberk/EM_Realtime_Processing](https://github.com/kucukogluberk/EM_Realtime_Processing)
-> (tag `v2.2.0`). It is self-contained: it builds its own Docker image (Holoscan 4.4, CUDA 12)
-> and does not use the rest of this repository. Its GPU ingest (`operators/`) is an earlier fork
-> of this repository's Holoscan operators, kept as it was used live; the current operators are in
-> [`holoscan_pipeline/`](../holoscan_pipeline/). Bringing the two together is discussed in
-> [#9](https://github.com/electronmicroscopy/live4d/issues/9). Run every command below from this folder.
+> (tag `v2.2.0`). Background: [#9](https://github.com/electronmicroscopy/live4d/issues/9).
+> Run every command below from this folder unless it says otherwise.
 
 This program makes a parallax (tcBF) image **while the scan is running**. The ARINA detector
-sends its frames over the network, an NVIDIA GPU unpacks them, and every frame is added to the
-image as soon as it arrives. You watch the image fill in, in a browser. It keeps up with the ARINA
-at full speed (120,000 frames per second, 2×2 binned; measured on an NVIDIA RTX 6000 Ada).
+sends its frames to an NVIDIA GPU, and every frame is added to the image as soon as it arrives.
+You watch the image fill in, in a browser. It keeps up with the ARINA at full speed (120,000
+frames per second, 2×2 binned).
 
 ![The browser viewer: the Reconstruction section's sliders, the parallax image phase-flipped and filtered, and its Fourier transform](docs/images/web_viewer.jpg)
 
@@ -34,6 +35,32 @@ More detail: [`docs/GUIDE.md`](docs/GUIDE.md) (the full guide),
 reconstruction, looping a scan, a focus-walk demo) and [`docs/CLI.md`](docs/CLI.md) (every
 option).
 
+## Which image, which transport
+
+There are two Docker images. Both run the same reconstruction and the same viewer; only the way
+the frames come in differs.
+
+| | Holoscan 5 image (recommended) | Holoscan 4 image (2.2.0) |
+|---|---|---|
+| Dockerfile | `docker/Dockerfile.hsdk5`, built from the **repository root** | `docker/Dockerfile`, built from this folder |
+| Transports | `--transport zmq` or `--transport rdma` | ZMQ only |
+| NVIDIA driver | CUDA 13 (driver 580 or newer) | CUDA 12 or newer |
+| GPUs | Ampere (RTX 30xx, A6000), Ada, Hopper, Blackwell (RTX PRO 6000) | A100, Ampere, Ada, Hopper; **not Blackwell** (its PyTorch has no Blackwell kernels) |
+| Frame type | uint16 only (the ARINA's fast scans) | uint16 and uint32 |
+| Tested | RTX PRO 6000 Blackwell, ARINA over RDMA; ZMQ with replays | RTX 6000 Ada, ARINA over ZMQ |
+
+The two transports:
+
+| | `--transport zmq` (the default) | `--transport rdma` |
+|---|---|---|
+| How | the DCU's Stream2 over TCP (ZeroMQ), `--n-connections 3` | the DCU's RDMA stream (imagemux) into a ring in GPU memory |
+| Compression | **`bslz4` on** (LZ4); the GPU unpacks the frames | **off** (`none`); the RDMA receiver refuses compressed frames |
+| DCU settings | `stream/mode` `enabled`, `stream/format` `cbor`, `detector/compression` `bslz4` | `bstream/mode` `cbor-rdma`, `detector/compression` `none` |
+| Network | any network link to the DCU, 10 Gbit/s or faster for 120 kHz | an RDMA-capable card (RoCE, e.g. ConnectX) on the DCU's RDMA network |
+
+The compression is set on the DCU, not in this program, so **the DCU's compression must match the
+transport you choose.** A mismatch stops the run with an error that says so.
+
 ## What is where
 
 ```
@@ -41,18 +68,24 @@ realtime_stem/        the Python package
   apps/run.py           the program you run (with --viewer-port it also serves the viewer)
   apps/control.py       live tuning from the viewer
   ingest/               receives the detector frames
+    hsdk5_graph.py        Holoscan 5: the shared ZMQ / RDMA receivers → the reconstruction
+    holoscan_graph.py     Holoscan 4: this folder's operators → the reconstruction
+    python_ingest.py      no Holoscan: CPU decode, for laptops and recordings
   processing/parallax/  the parallax / tcBF reconstruction
   streaming/            publishes the live image; web/ is the browser viewer
-operators/            the C++/CUDA frame receiver and GPU decompressor
-docker/Dockerfile     builds the Docker image
+operators/            the Holoscan 4 image's C++/CUDA frame receiver and GPU decompressor
+docker/Dockerfile.hsdk5  builds the Holoscan 5 image (from the repository root)
+docker/Dockerfile        builds the Holoscan 4 image (from this folder)
 examples/             matplotlib viewer, notebook, sample recording
-tools/                detector setup, stream recorder, replay, simulator, geometry calibration,
-                      looping and refocusing a recording
+tools/                detector setup, stream recorder, replay (ZMQ and RDMA), simulator,
+                      geometry calibration, looping and refocusing a recording
 scripts/              installation check, demos, the standard session analysis
 tests/                unit tests
 ```
 
-Recorded sessions and their analysis (Gd₂O₃ nanoparticles, an Au grating) are in
+The Holoscan 5 image compiles the receivers from [`../holoscan_pipeline/`](../holoscan_pipeline/)
+(`ZmqRxOp`, `DecompressGpuOp`, `RdmaRxOp`) and installs [`../dectris/`](../dectris/) (the RDMA
+connection). Recorded sessions and their analysis (Gd₂O₃ nanoparticles, an Au grating) are in
 [EM_Realtime_Processing/sessions](https://github.com/kucukogluberk/EM_Realtime_Processing/tree/v2.2.0/sessions).
 
 ## Try it without a detector
@@ -72,25 +105,29 @@ Open http://127.0.0.1:8050. The viewer stays up after the replay: change C10 or 
 the Reconstruction section and the image is re-rendered from the frames it holds. Ctrl-C saves the
 tuned image to `out/` and prints the tuned flags.
 
-`scripts/run_replay_demo.sh` does the same in Docker on the GPU. [`docs/WORKFLOWS.md`](docs/WORKFLOWS.md)
-streams a recording in a loop, as a microscope scanning the same area would, and walks it through
-focus.
+`scripts/run_replay_demo.sh` does the same in the Holoscan 4 image on the GPU. To test the
+Holoscan 5 image without a detector, see "Testing the Holoscan 5 image without a detector" below.
+[`docs/WORKFLOWS.md`](docs/WORKFLOWS.md) streams a recording in a loop, as a microscope scanning
+the same area would, and walks it through focus.
 
 ## What you need
 
 - **A Linux PC with an NVIDIA GPU** and a network connection to the ARINA's detector control
   unit (the DCU). We call it the *processing PC*.
-- **An NVIDIA driver for CUDA 12 or newer.** Run `nvidia-smi`: it must show `CUDA Version: 12.x`
-  or higher.
+- **An NVIDIA driver** for CUDA 13 (Holoscan 5 image) or CUDA 12 (Holoscan 4 image). Run
+  `nvidia-smi`: it shows the `CUDA Version` the driver supports.
 - **Docker** and the **NVIDIA Container Toolkit**, so that Docker can use the GPU.
+- **For RDMA only:** an RDMA network card on the DCU's RDMA network (`ibv_devinfo` shows its
+  device, e.g. `mlx5_0`, with `state: PORT_ACTIVE`). Frames go straight into GPU memory when the
+  host has GPUDirect RDMA (the `nvidia_peermem` kernel module: `lsmod | grep nvidia_peermem`);
+  without it, use `--rdma-ring-memory host_mapped`.
 - **Python 3.10 or newer**, for the detector commands (and the optional standalone viewers).
 - **A web browser**, on the processing PC or on another computer (see "Watching from another
   computer").
-- **Disk space:** the NVIDIA base image is large. Keep several tens of GB free.
-- The image is compiled for A100, RTX 30xx / A6000, RTX 40xx / RTX 6000 Ada / L4 / L40 and
-  H100 / H200 GPUs; it was tested on an RTX 6000 Ada. Older GPUs (V100, T4) need an extra build
-  option: see
-  [`docs/GUIDE.md`](docs/GUIDE.md), "Host requirements".
+- **Disk space:** the NVIDIA base images are large. Keep several tens of GB free.
+- GPUs missing from the image's list (older ones such as V100 or T4, or A100 for the Holoscan 5
+  image) need an extra build option: `--build-arg CUDA_ARCHITECTURES="…"` (see
+  [`docs/GUIDE.md`](docs/GUIDE.md), "Host requirements").
 
 ## Install
 
@@ -114,9 +151,20 @@ cd live4d/realtime_stem_parallax
 **3. Build the Docker image.** The first build downloads NVIDIA's base image (large; this can take
 a while, depending on your network) and then compiles the GPU code (a few minutes).
 
+The Holoscan 5 image (ZMQ and RDMA) is built from the repository root, one folder up:
+
+```bash
+(cd .. && docker build -f realtime_stem_parallax/docker/Dockerfile.hsdk5 -t realtime-stem:hsdk5 .)
+```
+
+The Holoscan 4 image (ZMQ only; not on Blackwell GPUs) is built from this folder:
+
 ```bash
 docker build -t realtime-stem:latest -f docker/Dockerfile .
 ```
+
+The commands below use `realtime-stem:hsdk5`. With the Holoscan 4 image, use
+`realtime-stem:latest` and leave out the `--transport` and `--rdma-…` options.
 
 **4. Install the host tools** (the detector commands, and the optional standalone viewers) in a
 Python virtual environment. (On recent Ubuntu, `pip install` outside a virtual environment is
@@ -131,16 +179,21 @@ pip install -e ".[viz,replay]"
 
 In every new terminal, run `source .venv/bin/activate` again before using the detector commands.
 
-**5. Find two things.**
+**5. Find these values.**
 
-- **Your GPU number:** run `nvidia-smi -L` and pick one (`GPU 0`, `GPU 1`, …).
-- **The DCU's stream address:** the IP address of the DCU on the network to this PC. It can be
-  different from the address of the DCU's web page; ask whoever set up the detector.
+- **Your GPU number:** run `nvidia-smi -L` and pick one (`GPU 0`, `GPU 1`, …). With RDMA, prefer
+  a GPU next to the RDMA card (`nvidia-smi topo -m`: the same NUMA node, ideally `PIX` or `PXB`).
+- **For ZMQ: the DCU's stream address,** the IP address of the DCU on the network to this PC. It
+  can be different from the address of the DCU's web page; ask whoever set up the detector.
+- **For RDMA: two addresses and the device.** The DCU's address on the RDMA network (port 31003),
+  this PC's own address on that network, and the card's device name (`ibv_devinfo`, e.g.
+  `mlx5_0`).
 
-**6. Run the installation check.**
+**6. Run the installation check** (it checks the GPU, the DCU's ZMQ address and a replay; it
+does not test RDMA).
 
 ```bash
-GPU=<N> DCU=<DCU_IP> scripts/check_install.sh
+GPU=<N> DCU=<DCU_IP> IMAGE=realtime-stem:hsdk5 scripts/check_install.sh
 ```
 
 Every step prints `PASS`, `FAIL` or `SKIP`. At the end it prints the `--gpus` and `--endpoint`
@@ -148,9 +201,14 @@ values to use in the run command below.
 
 ## Before a session: set up the detector
 
-The DCU must send its frames as `cbor` with `bslz4` compression, and one frame per scan position.
-Run these in the virtual environment (`source .venv/bin/activate`). Check the settings (this only
-reads them):
+The DCU's settings depend on the transport. Change them only while the detector is not armed (the
+DCU refuses changes while it is `ready`). For both: one frame per scan position (trigger mode
+`exts`, `nimages` 1, `ntrigger` = NY × NX), binning `2x2` for `--binned`, and a dwell time short
+enough for uint16 frames (the DCU switches to uint32 for long dwells, which the Holoscan 5 image
+does not take; 120 kHz down to about 30 kHz gave uint16).
+
+**ZMQ.** The helper `tools.detector_setup` checks and sets exactly what ZMQ needs. Run it in the
+virtual environment (`source .venv/bin/activate`). Check the settings (this only reads them):
 
 ```bash
 python -m tools.detector_setup check --ip <DCU_IP> --scan 256 256 --binned
@@ -163,7 +221,29 @@ If something is wrong, set it. `--frame-time` is the scan's dwell time per posit
 python -m tools.detector_setup apply --ip <DCU_IP> --scan 256 256 --binned --frame-time 8.334e-6
 ```
 
-You can also do this on the DCU's web page instead.
+**RDMA.** The helper knows the ZMQ settings only (its `check` reports compression `none` as a
+difference; that is expected here). Set these on the DCU's web page or through its REST API, for
+example with `curl` (`<DCU_IP>` is the DCU's REST address):
+
+```bash
+put() { curl -s -X PUT -H "Content-Type: application/json" -d "{\"value\":$3}" \
+          "http://<DCU_IP>/$1/api/1.8.0/config/$2"; echo; }
+put detector compression    '"none"'
+put bstream  mode           '"cbor-rdma"'
+put bstream  rdma_batch_size 64
+put bstream  rdma_device    '"<DCU_RDMA_PORT>"'   # e.g. enp1s0f0np0, see below
+put stream   mode           '"disabled"'      # the ZMQ stream is not used
+```
+
+and the per-scan values (trigger mode, `nimages`, `ntrigger`, frame time, binning) as for ZMQ.
+
+- **`rdma_device` must not be empty.** It names the DCU's own RDMA port; its one allowed value
+  is listed by `curl http://<DCU_IP>/bstream/api/1.8.0/config/rdma_device`.
+- **Check the RDMA stream's state before arming:**
+  `curl http://<DCU_IP>/bstream/api/1.8.0/status/state` must be `ready` (or `acquire` during a
+  scan), and `.../status/dropped` should stay 0. In `error` it drops every message, START
+  included, even with the pipeline connected; re-arming does not clear it (see "If something goes
+  wrong").
 
 ## Run an experiment
 
@@ -212,17 +292,41 @@ Write negative numbers with `=` (`--defocus=-300`), as above.
 
 Always start it **before** the scan: the DCU throws frames away while nobody is listening.
 
+**With ZMQ** (DCU compression `bslz4`):
+
 ```bash
-docker run --rm --network host --gpus "device=<N>" --ulimit stack=33554432:33554432 \
-  -v "$PWD":/work -v "$PWD/out":/out -w /work --entrypoint python3 \
-  realtime-stem:latest -m realtime_stem.apps.run \
+docker run --rm -it --name realtime-stem --network host --gpus "device=<N>" \
+  --ulimit stack=33554432:33554432 --user $(id -u):$(id -g) \
+  -v "$PWD":/work -w /work --entrypoint python3 \
+  realtime-stem:hsdk5 -m realtime_stem.apps.run \
     --endpoint tcp://<DCU_IP>:31001 $(cat site.flags) \
-    --viewer-port 8050 --continuous --out-dir /out
+    --viewer-port 8050 --continuous --out-dir out
 ```
 
-It prints the GPU it uses and the viewer's address, and then waits. If it prints
-`WARNING: cannot reach …`, the DCU address is wrong or the network is down; no frames can arrive
-until that is fixed.
+**With RDMA** (DCU compression `none`, `bstream` mode `cbor-rdma`):
+
+```bash
+docker run --rm -it --name realtime-stem --network host --gpus "device=<N>" \
+  --device /dev/infiniband --ulimit memlock=-1:-1 \
+  --ulimit stack=33554432:33554432 --user $(id -u):$(id -g) \
+  -v "$PWD":/work -w /work --entrypoint python3 \
+  realtime-stem:hsdk5 -m realtime_stem.apps.run \
+    --transport rdma --rdma-remote <DCU_RDMA_IP>:31003 --rdma-local <THIS_PC_RDMA_IP> \
+    --rdma-device <mlx5_N> $(cat site.flags) \
+    --viewer-port 8050 --continuous --out-dir out
+```
+
+It prints the GPU it uses and the viewer's address, connects to the DCU, and then prints
+`[holoscan] ready (ZMQ receiver connected)` or `[holoscan] ready (RDMA receiver connected)`.
+**Wait for that line before you arm the detector.** Then it waits for the scan.
+
+- **ZMQ:** if it prints `WARNING: cannot reach …`, the DCU address is wrong or the network is
+  down; no frames can arrive until that is fixed.
+- **RDMA:** the pipeline connects once and keeps the connection for the whole session; every scan
+  goes over it. If it prints `no RDMA sender answers at …`, check the addresses, that the DCU's
+  `bstream` mode is `cbor-rdma`, and that no other program is connected to the DCU's RDMA stream.
+- The Holoscan 5 receivers take batches of at most 1000 frames; a larger `--batch-size` is reduced
+  to 1000 with a message.
 
 ### Step 3: open the viewer
 
@@ -254,7 +358,8 @@ In terminal 2, first run `source .venv/bin/activate`.
 3. When the scan has finished, disarm the detector:
    `python -m tools.detector_setup disarm --ip <DCU_IP>`
 
-(You can also arm and disarm from the DCU's web page or your own software.)
+(You can also arm and disarm from the DCU's web page or your own software. `arm` and `disarm`
+work the same for both transports.)
 
 After the scan, terminal 1 prints `COMPLETE: all N scan positions received`. If it prints
 `WARNING: INCOMPLETE SCAN`, some frames were lost (see "If something goes wrong").
@@ -300,17 +405,71 @@ ssh -L 8050:127.0.0.1:8050 <user>@<processing-PC>
 Only screen-sized images travel, so large images stay smooth. Recording the page works through
 the tunnel too.
 
+## Testing the Holoscan 5 image without a detector
+
+Both transports can be fed from a recording (`.dstream`, see `tools/record_stream.py`) or a
+simulated scan, on the processing PC itself. Start the pipeline first, wait for
+`[holoscan] ready`, then start the sender in a second terminal (set `IMG` and `RUN` there too). The pipeline then prints
+`COMPLETE` and saves the result, which you can compare with an offline reconstruction of the same
+frames (`--ingest python --source …`).
+
+```bash
+IMG=realtime-stem:hsdk5
+RUN="docker run --rm --network host --gpus device=<N> --ulimit stack=33554432:33554432 \
+     --user $(id -u):$(id -g) -v $PWD:/work -w /work --entrypoint python3"
+$RUN $IMG -m tools.simulate_4dstem --scan 256 256 --format dstream --out out/sim256
+```
+
+**ZMQ:** the replay feeder sends the recording as the DCU would (compressed, three connections).
+
+```bash
+$RUN $IMG -m realtime_stem.apps.run --endpoint tcp://127.0.0.1:5655 $(cat out/sim256.flags) --out-dir out/zmq
+$RUN $IMG -m tools.replay_to_zmq out/sim256.dstream --endpoint tcp://127.0.0.1:5655 --fast   # terminal 2
+```
+
+**RDMA:** `tools/rdma_sender.py` is a stand-in for the DCU's RDMA sender. It listens on this PC's
+RDMA address, port 41003, and writes the frames uncompressed into the pipeline's ring
+(`--rate` paces it, e.g. 120000).
+
+```bash
+RDMA="--device /dev/infiniband --ulimit memlock=-1:-1"
+$RUN $RDMA $IMG -m tools.rdma_sender --source out/sim256.dstream --listen <THIS_PC_RDMA_IP> --rate 120000
+$RUN $RDMA $IMG -m realtime_stem.apps.run --transport rdma --rdma-remote <THIS_PC_RDMA_IP>:41003 \
+    --rdma-local <THIS_PC_RDMA_IP> $(cat out/sim256.flags) --out-dir out/rdma                  # terminal 2
+```
+
+Here the sender starts first, because the pipeline connects to it.
+
 ## If something goes wrong
 
 - **Nothing arrives:**
-  - check the DCU address (`WARNING: cannot reach …`);
+  - check that the pipeline printed `[holoscan] ready …` before the detector was armed;
+  - ZMQ: check the DCU address (`WARNING: cannot reach …`);
   - check that the detector is armed;
   - check that no other pipeline is still running (`docker ps`).
 - **`INCOMPLETE SCAN`:** only one program may read the detector's stream at a time. A second one
   (another tool, a forgotten container) silently takes part of the frames. Stop it.
 - **The run stops with a frame-size error:** `--binned` does not match the detector's binning.
-- **The DCU's compression** must be `bslz4` (its default). `detector_setup check` shows it.
-- **Files in `out/` belong to root** (Docker writes them). Delete them with `sudo`.
+- **`Invalid BSLZ4 image` (ZMQ) or `Invalid RDMA stream` (RDMA):** the DCU's compression does not
+  match the transport. ZMQ needs `bslz4`, RDMA needs `none`.
+- **`receives uint16 frames only`:** the dwell time is so long that the DCU sends uint32 frames.
+  Shorten the dwell, or use the Holoscan 4 image.
+- **RDMA: `no RDMA sender answers`:** see Step 2. The DCU's RDMA sender serves one receiver at a
+  time.
+- **RDMA: the pipeline is `ready` but no series starts after `arm`:** read the DCU's
+  `bstream/api/1.8.0/status/state` and `status/dropped`. If the state is `error` (the DCU drops
+  everything, and `dropped` counts each START, frame and END), reset the module and set it up again,
+  with the detector disarmed and the pipeline stopped (the reset drops its connection):
+  `PUT bstream/api/1.8.0/command/initialize`, then `mode` `cbor-rdma`, `rdma_batch_size` and
+  `rdma_device` (it is empty after the reset; see "Before a session"). The state must then show
+  `ready`. Start the pipeline, arm, and the pipeline prints `[rdma] series … started` within a
+  second.
+- **RDMA with `--rdma-ring-memory gpu` (the default) fails to register the ring:** the host has no
+  GPUDirect RDMA (`nvidia_peermem`). Use `--rdma-ring-memory host_mapped`.
+- **"no kernel image is available":** the image was not built for this GPU. On a Blackwell GPU use
+  the Holoscan 5 image; otherwise add the GPU to `CUDA_ARCHITECTURES` and rebuild.
+- **Files in `out/` belong to root:** the container ran without `--user $(id -u):$(id -g)`.
+  Delete them with `sudo`.
 - More in [`docs/GUIDE.md`](docs/GUIDE.md), "Known issues and limitations".
 
 ## For AI coding assistants
@@ -321,6 +480,7 @@ including how to set it up on a new machine.
 ## Credits
 
 The real-time (streaming) parallax implementation is the work of Georgios Varnavides
-(Varnavides et al., *Microsc. Microanal.* 32(2), ozaf139). The GPU ingest in
-`operators/` builds on [electronmicroscopy/live4d](https://github.com/electronmicroscopy/live4d)
-(Denis Leshchev, NVIDIA; MIT license, see `operators/LICENSE`).
+(Varnavides et al., *Microsc. Microanal.* 32(2), ozaf139). The GPU ingest of both images
+(`operators/` and [`../holoscan_pipeline/`](../holoscan_pipeline/), [`../dectris/`](../dectris/))
+is [electronmicroscopy/live4d](https://github.com/electronmicroscopy/live4d) (Denis Leshchev,
+NVIDIA; MIT license, see `operators/LICENSE`).

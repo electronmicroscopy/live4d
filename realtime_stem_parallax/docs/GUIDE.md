@@ -11,6 +11,14 @@ CPU by a pure-Python ingest, anywhere), folded into a reconstruction as they arr
 out live over ZeroMQ — so the reconstruction fills in *during* the scan rather than only at the
 end, and keeps following the microscope while it scans continuously.
 
+> **Holoscan 5 (3.0.0).** This guide describes the Holoscan 4 image (`docker/Dockerfile`, ZMQ)
+> in detail. The Holoscan 5 image (`docker/Dockerfile.hsdk5`) runs the same processing,
+> streaming and viewer, with the repository's shared receivers over ZMQ or RDMA: how to build it,
+> choose a transport, set up the DCU and test it without a detector is in the
+> [README](../README.md) ("Which image, which transport" onwards). Where this guide names
+> `operators/`, `kMaxBatchSize` (2048) or `--scheduler-threads`, the Holoscan 5 equivalents are
+> `../holoscan_pipeline/`, a batch limit of 1000, and the Holoscan 5 runtime's own scheduling.
+
 The worked example is **parallax / tilt-corrected bright field (tcBF)**, running at 120 kHz on
 binned ARINA data. The pipeline is deliberately modular so a new algorithm is a drop-in.
 

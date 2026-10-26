@@ -1,8 +1,59 @@
 # Changelog
 
-This folder holds realtime-stem 2.2.0. Each release is a git tag in
-[EM_Realtime_Processing](https://github.com/kucukogluberk/EM_Realtime_Processing) (e.g. `v2.2.0`), where its history is; the recorded sessions
+This folder holds realtime-stem 3.0.0. Releases up to 2.2.0 are git tags in
+[EM_Realtime_Processing](https://github.com/kucukogluberk/EM_Realtime_Processing) (e.g. `v2.2.0`), where their history is; the recorded sessions
 named below are there too, in [`sessions/`](https://github.com/kucukogluberk/EM_Realtime_Processing/tree/v2.2.0/sessions).
+3.0.0 and later are developed in this repository.
+
+## 3.0.0
+
+The same reconstruction and viewer on **Holoscan SDK 5**, fed by this repository's shared
+receivers, over **ZMQ** (bslz4-compressed) or **RDMA** (uncompressed, into GPU memory). The
+Holoscan 4 image and its ingest are unchanged and still build.
+
+- **Holoscan 5 image:** `docker/Dockerfile.hsdk5` (CUDA 13, PyTorch 2.11 for CUDA 13, kernels for
+  Ampere, Ada, Hopper and Blackwell), built from the repository root. It compiles
+  `holoscan_pipeline/` (`ZmqRxOp`, `DecompressGpuOp`, `RdmaRxOp`) and installs `dectris/`.
+- **`run.py --transport zmq|rdma`.** `zmq` (the default) needs the DCU's compression `bslz4`;
+  `rdma` needs compression `none` and `bstream` mode `cbor-rdma`, and takes `--rdma-remote`,
+  `--rdma-local`, `--rdma-device`, `--rdma-ring-memory gpu|host_mapped` (default `gpu`:
+  GPUDirect RDMA), `--rdma-ring-mib`, `--rdma-timeout`. In the Holoscan 4 image only `zmq`
+  exists, as before.
+- **One connection per run** (`ingest/hsdk5_graph.py`, `Hsdk5Session`): the pipeline connects
+  once and every scan of a `--continuous` session is a round on the same running graph. The next
+  series' START waits until the previous scan has been handed over.
+- **`tools/rdma_sender.py`:** a stand-in for the DCU's RDMA sender (imagemux protocol, port
+  41003), replaying a `.dstream` or `.npy` paced at `--rate`, one or several series per
+  connection. It replaced the earlier loopback test tool.
+- **Full START and END messages** in the simulator and the recording tools
+  (`codec.encode_start_message` / `encode_end_message`: frame size, dtype, number of images,
+  `series_unique_id`), as a DCU sends them; the Holoscan 5 receivers need them. The bundled
+  `examples/data/sample.dstream` has them now (its images are unchanged).
+  `tools/repeat_dstream.py --series per-pass` gives each pass its own `series_id`.
+- **`[sink] TOTAL … rate`** is measured from the first to the last batch, so it shows the rate
+  frames arrived at (it understated it before).
+- **`scripts/check_install.sh`** works with either image (`IMAGE=realtime-stem:hsdk5`).
+
+Shared receivers (`holoscan_pipeline/`, also proposed to `main` separately):
+
+- `fast_cbor_parse`: keeps scanning after a byte sequence that looks like the tag it searches but
+  is not. Before, about 1 real frame in 20,000 (e.g. a `stop_time` value) was rejected.
+- `ZmqRxOp`: `n_connections` (1–16). With more than one, messages reordered across connections
+  are put back in order per series (END before the last images, the next series before this END,
+  START after the first images); stragglers of a finished series are dropped.
+- A namespace fix (`::dectris::log_header_appendix`) so the receivers build against Holoscan 5.
+
+Verified on an RTX PRO 6000 Blackwell (driver 595), 1024×1024 binned beam-on recording:
+`parallax_recon.npy` bit-identical to the Holoscan 4 image over both transports; ZMQ replay
+(3 connections) of all 1,048,576 frames at 287 kHz; RDMA stand-in at 623 kHz unpaced and
+120 kHz paced; three series back to back in one run. Live on an ARINA over RDMA, both ring types:
+`COMPLETE` scans in `--continuous` mode; with the GPU ring, 60 consecutive 256×256 scans in one
+run, every one `COMPLETE` (all 65,536 positions, 85–87 kHz, the scan's own rate), 0 frames
+dropped by the DCU.
+
+Limits: the Holoscan 5 receivers take uint16 frames only (the DCU sends uint32 for long dwells:
+use the Holoscan 4 image) and batches of at most 1000 frames. The Holoscan 4 image does not run on
+Blackwell GPUs. ZMQ on Holoscan 5 has been run with replays only, not yet from a live DCU.
 
 ## 2.2.0
 
