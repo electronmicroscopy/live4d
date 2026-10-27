@@ -258,7 +258,11 @@ encoder; the detector still reports it. In finite mode the run completes after t
 consumer, encoder included. Each kept or dropped series prints an `[ans-result]` record with
 `images`, `encoded_bytes`, `raw_bytes`, `kept` and `encode_interval_s`.
 
-`PipelineApp(config, encoder_sink=...)` replaces the default sink (`ResidentSeries`), for example
+The default sink, `SeriesStore` (`algorithms/series_store.py`), is the one owner of the finished
+`Dataset4dstemGPU` series: it keeps the latest `encoder.keep` and is the only code that closes one.
+Per-scan operators pass the series name and read the buffer under a lease
+(`with store.lease(name) as dataset:`); a leased series is never closed, and at most `max_leased`
+series are leased at once. `PipelineApp(config, encoder_sink=...)` replaces the sink, for example
 to save each series or to show it while it arrives; the sink contract is in `ans_encoding.py`.
 
 ## Shared messages and GPU ownership

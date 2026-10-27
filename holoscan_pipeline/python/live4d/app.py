@@ -24,8 +24,8 @@ class PipelineApp:
         writing = config.writer["enabled"]
         encoding = config.encoder["enabled"]
         if encoding and encoder_sink is None:
-            from .algorithms.ans_encoding import ResidentSeries
-            encoder_sink = ResidentSeries(config.device, config.encoder["keep"])
+            from .algorithms.series_store import SeriesStore
+            encoder_sink = SeriesStore(config.device, config.encoder["keep"])
         self.encoder_sink = encoder_sink
         finite = config.execute["mode"] == "finite"
         # One spare queue slot covers a released input until its callback commits consumption.

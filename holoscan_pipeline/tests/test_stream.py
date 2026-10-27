@@ -716,8 +716,8 @@ def encoded(dataset):
 def test_ans_encoder_both_sizes_and_partial_series(writing, tmp_path, capfd):
     # The encoder is one more decoded consumer, beside the detector and, optionally, the writer.
     pytest.importorskip("quantem.gpu.streaming")
-    from live4d.algorithms.ans_encoding import ResidentSeries
-    sink = ResidentSeries(keep=0)
+    from live4d.algorithms.series_store import SeriesStore
+    sink = SeriesStore(keep=0)
     series = [(1, list(range(16)), (96, 96)), (2, list(range(9)), (192, 192)), (3, list(range(16)), (96, 96))]
     run_series(series, batch_size=5, service=True, pixels=series_pixels, encoder=sink,
                writer=dict(output_dir=str(tmp_path)) if writing else None)
@@ -733,8 +733,8 @@ def test_ans_encoder_both_sizes_and_partial_series(writing, tmp_path, capfd):
 
 def test_ans_encoder_drops_a_series_with_a_gap_and_keeps_the_next(capfd):
     pytest.importorskip("quantem.gpu.streaming")
-    from live4d.algorithms.ans_encoding import ResidentSeries
-    sink = ResidentSeries(keep=0)
+    from live4d.algorithms.series_store import SeriesStore
+    sink = SeriesStore(keep=0)
     series = [(1, [0, 1, 2, 5, 6], (96, 96)), (2, list(range(4)), (96, 96))]
     run_series(series, batch_size=2, scan=(5, 1), service=True, pixels=series_pixels, encoder=sink)
     assert [d["series"] for d in sink.dropped] == ["series_1"]
@@ -746,8 +746,8 @@ def test_ans_encoder_drops_a_series_with_a_gap_and_keeps_the_next(capfd):
 def test_ans_encoder_finite_mode_completes_after_every_consumer(tmp_path, capfd):
     # Detector, writer and encoder all see END; the run completes after the last of them.
     pytest.importorskip("quantem.gpu.streaming")
-    from live4d.algorithms.ans_encoding import ResidentSeries
-    sink = ResidentSeries()
+    from live4d.algorithms.series_store import SeriesStore
+    sink = SeriesStore()
     run_series([(1, list(range(9)))], batch_size=4, pixels=series_pixels, encoder=sink,
                writer=dict(output_dir=str(tmp_path)))
     expected = np.stack([series_pixels(1, image_id, (96, 96)) for image_id in range(9)])

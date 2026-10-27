@@ -4,7 +4,7 @@ The encoding itself is quantem.gpu's `LiveEncoder`: flagged-pixel correction and
 `Dataset4dstemGPU` that `quantem.gpu.io.load` returns for the same counts. This module holds no
 Holoscan state; `processing.AnsEncoderOp` calls `SeriesEncoder` on the runtime's CUDA stream.
 
-What becomes of each series is the sink's:
+What becomes of each series is the sink's (`series_store.SeriesStore` by default):
 
     sink.begin(series_id, scan_shape, image_shape) -> LiveEncoder, or None to skip the series
     sink.complete(encoder) -> dict                     # after END; returns the series summary
@@ -108,37 +108,3 @@ class SeriesEncoder:
         self.log(f"[ans] series dropped: {reason}")
         self.sink.drop(encoder, reason)
 
-
-class ResidentSeries:
-    """The default sink: keep the latest `keep` encoded series on the GPU (0: all)."""
-
-    def __init__(self, device: int = 0, keep: int = 1, pixel_mask=None):
-        self.device, self.keep, self.pixel_mask = int(device), int(keep), pixel_mask
-        self.datasets, self.dropped = [], []
-
-    def begin(self, series_id, scan_shape, image_shape):
-        from quantem.gpu.streaming import LiveEncoder
-
-        mask = self.pixel_mask if self.pixel_mask is not None and tuple(self.pixel_mask.shape) == image_shape else None
-        return LiveEncoder(scan_shape, image_shape, pixel_mask=mask, device=f"cuda:{self.device}",
-                           metadata={"series": f"series_{series_id}"})
-
-    def complete(self, encoder) -> dict:
-        from quantem.gpu.streaming import IncompleteAcquisition
-
-        summary = dict(series=encoder.metadata["series"], images=encoder.received, total=encoder.total,
-                       encoded_bytes=int(encoder.source.nbytes),
-                       raw_bytes=encoder.received * math.prod(encoder.detector_shape) * 2)
-        try:
-            dataset = encoder.finish()
-        except IncompleteAcquisition as error:
-            self.drop(encoder, str(error))
-            return dict(summary, kept=False)
-        self.datasets.append(dataset)
-        while self.keep and len(self.datasets) > self.keep:
-            self.datasets.pop(0).close()
-        return dict(summary, kept=True)
-
-    def drop(self, encoder, reason: str) -> None:
-        self.dropped.append(dict(series=encoder.metadata.get("series"), reason=reason))
-        encoder.release()
