@@ -234,7 +234,7 @@ class Loopback:
 
 def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
                     stop_after_first_data=False, publication_window=0, release=None,
-                    sink_delay_s=0):
+                    sink_delay_s=0, session_control=None):
     import cupy as cp
     import holoscan as hs
     import numpy as np
@@ -293,11 +293,13 @@ def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
 
     graph = hs.Graph("rdma-source-loopback", default_clock=hs.RealtimeClock)
     source = RdmaRxOp(
-        graph, "rdma_rx", qp_handle=loopback.rx.native_handle,
+        graph, "rdma_rx", qp_handle=0 if session_control else loopback.rx.native_handle,
         ring_address=loopback.ring_address,
         ring_device_address=loopback.ring_device_address,
         ring_bytes=loopback.ring_bytes, ring_memory="host_mapped",
-        credit_address=loopback.credit_mr.address, credit_rkey=loopback.credit_mr.rkey,
+        credit_address=0 if session_control else loopback.credit_mr.address,
+        credit_rkey=0 if session_control else loopback.credit_mr.rkey,
+        session_handle=session_control.handle if session_control else 0,
         batch_size=batch_size, max_batch=max_batch, device=0,
         publication_window=publication_window,
     )
@@ -580,4 +582,107 @@ def test_failed_receive_completion_fails_the_graph():
             ), session.summary()
             assert "RDMA connection failed" in session.summary()
     finally:
+        loopback.close()
+
+
+def test_session_reconnect_reuses_ring_without_restarting_operator():
+    """Fresh QP/credit epochs over one ring; batch IDs and bounded publication persist."""
+    import holoscan as hs
+    from dectris.imagemux import RemoteRegion
+    from live4d.rdma_session import RdmaSession
+
+    loopback = Loopback(1 << 20)
+    control = RdmaSession()
+    window = BatchWindow(1)
+    original_ring = (loopback.ring_address, loopback.ring_mr.rkey)
+    try:
+        plan, records, ready, _, _ = _build_receiver(loopback, batch_size=2,
+            session_control=control, publication_window=window.handle,
+            release=window.release, sink_delay_s=0.01)
+        expected = []
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 20, "READY with no attached QP")
+            assert control.snapshot()["starts"] == 1
+            for index, (shape, count) in enumerate([((96, 96), 0), ((192, 192), 3), ((96, 96), 5)]):
+                if index:
+                    # Only after detach acknowledgment may either old QP be destroyed.
+                    loopback.rx.close()
+                    loopback.tx.close()
+                    loopback.credit[:] = 0
+                    loopback.rx = loopback.ctx.create_qp(recv_depth=64, send_depth=64, signal_every=1)
+                    loopback.tx = loopback.ctx.create_qp(recv_depth=1, send_depth=64, signal_every=1)
+                    loopback.rx.connect(loopback.tx.endpoint)
+                    loopback.tx.connect(loopback.rx.endpoint)
+                    assert loopback.rx.post_recvs(64) == 64
+                credit = RemoteRegion(loopback.credit_mr.address, 8, loopback.credit_mr.rkey)
+                generation = control.attach(loopback.rx, credit)
+                with pytest.raises(RuntimeError):
+                    control.attach(loopback.rx, credit)
+                with pytest.raises(RuntimeError):
+                    control.detach(generation)
+                _wait_until(session, lambda: control.snapshot()["attached"] == generation,
+                            20, "session attach")
+                with pytest.raises(RuntimeError):
+                    control.detach(generation - 1)
+                writer = RingWriter(loopback.ring_bytes)
+                _start(writer, 100 + index, count, shape)
+                if count:
+                    _image(writer, 100 + index, list(range(count)), list(range(20, 20+count)), shape)
+                    expected.extend([(list(range(i, min(i+2, count))),
+                                      list(range(20+i, 20+min(i+2, count))))
+                                     for i in range(0, count, 2)])
+                _end(writer, 100 + index)
+                sender, errors = _start_sender(loopback, writer.records)
+                _wait_until(session, lambda: control.snapshot()["drained"] == generation,
+                            20, "GPU reads and credit sends drained")
+                _join_sender(sender, errors, 20)
+                status = control.snapshot()
+                assert status["position"] == status["safe_credit"] == status["sent_credit"] == writer.position
+                assert status["series_id"] == 100 + index
+                assert loopback.rx.stats["writes_outstanding"] == 0
+                control.detach(generation)
+                _wait_until(session, lambda: control.snapshot()["detached"] == generation,
+                            20, "detach acknowledgment")
+                control.release_detached(generation)
+                _wait_until(session, lambda: sum(r["end"] for r in records) == index + 1,
+                            20, "downstream END")
+                assert not session.wait(timeout=0)
+                assert (loopback.ring_address, loopback.ring_mr.rkey) == original_ring
+            assert sum(r["pipeline_ready"] for r in records) == 1
+            assert [r["batch_id"] for r in records] == sorted({r["batch_id"] for r in records})
+            _assert_pixels(records, expected)
+            session.request_stop()
+            assert session.wait(timeout=10), session.summary()
+        assert control.snapshot()["starts"] == control.snapshot()["stops"] == 1
+    finally:
+        control.close()
+        window.close()
+        loopback.close()
+
+
+def test_session_geometry_failure_never_reports_drained():
+    import holoscan as hs
+    from dectris.imagemux import RemoteRegion
+    from live4d.rdma_session import RdmaSession
+
+    loopback = Loopback(1 << 20)
+    control = RdmaSession()
+    try:
+        plan, _, ready, _, _ = _build_receiver(loopback, batch_size=2, session_control=control)
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 20, "READY")
+            generation = control.attach(loopback.rx,
+                RemoteRegion(loopback.credit_mr.address, 8, loopback.credit_mr.rkey))
+            _wait_until(session, lambda: control.snapshot()["attached"] == generation, 20, "attach")
+            writer = RingWriter(loopback.ring_bytes)
+            _start(writer, 201, 1, (96, 96))
+            _image(writer, 201, [0], [7], (192, 192))
+            sender, errors = _start_sender(loopback, writer.records)
+            assert session.wait(timeout=20), "malformed IMAGE did not fail the source"
+            _join_sender(sender, errors, 20)
+            assert "RDMA image geometry does not match START" in session.summary()
+            assert control.snapshot()["drained"] == 0
+        assert control.snapshot()["state"] == "stopped"
+    finally:
+        control.close()
         loopback.close()

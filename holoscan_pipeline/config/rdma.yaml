@@ -2,6 +2,8 @@ transport: rdma
 batch_size: 512
 queue_depth: 4
 device: 0
+# Optional ordered CUDA ordinals; overrides device. Use [0] for the same path on one GPU.
+# devices: [0, 1]
 execute:
   mode: finite
   seconds: 0

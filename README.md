@@ -40,6 +40,12 @@ The writer does compete with the rest of the pipeline for other resources:
 Those runs were paced at 120,000 fps. They show that the pipeline sustains that rate with the
 writer enabled, not how much headroom the writer costs.
 
+Service mode can route consecutive acquisitions across an ordered `devices` list for
+both transports.
+One GPU and multiple GPUs use the same processing and connection management code.
+Repeated entries such as `devices: [0, 0]` create independent routing branches on one
+GPU for development and testing.
+
 ## Documentation
 
 - [Build, configure, run, and troubleshoot Live4D](docs/holoscan_basic_ingest.md)

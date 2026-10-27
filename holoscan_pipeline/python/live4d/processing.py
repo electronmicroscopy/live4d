@@ -86,13 +86,17 @@ class VirtualDetectorOp(hs.Operator):
     adf_inner = hs.Param(24.0)
     adf_outer = hs.Param(48.0)
 
-    def __init__(self, *, ready=None, finite=True, observer=None, release=None, completion=None):
+    def __init__(self, *, ready=None, finite=True, observer=None, release=None, completion=None,
+                 results=None, done=None, announce_ready=True):
         super().__init__()
         self.ready = ready
         self.finite = finite
         self.completion = completion
         self.observer = observer
         self.release = release
+        self.results = results
+        self.done = done
+        self.announce_ready = announce_ready
         self.last = None
 
     def setup(self, spec):
@@ -146,7 +150,8 @@ class VirtualDetectorOp(hs.Operator):
                 stream.synchronize()
                 del view
                 if self.ready is not None:
-                    print("[holoscan] ready", flush=True)
+                    if self.announce_ready:
+                        print("[holoscan] ready", flush=True)
                     self.ready.set()
                 if self.release is not None:
                     self.release(int(batch.batch_id))
@@ -217,27 +222,49 @@ class VirtualDetectorOp(hs.Operator):
                     received_images=self.received, announced_images=self.announced_images,
                     positions=self.placed, batches=self.batches, stage="processing"))
                 # Preserve float32 processing and report a float64 aggregate of the stored values.
-                totals = cp.asnumpy(self.image.sum(axis=(1, 2), dtype=cp.float64)).tolist()
+                totals = self.image.sum(axis=(1, 2), dtype=cp.float64)
+                if self.results is None:
+                    totals = cp.asnumpy(totals).tolist()
                 elapsed = (self.last_image - self.first) if self.first is not None else 0.0
                 result = dict(series_id=int(batch.series_id), images=self.received,
                               announced_images=self.announced_images,
                               positions=self.placed, scan_positions=self.series_scan.size,
                               gap_events=self.gaps, missing_images=self.missing, batches=self.batches,
-                              batch_sizes=self.batch_sizes, bf_sum=totals[0], adf_sum=totals[1],
+                              batch_sizes=self.batch_sizes,
                               device=self.device_id, processed_images=self.received,
                               processing_dtype="float32", totals_dtype="float64",
                               delivered_interval_s=elapsed,
                               delivered_fps=(self.received - self.first_batch_count) / elapsed
                               if elapsed and self.batches > 1 else None)
-                self.last = (batch.series_id, self.image, result)
-                positioned.result = result
-                _log_series("series-result", result)
-                if self.observer is not None:
-                    self.observer(batch, positioned)
-                self.series = self.image = None
-                self.announced_images = None
-                if self.finite and (self.completion is None or self.completion.arrive()):
-                    ctx.request_completion()
+                if self.results is None:
+                    result.update(bf_sum=totals[0], adf_sum=totals[1])
+                    self.last = (batch.series_id, self.image, result)
+                    positioned.result = result
+                    _log_series("series-result", result)
+                    if self.observer is not None:
+                        self.observer(batch, positioned)
+                    self.series = self.image = None
+                    self.announced_images = None
+                    if self.finite and (self.completion is None or self.completion.arrive()):
+                        ctx.request_completion()
+                else:
+                    image = self.image
+
+                    def finish(values):
+                        result.update(bf_sum=values[0], adf_sum=values[1])
+                        self.last = (batch.series_id, image, result)
+                        positioned.result = result
+                        _log_series("series-result", result)
+                        if self.observer is not None:
+                            self.observer(batch, positioned)
+                        if self.finite and (self.completion is None or self.completion.arrive()):
+                            self.done()
+
+                    # Completion owns totals, map, and callback until its CUDA event is done.
+                    # It must bound outstanding results and must not retain the runtime stream.
+                    self.results(totals, finish)
+                    self.series = self.image = None
+                    self.announced_images = None
             if self.release is not None:
                 self.release(int(batch.batch_id))
 

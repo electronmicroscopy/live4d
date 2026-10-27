@@ -287,9 +287,12 @@ Contract DecompressGpuOp::contract() const {
 }
 
 void DecompressGpuOp::start() {
+  device_ = static_cast<int>(params().device);
+  CUDA_CHECK(cudaSetDevice(device_));
   publication_window_ = ::dectris::access(params().publication_window);
   input_window_ = ::dectris::access(params().input_window);
   last_capture_ns_ = -1;
+  batch_id_ = 0;
   active_width_ = DETECTOR_WIDTH;
   active_height_ = DETECTOR_HEIGHT;
   active_series_id_ = 0;
@@ -305,9 +308,14 @@ void DecompressGpuOp::start() {
 expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
   try {
     if (context.cancellation().stop_requested()) return {};
+    CUDA_CHECK(cudaSetDevice(device_));
     HOLOSCAN_TRY(auto selected, input.selected_sample());
     const auto& batch = selected.data();
-    while (publication_window_ && !publication_window_->admits(batch.batch_id)) {
+    if (!batch.pipeline_ready && batch.destination != params().destination) {
+      if (input_window_) input_window_->release(batch.batch_id);
+      return {};  // Host tensor fanout only; no GPU allocation or copy here.
+    }
+    while (publication_window_ && !publication_window_->admits(batch_id_ + 1)) {
       if (context.cancellation().stop_requested()) return {};
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
@@ -389,7 +397,7 @@ expected<void, Error> DecompressGpuOp::compute(ExecutionContext& context) {
     }
     HOLOSCAN_TRY(std::move(writer).commit());
     DecodedBatch decoded;
-    decoded.batch_id = batch.batch_id;
+    decoded.batch_id = ++batch_id_;
     decoded.image_ids = batch.image_ids;
     decoded.end_of_series = batch.end_of_series;
     decoded.start_of_series = batch.start_of_series;
@@ -454,6 +462,8 @@ void DecompressGpuOp::allocate_gpu_resources() {
 }
 
 void DecompressGpuOp::free_gpu_resources() {
+  if (device_ < 0) return;  // A cold graph prototype has no CUDA resources.
+  cudaSetDevice(device_);
   stream_ = nullptr;  // Borrowed from ExecutionContext; never destroy it here.
 
   // Note: h_pinned_compressed_ is now owned by zmq_rx_operator, don't free it here

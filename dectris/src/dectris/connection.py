@@ -17,6 +17,54 @@ RECV_DEPTH = 1024  # RECEIVEs kept posted; must exceed the sender's in-flight fr
 SEND_DEPTH = 64  # credit writes in flight
 
 
+class RegisteredRing:
+    """A fixed-device ring whose registration survives individual queue pairs.
+
+    The context and all QPs referencing this ring must outlive GPU reads, and
+    must be closed before the ring. No connection operation reallocates it.
+    """
+
+    def __init__(self, context, gpu, ring_bytes, *, ring_memory="gpu"):
+        if ring_memory not in ("gpu", "host_mapped"):
+            raise ValueError("ring_memory must be 'gpu' or 'host_mapped'")
+        self.gpu, self.ring_memory = gpu, ring_memory
+        self.memory = self.mr = None
+        try:
+            with cp.cuda.Device(gpu):
+                if ring_memory == "host_mapped":
+                    self.memory = cp.cuda.PinnedMemory(ring_bytes, cp.cuda.runtime.hostAllocMapped)
+                    ctypes.memset(self.memory.ptr, 0, ring_bytes)
+                    self.device_address = mapped_device_pointer(self.memory.ptr, gpu)
+                else:
+                    self.memory = cp.cuda.Memory(ring_bytes)
+                    cp.cuda.runtime.memset(self.memory.ptr, 0, ring_bytes)
+                    self.device_address = self.memory.ptr
+                self.mr = context.register(self.memory.ptr, ring_bytes, remote_write=True)
+            self.region = RemoteRegion(self.mr.address, self.mr.length, self.mr.rkey)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.memory is not None:
+            with cp.cuda.Device(self.gpu):
+                cp.cuda.runtime.deviceSynchronize()
+                if self.mr is not None:
+                    self.mr.close()
+                    self.mr = None
+                self.memory = None
+
+
+def connect_qp(qp, peer):
+    """Connect and post receives before imagemux is allowed to write."""
+    e = peer.endpoint
+    qp.connect(imxrdma.Endpoint(e.qp_num, e.psn, e.lid, e.mtu, e.gid))
+    posted = qp.post_recvs(RECV_DEPTH)
+    if posted != RECV_DEPTH:
+        raise RuntimeError(f"posted {posted}/{RECV_DEPTH} RECEIVEs")
+    return qp
+
+
 class VerbsConn:
     """An RC queue pair and a ring registered for imagemux's writes.
 
@@ -31,23 +79,15 @@ class VerbsConn:
         if ring_memory not in ("gpu", "host_mapped"):
             raise ValueError("ring_memory must be 'gpu' or 'host_mapped'")
         self.gpu, self.ring_memory = gpu, ring_memory
-        self.ctx = self.ring_mem = self.ring_mr = self.qp = None
+        self.ctx = self.ring_mem = self.ring_mr = self.qp = self._ring = None
         try:
             self.ctx = imxrdma.Context(local_addr=local_addr, device=device)
-            with cp.cuda.Device(gpu):
-                if ring_memory == "host_mapped":
-                    self.ring_mem = cp.cuda.PinnedMemory(ring_bytes, cp.cuda.runtime.hostAllocMapped)
-                    ctypes.memset(self.ring_mem.ptr, 0, ring_bytes)
-                    self.ring_device_address = mapped_device_pointer(self.ring_mem.ptr, gpu)
-                else:
-                    self.ring_mem = cp.cuda.Memory(ring_bytes)
-                    cp.cuda.runtime.memset(self.ring_mem.ptr, 0, ring_bytes)
-                    self.ring_device_address = self.ring_mem.ptr
-            self.ring_mr = self.ctx.register(self.ring_mem.ptr, ring_bytes, remote_write=True)
+            self._ring = RegisteredRing(self.ctx, gpu, ring_bytes, ring_memory=ring_memory)
+            self.ring_mem, self.ring_mr = self._ring.memory, self._ring.mr
+            self.ring_device_address, self.ring = self._ring.device_address, self._ring.region
             self.qp = self.ctx.create_qp(recv_depth=RECV_DEPTH, send_depth=SEND_DEPTH)
             e = self.qp.endpoint
             self.endpoint = QpEndpoint(e.qp_num, e.psn, e.lid, e.mtu, e.gid)
-            self.ring = RemoteRegion(self.ring_mr.address, self.ring_mr.length, self.ring_mr.rkey)
         except Exception:
             self.close()
             raise
@@ -55,24 +95,17 @@ class VerbsConn:
     def connect(self, peer: Peer):
         """Connect the queue pair to imagemux's endpoint, then post RECV_DEPTH zero-length
         RECEIVEs. Called before Ready is sent, so frames may arrive as soon as it returns."""
-        e = peer.endpoint
-        self.qp.connect(imxrdma.Endpoint(e.qp_num, e.psn, e.lid, e.mtu, e.gid))
-        posted = self.qp.post_recvs(RECV_DEPTH)
-        if posted != RECV_DEPTH:
-            raise RuntimeError(f"posted {posted}/{RECV_DEPTH} RECEIVEs")
-        return self.qp
+        return connect_qp(self.qp, peer)
 
     def close(self):
         """Stop NIC writes, finish GPU reads, then deregister and release the ring."""
         if self.qp is not None:
             self.qp.close()
             self.qp = None
-        if self.ring_mem is not None and self.ring_memory == "host_mapped":
-            with cp.cuda.Device(self.gpu):
-                cp.cuda.runtime.deviceSynchronize()
-        if self.ring_mr is not None:
-            self.ring_mr.close()
-            self.ring_mr = None
+        if self._ring is not None:
+            self._ring.close()
+            self._ring = None
+        self.ring_mr = None
         self.ring_mem = None
         self.ctx = None
 

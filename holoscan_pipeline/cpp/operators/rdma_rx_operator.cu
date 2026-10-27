@@ -110,8 +110,10 @@ Contract RdmaRxOp::contract() const {
 
 void RdmaRxOp::start() {
   const auto& config = params();
-  if (config.qp_handle == 0 || config.ring_address == 0 || config.ring_device_address == 0 ||
-      config.credit_address == 0 || config.ring_bytes < 2 * kFrameAlign ||
+  if ((!config.session_handle && (!config.qp_handle || !config.credit_address)) ||
+      (config.session_handle && (config.qp_handle || config.credit_address || config.credit_rkey)) ||
+      config.ring_address == 0 || config.ring_device_address == 0 ||
+      config.ring_bytes < 2 * kFrameAlign ||
       config.ring_bytes % kFrameAlign != 0 || config.ring_address % kFrameAlign != 0 ||
       config.credit_rkey > std::numeric_limits<uint32_t>::max() ||
       (config.ring_memory != "gpu" && config.ring_memory != "host_mapped") ||
@@ -121,6 +123,8 @@ void RdmaRxOp::start() {
   }
 
   qp_ = reinterpret_cast<imx_qp*>(static_cast<uintptr_t>(config.qp_handle));
+  session_ = reinterpret_cast<::dectris::RdmaSession*>(
+      static_cast<uintptr_t>(config.session_handle));
   publication_window_ = ::dectris::access(config.publication_window);
   ring_address_ = config.ring_address;
   ring_device_address_ = config.ring_device_address;
@@ -188,10 +192,13 @@ void RdmaRxOp::start() {
   pending_immediates_.clear();
   pending_credits_.clear();
   frame_.reset();
+  session_generation_ = 0;
+  session_end_emitted_ = false;
+  if (session_) session_->started();
 }
 
 expected<void, Error> RdmaRxOp::compute(ExecutionContext& context) {
-  if (!qp_) {
+  if (!qp_ && !session_) {
     return make_unexpected(make_error(ErrorCode::kFailure,
                                       "Invalid RDMA receiver configuration"));
   }
@@ -203,6 +210,15 @@ expected<void, Error> RdmaRxOp::compute(ExecutionContext& context) {
   }
 
   if (context.cancellation().stop_requested()) return {};
+  if (session_) {
+    HOLOSCAN_TRY(session_control());
+    if (!ready_emitted_) {
+      if (publication_window_ && !publication_window_->admits(next_batch_id_ + 1)) return {};
+      return emit_control(context, ControlKind::kReady);
+    }
+    if (!qp_) return {};  // Both branches can stay warm without an attached transport.
+    if (session_end_emitted_) return drain_session();
+  }
   HOLOSCAN_TRY(poll_credits());
   HOLOSCAN_TRY(retry_credit_write());
   if (publication_window_ && !publication_window_->admits(next_batch_id_ + 1)) return {};
@@ -718,10 +734,63 @@ expected<void, Error> RdmaRxOp::emit_control(ExecutionContext& context, ControlK
   if (!emitted) return make_unexpected(std::move(emitted).error());
   published = true;
   if (kind == ControlKind::kReady) ready_emitted_ = true;
+  if (kind == ControlKind::kEnd && session_) session_end_emitted_ = true;
   if (kind == ControlKind::kStart) pending_start_metadata_.clear();
   pending_control_ = ControlKind::kNone;
   pending_control_series_id_ = 0;
   pending_control_images_ = 0;
+  return {};
+}
+
+void RdmaRxOp::reset_connection_state() {
+  next_sequence_ = reader_position_ = safe_credit_position_ = sent_credit_position_ = 0;
+  active_series_id_ = active_series_images_ = 0;
+  recv_deficit_ = 0;
+  active_series_ = session_end_emitted_ = false;
+  pending_control_ = ControlKind::kNone;
+  pending_control_series_id_ = pending_control_images_ = 0;
+  pending_start_metadata_.clear();
+  pending_immediates_.clear();
+  pending_credits_.clear();
+  frame_.reset();
+  // Batch IDs, capture timestamps, publication windows, READY, and tensor pools persist.
+}
+
+expected<void, Error> RdmaRxOp::session_control() {
+  const auto command = session_->take_command();
+  if (command.kind == ::dectris::RdmaSession::CommandKind::kAttach) {
+    if (qp_) return make_unexpected(make_error(ErrorCode::kFailure, "RDMA session already attached"));
+    reset_connection_state();
+    qp_ = reinterpret_cast<imx_qp*>(static_cast<uintptr_t>(command.qp));
+    credit_address_ = command.credit_address;
+    credit_rkey_ = command.credit_rkey;
+    session_generation_ = command.generation;
+    session_->attached(session_generation_, next_batch_id_);
+  } else if (command.kind == ::dectris::RdmaSession::CommandKind::kDetach) {
+    if (!qp_ || command.generation != session_generation_ || !session_end_emitted_)
+      return make_unexpected(make_error(ErrorCode::kFailure, "Invalid RDMA session detach"));
+    qp_ = nullptr;  // No callback may access the old QP after publishing this acknowledgment.
+    reset_connection_state();
+    session_->detached(session_generation_);
+  }
+  return {};
+}
+
+expected<void, Error> RdmaRxOp::drain_session() {
+  HOLOSCAN_TRY(poll_completions());
+  if (!pending_immediates_.empty() || frame_ || active_series_)
+    return make_unexpected(make_error(ErrorCode::kProtocolError,
+                                      "Unexpected data after RDMA session END"));
+  HOLOSCAN_TRY(poll_credits());
+  HOLOSCAN_TRY(retry_credit_write());
+  imx_stats stats{};
+  imx_qp_stats_get(qp_, &stats);
+  // Controlled QPs signal every credit write, allowing an idle queue to prove its drain.
+  if (pending_credits_.empty() && sent_credit_position_ == reader_position_ &&
+      stats.writes_outstanding == 0 && recv_deficit_ == 0) {
+    session_->drained(session_generation_, active_series_id_, next_batch_id_, reader_position_,
+                       safe_credit_position_, sent_credit_position_);
+  }
   return {};
 }
 
@@ -732,6 +801,10 @@ void RdmaRxOp::stop() {
   }
   clear_state();
   qp_ = nullptr;
+  if (session_) {
+    session_->stopped();
+    session_ = nullptr;
+  }
 }
 
 void RdmaRxOp::clear_state() noexcept {

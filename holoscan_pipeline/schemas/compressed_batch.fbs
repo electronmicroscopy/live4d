@@ -12,6 +12,7 @@ table CompressedBatch {
   start_metadata: [ubyte] (id: 8);
   series_images: ulong (id: 9);
   pipeline_ready: bool (id: 10);
+  destination: uint (id: 11);
 }
 root_type CompressedBatch;
 file_identifier "DCBZ";

@@ -187,6 +187,7 @@ class MockImagemux:
         self.hello = None
         self.ready = False
         self.hang_up = hang_up_after_handshake
+        self.receiver_closed = threading.Event()
         self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
@@ -202,6 +203,7 @@ class MockImagemux:
             self.ready = True
             if not self.hang_up:
                 conn.recv(1)  # stay connected until the receiver closes
+                self.receiver_closed.set()
 
 
 class HandshakeTest(unittest.TestCase):
@@ -235,6 +237,21 @@ class HandshakeTest(unittest.TestCase):
         self.assertTrue(link.liveness.wait_dead(2))
         self.assertFalse(link.liveness.alive)
         link.close()
+
+    def test_local_close_wakes_liveness_and_is_idempotent(self):
+        imagemux = MockImagemux()
+        link = self.connector(imagemux).connect()
+        imagemux.thread.join(0.5)
+        link.close()
+        self.assertTrue(link.liveness.wait_dead(2))
+        link.close()
+
+    def test_local_close_hangs_up_on_imagemux_at_once(self):
+        imagemux = MockImagemux()
+        link = self.connector(imagemux).connect()
+        imagemux.thread.join(0.5)
+        link.close()
+        self.assertTrue(imagemux.receiver_closed.wait(2))
 
     def test_imagemux_closing_after_the_hello_is_explained(self):
         server = socket.socket()

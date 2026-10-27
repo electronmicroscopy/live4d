@@ -42,7 +42,19 @@ void ZmqRxOp::start() {
   active_image_bytes_ = dectris::kDetectorPixels * sizeof(uint16_t);
   active_width_ = static_cast<uint32_t>(dectris::kDetectorWidth);
   active_height_ = static_cast<uint32_t>(dectris::kDetectorHeight);
-  batch_id_ = 0;
+  batch_id_ = acquisition_ = 0;
+  publication_windows_.clear();
+  acquisition_windows_.clear();
+  for (auto handle : params().publication_windows) {
+    if (!handle) throw std::runtime_error("ZmqRxOp: null publication window");
+    publication_windows_.push_back(::dectris::access(handle));
+  }
+  for (auto handle : params().acquisition_windows) {
+    if (!handle) throw std::runtime_error("ZmqRxOp: null acquisition window");
+    acquisition_windows_.push_back(::dectris::access(handle));
+  }
+  if (!acquisition_windows_.empty() && acquisition_windows_.size() != publication_windows_.size())
+    throw std::runtime_error("ZmqRxOp: destination window counts disagree");
   metadata_ = {};
   metadata_.image_ids.reserve(dectris::kMaxBatchSize);
   metadata_.sizes.reserve(dectris::kMaxBatchSize);
@@ -64,6 +76,10 @@ void ZmqRxOp::start() {
 expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
   if (context.cancellation().stop_requested()) return {};
   if (publication_window_ && !publication_window_->admits(batch_id_ + 1)) return {};
+  // Every fanout consumer has its own credit. An inactive decoder cannot
+  // release the selected decoder's pinned input storage or queue capacity.
+  for (const auto* window : publication_windows_)
+    if (!window->admits(batch_id_ + 1)) return {};
   if (!ready_) {
     ready_ = true;
     return emit_batch(false, false, true);
@@ -72,6 +88,13 @@ expected<void, Error> ZmqRxOp::compute(ExecutionContext& context) {
     pending_end_ = false;
     active_ = false;
     return emit_batch(false, true);
+  }
+  if (!active_ && params().acquisition_limit && acquisition_ >= params().acquisition_limit)
+    return {};  // Finite mode admits its first acquisition in input order.
+  if (!active_ && !acquisition_windows_.empty()) {
+    const auto destination = acquisition_ % acquisition_windows_.size();
+    if (!acquisition_windows_[destination]->admits(acquisition_ / acquisition_windows_.size() + 1))
+      return {};  // Leave the next START on the socket until this GPU completes.
   }
   const auto target = static_cast<size_t>(context.params<ZmqRxParams>().batch_size);
   // Bound control/unknown messages too, so idle and cancellation stay responsive.
@@ -141,11 +164,13 @@ expected<void, Error> ZmqRxOp::emit_batch(bool start, bool end, bool ready) {
     if (!staging_.empty()) std::memcpy(writer.data(), staging_.data(), staging_.size());
   }));
   metadata_.batch_id = ++batch_id_;
+  metadata_.destination = acquisition_windows_.empty() ? 0 : acquisition_ % acquisition_windows_.size();
   metadata_.start_of_series = start;
   metadata_.end_of_series = end;
   metadata_.pipeline_ready = ready;
   metadata_.series_images = series_images_;
   HOLOSCAN_TRY(output.emit_tensor(std::move(loan), metadata_));
+  if (end) ++acquisition_;
   staging_.clear();
   metadata_.image_ids.clear();
   metadata_.sizes.clear();

@@ -18,6 +18,7 @@
 #include "batch_window.hpp"
 #include "imxrx.h"
 #include "pipeline_types.hpp"
+#include "rdma_session.hpp"
 
 namespace holoscan::ops {
 
@@ -30,13 +31,14 @@ struct RdmaRxParams {
   uint64_t credit_address{};
   uint64_t credit_rkey{};
   uint64_t publication_window{};
+  uint64_t session_handle{};
   int64_t batch_size{128};
   int64_t max_batch{512};
   int64_t device{};
 };
 
 HOLOSCAN_PARAM_SCHEMA(
-    RdmaRxParams, holoscan::param_schema("holoscan.dectris.RdmaRxParams", 1),
+    RdmaRxParams, holoscan::param_schema("holoscan.dectris.RdmaRxParams", 2),
     holoscan::field<&RdmaRxParams::qp_handle>("qp_handle"),
     holoscan::field<&RdmaRxParams::ring_address>("ring_address"),
     holoscan::field<&RdmaRxParams::ring_device_address>("ring_device_address"),
@@ -45,6 +47,7 @@ HOLOSCAN_PARAM_SCHEMA(
     holoscan::field<&RdmaRxParams::credit_address>("credit_address"),
     holoscan::field<&RdmaRxParams::credit_rkey>("credit_rkey"),
     holoscan::field<&RdmaRxParams::publication_window>("publication_window"),
+    holoscan::field<&RdmaRxParams::session_handle>("session_handle"),
     holoscan::field<&RdmaRxParams::batch_size>("batch_size").range(int64_t{1}, int64_t{1000}),
     holoscan::field<&RdmaRxParams::max_batch>("max_batch").range(int64_t{1}, int64_t{1024}),
     holoscan::field<&RdmaRxParams::device>("device").range(int64_t{0}, INT64_MAX));
@@ -103,9 +106,15 @@ class RdmaRxOp final : public Operator<RdmaRxParams> {
   expected<void, Error> record_credit(uint64_t position,
                                       const std::shared_ptr<CudaEvent>& event = {});
   expected<void, Error> flush_gpudirect_writes();
+  expected<void, Error> session_control();
+  expected<void, Error> drain_session();
+  void reset_connection_state();
   void clear_state() noexcept;
 
   imx_qp* qp_{};  // Borrowed from the Python QueuePair owner.
+  ::dectris::RdmaSession* session_{};  // Owner outlives the runtime session.
+  uint64_t session_generation_{};
+  bool session_end_emitted_{};
   uint64_t ring_address_{};
   uint64_t ring_device_address_{};
   size_t ring_bytes_{};

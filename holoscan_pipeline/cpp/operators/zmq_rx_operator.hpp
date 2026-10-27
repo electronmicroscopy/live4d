@@ -17,12 +17,18 @@ struct ZmqRxParams {
   std::string endpoint{dectris::kDefaultZmqEndpoint};
   int64_t batch_size{static_cast<int64_t>(dectris::kMaxBatchSize)};
   uint64_t publication_window{};
+  std::vector<uint64_t> publication_windows{};
+  std::vector<uint64_t> acquisition_windows{};
+  uint64_t acquisition_limit{};
 };
 HOLOSCAN_PARAM_SCHEMA(
-    ZmqRxParams, holoscan::param_schema("holoscan.dectris.ZmqRxParams", 1),
+    ZmqRxParams, holoscan::param_schema("holoscan.dectris.ZmqRxParams", 2),
     holoscan::field<&ZmqRxParams::endpoint>("endpoint"),
     holoscan::field<&ZmqRxParams::batch_size>("batch_size").range(int64_t{1}, int64_t{1000}),
-    holoscan::field<&ZmqRxParams::publication_window>("publication_window"));
+    holoscan::field<&ZmqRxParams::publication_window>("publication_window"),
+    holoscan::field<&ZmqRxParams::publication_windows>("publication_windows"),
+    holoscan::field<&ZmqRxParams::acquisition_windows>("acquisition_windows"),
+    holoscan::field<&ZmqRxParams::acquisition_limit>("acquisition_limit"));
 
 class ZmqRxOp final : public Operator<ZmqRxParams> {
  public:
@@ -50,6 +56,8 @@ class ZmqRxOp final : public Operator<ZmqRxParams> {
   std::vector<uint8_t> staging_;
   CompressedBatch metadata_;
   uint64_t batch_id_ = 0;
+  uint64_t acquisition_ = 0;
+  std::vector<::dectris::BatchWindow*> publication_windows_, acquisition_windows_;
   ::dectris::BatchWindow* publication_window_{};
 };
 }  // namespace holoscan::ops

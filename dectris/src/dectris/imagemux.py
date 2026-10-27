@@ -474,4 +474,12 @@ class TcpConnector:
         except BaseException:
             sock.close()
             raise
-        return Link(conn, peer, Liveness(sock), sock.close)
+        def close():
+            # Wake the liveness thread's blocking recv before closing the socket.
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
+        return Link(conn, peer, Liveness(sock), close)

@@ -27,11 +27,13 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../dectris/native ${CMAKE_BINARY_DI
 set(PYTHON_BUILD_DIR ${CMAKE_BINARY_DIR}/python)
 foreach(schema IN ITEMS compressed_batch decoded_batch)
   # START metadata is at most 16 KiB; image IDs need at most 8 KiB in a separate message.
-  # Keep the decoded descriptor envelope below the channel's inline payload bound.
+  # Keep both descriptor envelopes below the channel's inline payload bound.
+  # Compressed batches carry three 1000-entry uint64 vectors (24 KiB maximum);
+  # START metadata occupies a separate, empty-image message.
   if(schema STREQUAL "decoded_batch")
     set(SCHEMA_METADATA_CAPACITY 24576)
   else()
-    set(SCHEMA_METADATA_CAPACITY 32768)
+    set(SCHEMA_METADATA_CAPACITY 28672)
   endif()
   holoscan_add_flatbuffer_schema(
     TARGET ${schema}_schema SCHEMA schemas/${schema}.fbs
@@ -40,7 +42,8 @@ foreach(schema IN ITEMS compressed_batch decoded_batch)
 endforeach()
 add_library(dectris_holoscan_ops SHARED
   cpp/bindings/dectris_holoscan_ops.cpp
-  cpp/common/fast_cbor_parse.c cpp/common/batch_window.cpp cpp/common/bitshuffle_kernel_gpu.cu
+  cpp/common/fast_cbor_parse.c cpp/common/batch_window.cpp cpp/common/rdma_session.cpp
+  cpp/common/bitshuffle_kernel_gpu.cu
   cpp/common/cbor_value.cpp cpp/common/nxmx_writer.cpp
   cpp/operators/zmq_rx_operator.cu cpp/operators/decompress_gpu_operator.cu
   cpp/operators/rdma_rx_operator.cu cpp/operators/h5_writer_operator.cu)
