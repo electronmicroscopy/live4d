@@ -12,6 +12,7 @@ _library = ctypes.CDLL(str(Path(__file__).with_name("libdectris_holoscan_ops.so"
 ZmqRxOp = hs.registry.resolve("holoscan.dectris.ZmqRxOp")
 DecompressGpuOp = hs.registry.resolve("holoscan.dectris.DecompressGpuOp")
 RdmaRxOp = hs.registry.resolve("holoscan.dectris.RdmaRxOp")
+RdmaRingsRxOp = hs.registry.resolve("holoscan.dectris.RdmaRingsRxOp")
 H5WriterOp = hs.registry.resolve("holoscan.dectris.H5WriterOp")
 
 _library.dectris_batch_window_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32]

@@ -57,6 +57,10 @@ Copy either `holoscan_pipeline/config/basic_ingest.yaml` or
 The RDMA example uses documentation-only addresses; replace them with reachable addresses
 on the sender and receiver RoCE interfaces.
 
+`holoscan_pipeline/config/rdma_rings.yaml` is the protocol 3 example: four 64 MiB rings for an
+imagemux that distributes series over several receiver rings. See
+[Multiple RDMA rings](#multiple-rdma-rings).
+
 `holoscan_pipeline/config/buffle_rdma.yaml` configures the live Spark-to-Buffle link:
 sender `10.10.10.2:31003` on Spark's `enp1s0f0np0`, receiver `10.10.10.1` on Buffle's
 `enp185s0f0np0` / `mlx5_0`, a 64 MiB mapped-host ring, and a 1000×1000 raster in service
@@ -146,8 +150,10 @@ Transport settings have separate meanings:
 | `batch_size` | Images in each downstream GPU batch, for either transport |
 | `rdma.max_batch` | Maximum RDMA completions collected in one poll, from 1 to 1024 |
 | Sender `rdma_batch_size` | Images packed into one transmitted RDMA frame; configured on the sender |
-| `rdma.ring_mib` | Registered ingress ring capacity, independent of the tensor pool |
+| `rdma.ring_mib` | Registered capacity of each ingress ring, independent of the tensor pool |
 | `rdma.ring_memory` | `gpu` for GPUDirect RDMA or `host_mapped` for mapped pinned host memory |
+| `rdma.protocol` | imagemux RDMA protocol: `2` (default, one ring) or `3` (one or more rings) |
+| `rdma.rings` | Protocol 3 ring count, from 1 to 256; default 1. Protocol 2 requires 1 |
 | `zmq.endpoint` | Stream2 ZMQ PUSH endpoint consumed by the receiver's PULL socket |
 | `rdma.remote_address` | Sender's imagemux TCP handshake address, including port |
 | `rdma.local_address`, `rdma.device` | Receiver RoCE address and optional verbs device name |
@@ -183,6 +189,31 @@ switching to binned images does not shrink the pool allocation.
 The two float32 scan maps use `8 * width * height` bytes of the series' raster, before temporary
 arrays, retained prior-series results, runtime tensors, and decoder scratch. The RDMA
 ring is additional storage. Scan size, batch size, and queue depth affect memory demand.
+
+## Multiple RDMA rings
+
+imagemux protocol 3 lets the receiver register several rings. imagemux writes each series into
+one ring and moves to the next ring, round robin, when the series ID changes; the first series
+of a connection goes to ring 0. Each ring has its own positions, sequence numbers, and credit
+word. While the receiver still holds one series' ring bytes, imagemux can write the next series
+into the next ring. Protocol 2 imagemux builds accept only `rdma.protocol: 2`, and protocol 3
+builds accept only `rdma.protocol: 3`, including with one ring.
+
+`rdma.protocol: 3` selects the `RdmaRingsRxOp` source instead of `RdmaRxOp`. The receiver
+allocates `rdma.rings * rdma.ring_mib` MiB as one registered GPU or mapped-host region and
+advertises ring i at offset `i * ring_mib` MiB. Every ring must hold the largest frame: a frame
+larger than its ring is dropped by imagemux. Downstream messages, batching, readiness, and
+tensor ownership are the same as with protocol 2.
+
+The source processes one series at a time, in the sender's order. It reads only the ring of the
+active series and queues the completions announced for other rings until END advances it to the
+next ring. Credits are returned per ring with the same GPU-read ordering as protocol 2. Receive
+completions arrive in write order. If the active ring has no queued frames while another ring
+has frames, the sender dropped the rest of the active series, for example its END after a ring
+stayed full for longer than imagemux's send timeout. The source then fails with
+`Invalid RDMA stream: ring N received a frame before ...` instead of waiting indefinitely.
+An immediate that names a ring beyond `rdma.rings`, or a header whose ring, sequence, or
+position does not match, also fails the run.
 
 ## HDF5 output
 
@@ -480,7 +511,7 @@ or independently validate BF/ADF sums. `--report` can save its JSON to a writabl
 | Symptom | Check |
 | --- | --- |
 | Docker cannot map `/dev/infiniband` | For ZMQ, remove the device argument or Compose device entry. For RDMA, verify host verbs devices first. |
-| RDMA fails before readiness | Verify the sender handshake service, remote host/port, receiver RoCE address/device, locked-memory limit, and ring registration support. `host_mapped` is an alternative when GPU registration is unavailable. |
+| RDMA fails before readiness | Verify the sender handshake service, remote host/port, receiver RoCE address/device, locked-memory limit, and ring registration support. `host_mapped` is an alternative when GPU registration is unavailable. If imagemux closes the connection after the Hello, check that `rdma.protocol` matches the imagemux build. |
 | Ready, but no series result | Confirm sender transport/compression and endpoint, trigger acquisition after readiness, and check that the sender emits END. `seconds: 0` allows an indefinite wait. |
 | Unsupported image or START error | Both routes require 96×96 or 192×192 uint16 images matching START metadata; ZMQ additionally requires BSLZ4. START metadata must fit within 16 KiB. |
 | Fewer placed images than received | Check the series' `scan_width * scan_height` against image IDs; out-of-scan IDs are intentionally excluded from maps. |

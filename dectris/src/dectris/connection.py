@@ -10,7 +10,7 @@ import cupy as cp
 
 from . import imxrdma
 from .dispatch import mapped_device_pointer
-from .imagemux import Link, Peer, QpEndpoint, RemoteRegion
+from .imagemux import FRAME_ALIGN, MAX_RINGS, Link, Peer, QpEndpoint, RemoteRegion
 
 DRAIN_S = 1.0  # time to process what is still in the ring when imagemux closes the handshake socket
 RECV_DEPTH = 1024  # RECEIVEs kept posted; must exceed the sender's in-flight frame limit
@@ -66,19 +66,25 @@ def connect_qp(qp, peer):
 
 
 class VerbsConn:
-    """An RC queue pair and a ring registered for imagemux's writes.
+    """An RC queue pair and rings registered for imagemux's writes.
 
-    ``gpu`` selects the GPU that processes the images. ``ring_memory='gpu'`` allocates its
-    ring with cudaMalloc and requires GPUDirect RDMA support. ``'host_mapped'`` registers
-    pinned host memory instead; ``ring_device_address`` is its CUDA alias. ``ring`` always
-    describes the address registered with verbs and advertised to imagemux.
+    ``gpu`` selects the GPU that processes the images. ``ring_memory='gpu'`` allocates the
+    rings with cudaMalloc and requires GPUDirect RDMA support. ``'host_mapped'`` registers
+    pinned host memory instead; ``ring_device_address`` is its CUDA alias. ``rings`` equal
+    rings of ``ring_bytes`` each (protocol 3) share one registration, ring i at offset
+    ``i * ring_bytes``. ``ring`` describes the whole registered region and ``rings`` each
+    ring advertised to imagemux; with one ring both are the same.
     """
 
     def __init__(self, local_addr: str, gpu: int, ring_bytes: int, device: str | None = None,
-                 *, ring_memory: str = "gpu"):
+                 *, ring_memory: str = "gpu", rings: int = 1):
         if ring_memory not in ("gpu", "host_mapped"):
             raise ValueError("ring_memory must be 'gpu' or 'host_mapped'")
+        if not 1 <= rings <= MAX_RINGS or ring_bytes % FRAME_ALIGN:
+            raise ValueError(f"need 1 to {MAX_RINGS} rings of a multiple of {FRAME_ALIGN} bytes")
         self.gpu, self.ring_memory = gpu, ring_memory
+        self.ring_bytes, self.ring_count = ring_bytes, rings
+        ring_bytes *= rings
         self.ctx = self.ring_mem = self.ring_mr = self.qp = self._ring = None
         try:
             self.ctx = imxrdma.Context(local_addr=local_addr, device=device)
@@ -88,6 +94,8 @@ class VerbsConn:
             self.qp = self.ctx.create_qp(recv_depth=RECV_DEPTH, send_depth=SEND_DEPTH)
             e = self.qp.endpoint
             self.endpoint = QpEndpoint(e.qp_num, e.psn, e.lid, e.mtu, e.gid)
+            self.rings = tuple(RemoteRegion(self.ring.addr + i * self.ring_bytes, self.ring_bytes,
+                                            self.ring.rkey) for i in range(rings))
         except Exception:
             self.close()
             raise

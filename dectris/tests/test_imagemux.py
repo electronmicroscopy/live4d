@@ -9,10 +9,11 @@ import unittest
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from dectris.imagemux import (  # noqa: E402
-    ACCEPT_LEN, FRAME_HEADER_LEN, HELLO_LEN, READY_LEN, PROTOCOL_VERSION, Accept, Compression,
-    CreditTracker, DataType, QpEndpoint, FrameHeader, FrameKind, FrameReader, Hello, ImageHeader,
-    ImagemuxCodec, LocalInfo, RemoteRegion, TcpConnector, HandshakeError, _read_exact,
-    decode_ready, encode_ready, frame_span, padded)
+    ACCEPT_LEN, FRAME_HEADER_LEN, HELLO_LEN, MAX_RINGS, READY_LEN, PROTOCOL_VERSION, Accept,
+    Compression, CreditTracker, DataType, QpEndpoint, FrameHeader, FrameKind, FrameReader, Hello,
+    ImageHeader, ImagemuxCodec, LocalInfo, MultiRingHello, RemoteRegion, TcpConnector,
+    HandshakeError, _read_exact, decode_ready, encode_ready, frame_span, immediate, padded,
+    split_immediate)
 
 ENDPOINT = QpEndpoint(0x1234, 0xABCDEF, 7, 5, bytes([0] * 10 + [0xFF, 0xFF, 10, 0, 0, 1]))
 
@@ -20,10 +21,11 @@ ENDPOINT = QpEndpoint(0x1234, 0xABCDEF, 7, 5, bytes([0] * 10 + [0xFF, 0xFF, 10, 
 class RingWriter:
     """Writes frames into a bytearray ring the way imagemux does."""
 
-    def __init__(self, ring_len):
+    def __init__(self, ring_len, version=PROTOCOL_VERSION, ring=0):
         self.ring = bytearray(ring_len)
         self.position = 0
         self.sequence = 0
+        self.version, self.index = version, ring
 
     def write(self, kind, data=b"", **kw):
         offset = self.position % len(self.ring)
@@ -31,7 +33,8 @@ class RingWriter:
         if kind != FrameKind.WRAP and offset + span > len(self.ring):
             self.write(FrameKind.WRAP)
             offset = 0
-        header = FrameHeader(kind, self.sequence, self.position, len(data), **kw)
+        header = FrameHeader(kind, self.sequence, self.position, len(data), **kw,
+                             ring=self.index, version=self.version)
         self.ring[offset:offset + FRAME_HEADER_LEN] = header.encode()
         self.ring[offset + FRAME_HEADER_LEN:offset + FRAME_HEADER_LEN + len(data)] = data
         self.position += len(self.ring) - offset if kind == FrameKind.WRAP else span
@@ -135,6 +138,111 @@ class ReaderTest(unittest.TestCase):
         w = RingWriter(1024)
         with self.assertRaises(HandshakeError):  # nothing written at the position yet
             FrameReader(1024).next(w.ring, 0)
+
+
+def _u(buf, offset, size):
+    return int.from_bytes(buf[offset:offset + size], "little")
+
+
+class MultiRingWireTest(unittest.TestCase):
+    """Protocol 3 layouts at the offsets documented in imagemux's docs/bstream.rst."""
+
+    def test_hello_layout(self):
+        buf = MultiRingHello(ENDPOINT, (RemoteRegion(0x0100, 0x0280, 0x0303),)).encode()
+        self.assertEqual((len(buf), buf[:4]), (HELLO_LEN + 24, b"IMXR"))
+        self.assertEqual([_u(buf, 4, 2), _u(buf, 8, 4), _u(buf, 36, 2)], [3, 0x1234, 1])
+        self.assertEqual([_u(buf, 64, 8), _u(buf, 72, 8), _u(buf, 80, 4), _u(buf, 84, 4)],
+                         [0x0100, 0x0280, 0x0303, 0])
+        self.assertEqual(set(buf[38:64]), {0})
+
+    def test_hello_roundtrip_with_rings_of_different_lengths(self):
+        rings = (RemoteRegion(0x7F00_0000_0000, 1 << 30, 0xDEADBEEF),
+                 RemoteRegion(0x7F80_0000_0000, 1 << 20, 0x1234))
+        buf = MultiRingHello(ENDPOINT, rings).encode()
+        self.assertEqual(MultiRingHello.encoded_len(buf[:HELLO_LEN]), len(buf))
+        self.assertEqual(len(buf), 112)
+        self.assertEqual(MultiRingHello.decode(buf), MultiRingHello(ENDPOINT, rings))
+
+    def test_hello_rejects_bad_rings_counts_and_lengths(self):
+        ring = RemoteRegion(0x1000, 4096, 1)
+        for bad in (RemoteRegion(0x1000, 4096 + 32, 1), RemoteRegion(0x1000, 128, 1),
+                    RemoteRegion(0x1040, 4096, 1)):
+            with self.assertRaisesRegex(HandshakeError, "misaligned"):
+                MultiRingHello.decode(MultiRingHello(ENDPOINT, (ring, bad)).encode())
+        for count in (0, MAX_RINGS + 1):
+            with self.assertRaisesRegex(HandshakeError, "ring count"):
+                MultiRingHello(ENDPOINT, (ring,) * count).encode()
+        buf = bytearray(MultiRingHello(ENDPOINT, (ring, ring)).encode())
+        with self.assertRaisesRegex(HandshakeError, "111 bytes, expected 112"):
+            MultiRingHello.decode(bytes(buf[:-1]))
+        buf[36:38] = (0).to_bytes(2, "little")
+        with self.assertRaisesRegex(HandshakeError, "ring count 0"):
+            MultiRingHello.decode(bytes(buf[:HELLO_LEN]))
+        with self.assertRaisesRegex(HandshakeError, "version 2, expected 3"):
+            MultiRingHello.decode(Hello(ENDPOINT, 0x1000, 4096, 1).encode())
+
+    def test_accept_and_ready_carry_the_version(self):
+        accept = Accept(ENDPOINT, 0x5555_0000, 42, 3)
+        self.assertEqual(_u(accept.encode(), 4, 2), 3)
+        self.assertEqual(Accept.decode(accept.encode(), 3), accept)
+        with self.assertRaises(HandshakeError):
+            Accept.decode(accept.encode())
+        self.assertEqual(_u(encode_ready(3), 4, 2), 3)
+        decode_ready(encode_ready(3), 3)
+        with self.assertRaises(HandshakeError):
+            decode_ready(encode_ready(3))
+
+    def test_immediates(self):
+        self.assertEqual([immediate(0, 5, 3), immediate(3, 5, 3), immediate(255, (1 << 24) + 7, 3)],
+                         [5, 0x0300_0005, 0xFF00_0007])
+        self.assertEqual(split_immediate(0x0300_0005), (3, 5))
+        self.assertEqual(split_immediate(immediate(200, 1 << 40, 3)), (200, 0))
+        self.assertEqual(immediate(0, (1 << 32) + 5), 5)  # protocol 2: low 32 bits
+
+    def test_frame_header_layout(self):
+        image = ImageHeader(0x0505, 0x0606, 0x0707, 0x0808, 0x0909, DataType.UINT16,
+                            Compression.BSLZ4, 0x0A0A, 0x0B0B, 0x0C0C)
+        header = FrameHeader(FrameKind.IMAGE, 0x0101, 0x0202, 0x0303, 0x0404, image, 0x0D0D, 3)
+        buf = header.encode()
+        self.assertEqual([_u(buf, 4, 2), _u(buf, 6, 2), _u(buf, 8, 8), _u(buf, 80, 2),
+                          _u(buf, 82, 2), _u(buf, 84, 2)],
+                         [3, 2, 0x0101, 0x0B0B, 0x0C0C, 0x0D0D])
+        self.assertEqual((len(buf), set(buf[86:])), (FRAME_HEADER_LEN, {0}))
+        self.assertEqual(FrameHeader.decode(buf, 3), header)
+        with self.assertRaisesRegex(HandshakeError, "version 3, expected 2"):
+            FrameHeader.decode(buf)
+        with self.assertRaises(ValueError):
+            FrameHeader(FrameKind.START, 0, 0, 0, ring=1).encode()
+
+    def test_rings_are_independent_streams(self):
+        # Series 1 in ring 0, series 2 in ring 1, series 3 in ring 0 again. A series spans
+        # 1024 bytes, so the IMAGE of series 3 wraps in the 1536-byte ring 0.
+        rings = [RingWriter(1536, 3, 0), RingWriter(1024, 3, 1)]
+        readers = [FrameReader(1536, version=3, ring=0), FrameReader(1024, version=3, ring=1)]
+        seen = []
+        for ring, series_id in ((0, 1), (1, 2), (0, 3)):
+            before = rings[ring].sequence
+            for kind, size in ((FrameKind.START, 40), (FrameKind.IMAGE, 300), (FrameKind.END, 8)):
+                rings[ring].write(kind, bytes([series_id]) * size, series_id=series_id)
+            for sequence in range(before, rings[ring].sequence):
+                frame = readers[ring].next(rings[ring].ring, immediate(ring, sequence, 3))
+                if frame:
+                    seen.append((ring, frame.header.series_id, frame.header.kind))
+                    self.assertEqual(frame.header.ring, ring)
+        self.assertEqual([s for _, s, _ in seen], [1, 1, 1, 2, 2, 2, 3, 3, 3])
+        self.assertEqual([r for r, _, _ in seen], [0, 0, 0, 1, 1, 1, 0, 0, 0])
+        self.assertEqual([reader.position for reader in readers], [w.position for w in rings])
+        self.assertEqual((rings[0].sequence, rings[0].position), (7, 2304))  # one wrap frame
+
+    def test_reader_rejects_other_rings(self):
+        w = RingWriter(1024, 3, 1)
+        w.write(FrameKind.START, b"x")
+        with self.assertRaisesRegex(HandshakeError, "out of order"):
+            FrameReader(1024, version=3, ring=0).next(w.ring, immediate(1, 0, 3))
+        with self.assertRaisesRegex(HandshakeError, "says ring 1"):
+            FrameReader(1024, version=3, ring=0).next(w.ring, immediate(0, 0, 3))
+        self.assertEqual(FrameReader(1024, version=3, ring=1).next(w.ring, 0x0100_0000)
+                         .header.kind, FrameKind.START)
 
 
 class FakeEvent:
@@ -279,6 +387,54 @@ class HandshakeTest(unittest.TestCase):
             self.connector(imagemux, boom).connect()
         imagemux.thread.join(2)
         self.assertFalse(imagemux.ready)
+
+
+class MultiRingImagemux:
+    """Plays imagemux's protocol 3 handshake: Hello of 64 bytes plus 24 per ring."""
+
+    def __init__(self):
+        self.srv = socket.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(1)
+        self.port = self.srv.getsockname()[1]
+        self.hello = None
+        self.ready = False
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        conn, _ = self.srv.accept()
+        with conn, self.srv:
+            prefix = _read_exact(conn, HELLO_LEN)
+            count = _u(prefix, 36, 2)
+            self.hello = prefix + _read_exact(conn, 24 * count)
+            conn.sendall(Accept(ENDPOINT, 0x2000, 0xCD, 3).encode())
+            decode_ready(_read_exact(conn, READY_LEN), 3)
+            self.ready = True
+            conn.recv(1)
+
+
+class MultiRingHandshakeTest(unittest.TestCase):
+    RINGS = tuple(RemoteRegion(0x10000 + i * 0x4000, 0x4000, 0xAB) for i in range(3))
+
+    def test_handshake_advertises_every_ring_and_returns_credit_words(self):
+        imagemux = MultiRingImagemux()
+        link = TcpConnector("127.0.0.1", ImagemuxCodec(3),
+                            lambda: LocalInfo(self.RINGS[0], ENDPOINT, self.RINGS),
+                            lambda peer: 3, port=imagemux.port).connect()
+        imagemux.thread.join(0.5)
+        self.assertEqual(MultiRingHello.decode(imagemux.hello), MultiRingHello(ENDPOINT, self.RINGS))
+        self.assertEqual([_u(imagemux.hello, 64 + 24 * i, 8) for i in range(3)],
+                         [0x10000, 0x14000, 0x18000])
+        self.assertTrue(imagemux.ready)
+        self.assertEqual(link.peer.credit, RemoteRegion(0x2000, 24, 0xCD))
+        link.close()
+
+    def test_protocol_2_refuses_several_rings(self):
+        with self.assertRaises(ValueError):
+            ImagemuxCodec(2).run(None, LocalInfo(self.RINGS[0], ENDPOINT, self.RINGS))
+        with self.assertRaises(ValueError):
+            ImagemuxCodec(4)
 
 
 class ProbeTest(unittest.TestCase):

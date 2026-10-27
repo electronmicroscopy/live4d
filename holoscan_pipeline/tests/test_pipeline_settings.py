@@ -25,6 +25,14 @@ def test_encoder_defaults_to_disabled_keeping_one_series():
     assert PipelineConfig().encoder == dict(enabled=False, keep=1)
 
 
+def test_rdma_protocol_selects_rings():
+    config = PipelineConfig()
+    assert (config.rdma["protocol"], config.rdma["rings"]) == (2, 1)
+    config = PipelineConfig(rdma=dict(protocol=3, rings=4))
+    assert (config.rdma["protocol"], config.rdma["rings"]) == (3, 4)
+    assert PipelineConfig(rdma=dict(protocol=3, rings=256)).rdma["rings"] == 256
+
+
 def test_detector_radius_accepts_192_pixel_extent():
     PipelineConfig(detector=dict(bf_radius=136, adf_inner=24, adf_outer=136))
     with pytest.raises(ValueError):
@@ -34,6 +42,9 @@ def test_detector_radius_accepts_192_pixel_extent():
 @pytest.mark.parametrize("values", [dict(batch_size=0), dict(batch_size=1001), dict(batch_size=True),
     dict(queue_depth=17), dict(transport="udp"), dict(transport="rdma"),
     dict(rdma=dict(max_batch=0)), dict(rdma=dict(ring_memory="host")),
+    dict(rdma=dict(protocol=1)), dict(rdma=dict(protocol="3")), dict(rdma=dict(protocol=3, rings=0)),
+    dict(rdma=dict(protocol=3, rings=257)), dict(rdma=dict(protocol=3, rings=True)),
+    dict(rdma=dict(rings=2)),
     dict(scan=dict(width=0)), dict(execute=dict(mode="unknown")), dict(zmq=dict(extra=1)),
     dict(writer=dict(enabled=1)), dict(writer=dict(output_dir="")),
     dict(writer=dict(name_pattern="/abs/series_$id")), dict(writer=dict(name_pattern="../up_$id")),
@@ -54,6 +65,8 @@ def test_shipped_configs():
     buffle = load_config(root / "buffle_rdma.yaml")
     assert buffle.transport == "rdma" and buffle.execute["mode"] == "service"
     assert buffle.scan == dict(width=1000, height=1000)
+    rings = load_config(root / "rdma_rings.yaml")
+    assert (rings.rdma["protocol"], rings.rdma["rings"], rings.rdma["ring_mib"]) == (3, 4, 64)
 
 
 def test_device_list_and_legacy_scalar_share_normalized_selection():
@@ -81,3 +94,11 @@ def test_repeated_devices_preserve_independent_routing_entries(transport):
     rdma = dict(remote_address="sender:31003", local_address="receiver")
     assert PipelineConfig(transport=transport, devices=[0, 0], rdma=rdma).gpu_devices == (0, 0)
     assert PipelineConfig(transport=transport, devices=[2, 3, 2], rdma=rdma).gpu_devices == (2, 3, 2)
+
+
+def test_protocol_3_is_not_supported_with_devices():
+    rdma = dict(remote_address="sender:31003", local_address="receiver", protocol=3)
+    PipelineConfig(transport="rdma", rdma=rdma)
+    with pytest.raises(ValueError):
+        PipelineConfig(transport="rdma", devices=[0], rdma=rdma)
+    PipelineConfig(transport="zmq", devices=[0], rdma=dict(protocol=3))
