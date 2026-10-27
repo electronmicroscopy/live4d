@@ -1,20 +1,9 @@
-"""Acquisitions received from a live source, each encoded on arrival and kept on the GPU as an ANS dataset."""
+"""The scans of a live session, each ANS-encoded on arrival and kept on the GPU as a dataset."""
 
 import threading
 import weakref
 
-import cupy as cp
-
 from quantem.gpu.io.dataset import Dataset4dstemGPU
-from quantem.gpu.streaming import IncompleteAcquisition, LiveEncoder
-from live4d.live.feed import BatchFeed
-
-
-def series_fields(start, index: int):
-    """Series name, detector shape and pixel mask from the detector's START mapping; ``index`` names a series
-    without an id."""
-    shape = (int(start["image_size_y"]), int(start["image_size_x"]))
-    return str(start.get("series_id", index)), shape, start.get("pixel_mask")
 
 
 class Recording:
@@ -159,81 +148,3 @@ class Recording:
                     self._retiring[acquisition.identifier] = acquisition
             if not acquired:
                 dataset.close()
-
-
-def record(source, scan_shape, *, device="cuda:0", on_acquisition=None, on_arrival=None,
-           metadata: dict | None = None, verbose: bool = True,
-           retire_other_shapes: bool = False) -> Recording:
-    """Receive acquisitions from a live source and keep each as an ANS dataset on the GPU; returns at once.
-
-    ``source`` yields acquisitions like ``BatchFeed`` (``series()`` of objects with
-    ``start`` and ``batches()``); ``scan_shape`` is configured, because a detector announces only an image
-    count. Each batch is corrected for flagged pixels and ANS-encoded as it arrives (quantem.gpu ``LiveEncoder``), so
-    an acquisition is complete, encoded and usable the moment its last pattern arrives; nothing else is
-    computed. Each acquisition is then analysed as a dataset: ``DirectPtycho(dataset)``, or
-    ``ptycho.series(datasets, fit)`` over several, MAPED and the other offline-style workflows.
-
-    ``metadata`` supplies measured calibration and provenance for each acquisition.
-    Each START message's fields are retained and take precedence over this template;
-    ``series`` is always the received acquisition name. The detector pixel mask is
-    stored separately and keeps its correction policy.
-
-    ``retire_other_shapes`` releases completed scans of another scan or detector shape when a scan of
-    a new shape starts (a size or binning change), so a live viewer (which compares scans of one shape) follows a size change.
-    Save those scans first.
-    """
-    recording = Recording(on_acquisition, on_arrival)
-    scan_shape = tuple(int(side) for side in scan_shape)
-
-    def work():
-        try:
-            with cp.cuda.Device(int(str(device).split(":")[-1])):
-                for index, acquisition in enumerate(source.series()):
-                    if recording.stop.is_set():
-                        break
-                    name, detector_shape, pixel_mask = series_fields(acquisition.start, index)
-                    acquired_metadata = dict(metadata or {})
-                    acquired_metadata.update({key: value for key, value in acquisition.start.items()
-                                              if key != "pixel_mask"})
-                    acquired_metadata["series"] = name
-                    # A receiver that reads the scan size from the detector's START passes it per series.
-                    series_scan = tuple(int(side) for side in acquisition.start.get("scan_shape", scan_shape))
-                    live = LiveEncoder(series_scan, detector_shape, pixel_mask=pixel_mask, device=device,
-                                           metadata=acquired_metadata)
-                    with recording.lock:
-                        if retire_other_shapes:
-                            for old in [item for item in recording.datasets
-                                        if tuple(item.shape) != (*series_scan, *detector_shape)]:
-                                recording.discard(old)
-                        recording.acquisitions.append(live)
-                    if recording.on_arrival is not None:
-                        recording.on_arrival(recording, live)
-                    for first, patterns in acquisition.batches():
-                        live.add(first, patterns)
-                    try:
-                        dataset = live.finish()
-                    except IncompleteAcquisition as error:
-                        live.release()
-                        with recording.lock:
-                            recording.incomplete.append({"series": name, "reason": str(error)})
-                        if verbose:
-                            print(f"record: series {name} incomplete ({error}); not kept.")
-                        continue
-                    with recording.lock:
-                        recording.datasets.append(dataset)
-                        recording._processing.add(live.identifier)
-                    try:
-                        if recording.on_acquisition is not None:
-                            recording.on_acquisition(dataset)
-                    finally:
-                        with recording.lock:
-                            recording._processing.discard(live.identifier)
-        except BaseException as error:  # noqa: BLE001 - surfaced to the caller by wait()
-            recording.error = error
-        finally:
-            if isinstance(source, BatchFeed) and (recording.error is not None or recording.stop.is_set()):
-                source._abort(recording.error or RuntimeError("The recording stopped; start another feed."))
-
-    recording.thread = threading.Thread(target=work, name="quantem-record", daemon=True)
-    recording.thread.start()
-    return recording

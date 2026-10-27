@@ -1,9 +1,10 @@
-"""Live 4D-STEM scans from a DECTRIS detector, ANS-encoded on the GPU as they arrive.
+"""Live 4D-STEM scans: live4d's pipeline with the ANS encoder on, as a page with Show4DSTEM.
 
-live4d's receiver (`graph.ReceiverSession`) hands each batch to `SeriesFeed`, which queues it on a
-`BatchFeed`; `recording.record` encodes it with quantem.gpu's `LiveEncoder` (flagged pixels
-corrected, lossless ANS on the GPU). Each detector series is one scan and becomes one
-`Dataset4dstemGPU`, the same object `quantem.gpu.io.load` returns for a file.
+`LiveFrames` runs `live4d.app.PipelineApp` in service mode with ``encoder.enabled``: the receiver,
+the virtual detectors and `encoding.AnsEncoderOp` are one Holoscan graph, and each detector series
+is ANS-encoded on the GPU as it arrives (quantem.gpu `LiveEncoder`). `LiveFrames` is the encoder's
+sink: each series becomes one `Dataset4dstemGPU` (the object `quantem.gpu.io.load` returns) in
+`datasets`, is saved, and is followed live by Show4DSTEM.
 
     live = LiveFrames(remote="10.0.0.2:31003", local="10.0.0.1", folder="/data/live")
     live.start()              # connects to the detector; nothing is armed or triggered
@@ -18,7 +19,6 @@ before it can be released, and `LiveScans` loads saved scans by name in any othe
 from __future__ import annotations
 
 import fcntl
-import math
 import os
 import queue
 import signal
@@ -28,115 +28,14 @@ import time
 from pathlib import Path
 
 import cupy as cp
-import numpy as np
-import torch
 
-from live4d.live.feed import BatchFeed
-from live4d.live.graph import ReceiverSession
-from live4d.live.recording import record
-from live4d.live.scans import DEFAULT_FOLDER
+from ..config import PipelineConfig
+from .recording import Recording
+from .scans import DEFAULT_FOLDER
 
 
 class ReceiverBusy(RuntimeError):
     """Another receiver holds the detector stream."""
-
-
-def scan_shape_from_start(start: dict, configured):
-    """The (rows, cols) raster of one series, or None when its images cannot be placed.
-
-    The START ``header_appendix`` ``scan_height`` / ``scan_width`` (as live4d reads them) come
-    first; without them, a square raster of ``number_of_images``; without a count, `configured`.
-    """
-    count = int(start.get("number_of_images") or 0)
-    appendix = start.get("header_appendix")
-    if isinstance(appendix, dict) and ("scan_width" in appendix or "scan_height" in appendix):
-        width, height = appendix.get("scan_width"), appendix.get("scan_height")
-        if type(width) is not int or type(height) is not int or width < 1 or height < 1:
-            return None
-        if count and count != width * height:
-            return None
-        return height, width
-    if not count:
-        return tuple(int(side) for side in configured)
-    side = math.isqrt(count)
-    return (side, side) if side * side == count else None
-
-
-class SeriesFeed:
-    """The graph's consumer: queue each series' batches on a `BatchFeed`, one detector series per scan.
-
-    `LiveEncoder` needs consecutive batches. A series whose images cannot be placed (gap, repeat,
-    unknown raster) is dropped and listed in `dropped`; the receiver keeps running for the next one.
-    """
-
-    def __init__(self, feed: BatchFeed, scan_shape, pixel_mask=None, log=print):
-        self.feed = feed
-        self.scan_shape = tuple(int(side) for side in scan_shape)
-        self.detector_shape = None
-        # one mask, or {side: mask} for each binning (96: 2x2, 192: unbinned)
-        self.pixel_mask = pixel_mask
-        self.log = log
-        self.name = None
-        self.active = False      # the current series has reached the feed
-        self.skip = False        # the current series was dropped
-        self.next_id = 0
-        self.series = 0          # series accepted
-        self.frames = 0          # frames queued, all series
-        self.dropped = []        # [{"series", "reason"}]
-
-    def on_start(self, start: dict, series_id: int) -> None:
-        if self.active:          # a START without the previous END: that series ends short
-            self.feed.end_series()
-        self.active, self.skip, self.next_id = False, False, 0
-        self.name = f"series_{start.get('series_id', series_id)}"
-        rows, cols = start.get("image_size_y"), start.get("image_size_x")
-        if rows and cols:
-            self.detector_shape = (int(rows), int(cols))
-        scan = scan_shape_from_start(start, self.scan_shape)
-        if scan is None:
-            self._drop(f"{start.get('number_of_images')} images and header_appendix "
-                       f"{start.get('header_appendix')!r} give no raster scan")
-            return
-        self.scan_shape = scan
-        self.series += 1
-
-    def _mask(self):
-        mask = self.pixel_mask.get(self.detector_shape[0]) if isinstance(self.pixel_mask, dict) else self.pixel_mask
-        return mask if mask is not None and tuple(mask.shape) == self.detector_shape else None
-
-    def process(self, frames, ids) -> None:
-        if self.skip or self.name is None:
-            return
-        n = int(frames.shape[0])
-        first, last = int(ids[0]), int(ids[-1])
-        if first != self.next_id or last - first + 1 != n:
-            self._drop(f"images {first}..{last} ({n}) do not follow image {self.next_id - 1}")
-            return
-        if last >= self.scan_shape[0] * self.scan_shape[1]:
-            self._drop(f"image {last} is beyond the {self.scan_shape[0]}x{self.scan_shape[1]} scan")
-            return
-        if not self.active:
-            self.detector_shape = tuple(int(side) for side in frames.shape[1:])   # what arrived
-            self.feed.start_series({"series_id": self.name, "image_size_y": self.detector_shape[0],
-                                    "image_size_x": self.detector_shape[1],
-                                    "scan_shape": self.scan_shape, "pixel_mask": self._mask()})
-            self.active = True
-        torch.cuda.current_stream().synchronize()    # the frames are written before CuPy copies them
-        self.feed.put(first, cp.from_dlpack(frames.detach()))
-        self.next_id = last + 1
-        self.frames += n
-
-    def end(self, series_images: int) -> None:
-        if self.active:
-            self.feed.end_series()
-        self.active = False
-
-    def _drop(self, reason: str) -> None:
-        if self.active:          # LiveEncoder reports the short series incomplete and frees it
-            self.feed.end_series()
-        self.active, self.skip = False, True
-        self.dropped.append({"series": self.name, "reason": reason})
-        self.log(f"[live] {self.name} dropped: {reason}")
 
 
 def _acquisition_id(dataset) -> str:
@@ -152,27 +51,35 @@ class LiveFrames:
     """
 
     def __init__(self, scan=(512, 512), *, remote="", local="", rdma_device="", transport="rdma",
-                 endpoint="", pixel_mask=None, keep: int = 10, folder=DEFAULT_FOLDER, autosave=("qem",),
-                 batch_size=1000, ring_mib=256, device="cuda:0", metadata=None, lock_path=None, who=None):
+                 endpoint="tcp://127.0.0.1:5555", pixel_mask=None, keep: int = 10, folder=DEFAULT_FOLDER,
+                 autosave=("qem",), batch_size=512, ring_mib=256, device: int = 0, detector=None,
+                 metadata=None, lock_path=None, who=None):
         self.keep = int(keep)
         self.folder = Path(folder).expanduser()
         self.autosave = (autosave,) if isinstance(autosave, str) else tuple(autosave or ())
-        self.device = int(str(device).split(":")[-1])
+        self.device = int(device)
+        # one mask, or {side: mask} for each binning (96: 2x2, 192: unbinned)
+        self.pixel_mask = pixel_mask
+        self.metadata = dict(metadata or {})
         self.who = who
         self.lock_path = Path(lock_path or os.environ.get("LIVE4D_LOCK")
                               or Path.home() / ".cache" / "live4d" / "receiver.lock")
-        self.feed = BatchFeed(max_batches=16)
-        self.series = SeriesFeed(self.feed, scan, pixel_mask)
-        self.session = ReceiverSession(self.series, transport=transport, remote=remote, local=local,
-                                       rdma_device=rdma_device, endpoint=endpoint,
-                                       batch_size=batch_size, ring_mib=ring_mib)
-        self.recording = record(self.feed, scan, device=device, on_acquisition=self._completed,
-                                on_arrival=lambda recording, acquisition: self._prune(),
-                                metadata=metadata, verbose=False)
+        self.config = PipelineConfig(
+            transport=transport, batch_size=int(batch_size), device=self.device,
+            scan=dict(height=int(scan[0]), width=int(scan[1])), detector=dict(detector or {}),
+            execute=dict(mode="service"), zmq=dict(endpoint=endpoint),
+            rdma=dict(remote_address=remote, local_address=local, device=rdma_device, ring_mib=int(ring_mib)),
+            encoder=dict(enabled=True))
+        self.recording = Recording()
+        self.scan_shape, self.detector_shape = tuple(scan), None
+        self.series_count = 0
+        self.dropped = []          # [{"series", "reason"}]
+        self.app = self._error = None
+        self._links = None         # RDMA owners: they must outlive the graph
         self._lock = None
         self._stop = threading.Event()
-        self._saved = {}          # (acquisition id, folder) -> written paths
-        self._pinned = {}         # acquisition id -> saves in progress; never released meanwhile
+        self._saved = {}           # (acquisition id, folder) -> written paths
+        self._pinned = {}          # acquisition id -> saves in progress; never released meanwhile
         self._pin_lock = threading.Lock()
         self._saves = queue.Queue()
         self.save_error = None
@@ -180,7 +87,7 @@ class LiveFrames:
 
     @property
     def receiving(self) -> bool:
-        return self.session.running
+        return self.recording.receiving
 
     @property
     def datasets(self):
@@ -188,7 +95,49 @@ class LiveFrames:
 
     @property
     def error(self):
-        return self.session.failure or self.recording.error
+        return self._error
+
+    # --- the encoder's sink: called by AnsEncoderOp inside the graph ------------------------------
+
+    def _mask(self, detector_shape):
+        mask = self.pixel_mask.get(detector_shape[0]) if isinstance(self.pixel_mask, dict) else self.pixel_mask
+        return mask if mask is not None and tuple(mask.shape) == tuple(detector_shape) else None
+
+    def begin(self, series_id, scan_shape, detector_shape):
+        """A series starts: its encoder, registered for live viewing; scans of an older size retire."""
+        from quantem.gpu.streaming import LiveEncoder
+
+        self.scan_shape, self.detector_shape = tuple(scan_shape), tuple(detector_shape)
+        encoder = LiveEncoder(scan_shape, detector_shape, pixel_mask=self._mask(detector_shape),
+                              device=f"cuda:{self.device}",
+                              metadata={**self.metadata, "series": f"series_{series_id}"})
+        with self.recording.lock:
+            self.recording.acquisitions.append(encoder)
+        self.series_count += 1
+        self._prune()
+        return encoder
+
+    def complete(self, encoder) -> None:
+        """A series ended: keep its dataset and queue its save, or note it incomplete."""
+        from quantem.gpu.streaming import IncompleteAcquisition
+
+        try:
+            dataset = encoder.finish()
+        except IncompleteAcquisition as error:
+            self.drop(encoder, str(error))
+            return
+        with self.recording.lock:
+            self.recording.datasets.append(dataset)
+        self._completed(dataset)
+
+    def drop(self, encoder, reason: str) -> None:
+        """A series that is not kept (gap, repeat, overrun, or ended short): free its counts."""
+        name = encoder.metadata.get("series")
+        encoder.release()
+        with self.recording.lock:
+            self.recording.acquisitions[:] = [item for item in self.recording.acquisitions if item is not encoder]
+            self.recording.incomplete.append({"series": name, "reason": reason})
+        self.dropped.append({"series": name, "reason": reason})
 
     # --- one receiver per detector stream --------------------------------------------------------
 
@@ -256,17 +205,73 @@ class LiveFrames:
         self._lock.truncate()
         self._lock.write(f"{os.getpid()} {time.time()} {self.viewer_name()}")
         self._lock.flush()
-        self.session.open()
-        where = self.session.remote if self.session.transport == "rdma" else self.session.endpoint
-        print(f"[live] listening: {self.session.transport} {where}, ANS on cuda:{self.device}", flush=True)
+        self._stop.clear()
+        self._error = None
+        self._open_graph()
+        transport = self.config.transport
+        where = self.config.rdma["remote_address"] if transport == "rdma" else self.config.zmq["endpoint"]
+        print(f"[live] listening: {transport} {where}, ANS on cuda:{self.device}", flush=True)
+
+    def _open_graph(self, ready_timeout_s: float = 60.0) -> None:
+        """As live4d's own entry point: connect (RDMA: register the ring, then the imagemux handshake),
+        build PipelineApp with the encoder, run it on a thread and wait until it is ready."""
+        from ..app import PipelineApp
+
+        sender_gone = None
+        if self.config.transport == "rdma":
+            from dectris import ImagemuxCodec, LocalInfo, TcpConnector, VerbsConn, watch_liveness
+
+            rdma = self.config.rdma
+            host, _, port = rdma["remote_address"].rpartition(":")
+            verbs = VerbsConn(rdma["local_address"], self.device, rdma["ring_mib"] << 20,
+                              rdma["device"] or None, ring_memory=rdma["ring_memory"])
+            try:
+                link = TcpConnector(host, ImagemuxCodec(), lambda: LocalInfo(verbs.ring, verbs.endpoint),
+                                    verbs.connect, port=int(port), timeout_s=rdma["timeout"]).connect()
+            except OSError as exc:
+                verbs.close()
+                raise ConnectionError(f"no RDMA sender answers at {rdma['remote_address']} ({exc})") from None
+            closing, sender_gone = watch_liveness(link)
+            self._links = (verbs, link, closing)        # these owners must outlive the graph
+            self.app = PipelineApp(self.config, conn=link.conn, ring=verbs.ring, credit=link.peer.credit,
+                                   ring_device_address=verbs.ring_device_address, encoder_sink=self)
+        else:
+            self.app = PipelineApp(self.config, encoder_sink=self)
+
+        def run():
+            try:
+                self.app.run(sender_gone, stop_event=self._stop)
+                if sender_gone is not None and sender_gone.is_set() and not self._stop.is_set():
+                    self._error = ConnectionError("the detector closed the connection")
+            except BaseException as exc:   # shown in the status
+                self._error = exc
+
+        self.recording.thread = threading.Thread(target=run, name="live4d-graph", daemon=True)
+        self.recording.thread.start()
+        deadline = time.monotonic() + ready_timeout_s
+        while not self.app.ready.wait(0.05):
+            if not self.recording.thread.is_alive() or time.monotonic() > deadline:
+                error = self._error
+                self.stop()
+                raise error or RuntimeError("the pipeline did not become ready")
 
     def stop(self, save_timeout_s: float = 300.0) -> None:
-        """Stop listening and hang up; finish pending saves; completed scans stay in `datasets`."""
+        """Stop the graph, then hang up; finish pending saves; completed scans stay in `datasets`."""
         self._stop.set()
-        self.session.close()
-        self.feed.close()
-        self.recording.close()
-        self.recording.wait(timeout=30)
+        if self.recording.thread is not None:
+            self.recording.thread.join(timeout=30)
+        if self._links is not None:
+            verbs, link, closing = self._links
+            closing.set()
+            sock = getattr(link.close, "__self__", None)     # the sender sees the hang-up at once
+            if isinstance(sock, socket.socket):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            link.close()
+            verbs.close()
+            self._links = None
         self._saves.put(None)
         deadline = time.monotonic() + save_timeout_s
         while self._pinned and time.monotonic() < deadline:
@@ -482,18 +487,19 @@ class LiveFrames:
         error = self.error
         if error is not None:
             return f"<b style='color:#c00'>Stopped: {error}</b>"
-        rows, cols = self.series.scan_shape
+        rows, cols = self.scan_shape
         state = "listening" if self.receiving else "not listening"
         with self.recording.lock:
             current = self.recording.acquisitions[-1].received if self.recording.acquisitions else 0
             resident = len(self.recording.datasets)
-        det = self.series.detector_shape or ("?", "?")
-        where = self.session.remote if self.session.transport == "rdma" else self.session.endpoint
-        dropped = f" &nbsp; dropped {len(self.series.dropped)}" if self.series.dropped else ""
+        det = self.detector_shape or ("?", "?")
+        transport = self.config.transport
+        where = self.config.rdma["remote_address"] if transport == "rdma" else self.config.zmq["endpoint"]
+        dropped = f" &nbsp; dropped {len(self.dropped)}" if self.dropped else ""
         saving = (f" &nbsp; <b style='color:#c00'>save failed: {self.save_error}</b>"
                   if self.save_error is not None else "")
-        return (f"<b>{state}</b> &nbsp; {self.session.transport.upper()} {where} &nbsp; scan {rows}x{cols}, "
-                f"detector {det[0]}x{det[1]} &nbsp; scans {self.series.series} (kept {resident}) &nbsp; "
+        return (f"<b>{state}</b> &nbsp; {transport.upper()} {where} &nbsp; scan {rows}x{cols}, "
+                f"detector {det[0]}x{det[1]} &nbsp; scans {self.series_count} (kept {resident}) &nbsp; "
                 f"current {100 * current / (rows * cols):.0f}% encoded{dropped}{saving}")
 
     def status(self, refresh_s: float = 1.0):

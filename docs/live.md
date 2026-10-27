@@ -1,10 +1,25 @@
 # Live scans: ANS-encoded on the GPU as they arrive
 
-`live4d.live` turns the detector stream received by live4d's operators (`RdmaRxOp`, or `ZmqRxOp` →
-`DecompressGpuOp`) into lossless, GPU-resident datasets. Each detector series is one scan; each
-batch is corrected for flagged pixels and ANS-encoded by quantem.gpu's `LiveEncoder` as it lands,
-so a scan is complete and encoded when its last image arrives. The result is the
-`Dataset4dstemGPU` that `quantem.gpu.io.load` returns for the same counts.
+With `encoder.enabled`, `PipelineApp` adds `AnsEncoderOp` (`live4d.live.encoding`) as one more
+consumer of the decoded batches, beside the virtual detectors and the HDF5 writer:
+
+```
+RdmaRxOp / DecompressGpuOp ─┬─► ScanTensorOp ─► VirtualDetectorOp   (window consumer 0)
+                            ├─► H5WriterOp                         (consumer 1, optional)
+                            └─► AnsEncoderOp                       (next consumer, own partition)
+```
+
+Each activation copies the batch's images once, on the runtime's CUDA stream, into a staging chunk
+of 4096 patterns and releases the batch to the publication window; no other host synchronization.
+A full chunk is corrected for flagged pixels and ANS-encoded in place by quantem.gpu's
+`LiveEncoder`, which waits for its encode once per chunk; the encoder's own partition keeps that
+wait off the receiver and the detectors. The scan raster of each series is the START
+`header_appendix` scan, else a square raster of `number_of_images`, else `scan` from the config.
+A series with a gap, repeat or overrun is dropped; the graph keeps running.
+
+`LiveFrames` is the encoder's sink and the user-facing session: it runs `PipelineApp` in service
+mode, keeps each completed series as the `Dataset4dstemGPU` that `quantem.gpu.io.load` returns,
+saves it, and serves the live Show4DSTEM page.
 
 ```python
 from live4d.live import LiveFrames, LiveScans
@@ -28,12 +43,13 @@ data = scans["series_297"]
 - **One receiver per detector stream:** a lock file (`LIVE4D_LOCK`) records who receives;
   `page()` offers Take over.
 
-Files in `holoscan_pipeline/python/live4d/live/`: `graph.py` (receiver session and sink operator), `receiver.py` (`LiveFrames`,
-`SeriesFeed`), `feed.py` (`BatchFeed`), `recording.py` (`record`, `Recording`), `scans.py`
-(`LiveScans`).
+Files in `holoscan_pipeline/python/live4d/live/`: `encoding.py` (`AnsEncoderOp`, `SeriesEncoder`),
+`receiver.py` (`LiveFrames`), `recording.py` (`Recording`), `scans.py` (`LiveScans`).
 
 Image: `docker/Dockerfile.live` (the pipeline image plus pinned quantem.gpu, with `LiveEncoder`, and
-quantem.widget for the viewer). Tests: `python -m pytest holoscan_pipeline/tests/test_live_series.py`.
+quantem.widget for the viewer). Tests: `python -m pytest holoscan_pipeline/tests/test_live_encoding.py`.
 
-Checked by replaying three 128×128 scans of 96×96 uint16 images over RDMA (same host) at
-120,000 frames/s: all three received, saved, and decoded bit-exactly to the source.
+`test_live_encoding.py` sends batches through `SeriesEncoder` into quantem.gpu's `LiveEncoder` on a
+CUDA device and decodes every kept series bit-exactly (chunk boundaries, 96 and 192 pixel images, a
+gap, a short series). The full graph with `AnsEncoderOp` has not yet been run against the 120,000 fps
+stress test.
