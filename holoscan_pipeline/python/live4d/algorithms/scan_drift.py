@@ -50,8 +50,10 @@ def drift_0_90(scan_0, scan_90, *, sampling_nm: float | None = None, line_time_s
 
 def virtual_image(scan) -> np.ndarray:
     """Mean over the detector, (rows, cols) float32: from the ANS counts for a `Dataset4dstemGPU`
-    (no decode of the scan), else from an array."""
-    if hasattr(scan, "mean") and hasattr(scan, "representation"):
+    (no decode of the scan), else from an array. A 2D image (a DirectPtycho phase) is used as it is."""
+    if len(scan.shape) == 2:
+        image = scan
+    elif hasattr(scan, "mean") and hasattr(scan, "representation"):
         image = scan.mean(dim=(2, 3))
     else:
         image = scan.mean(axis=(2, 3)) if isinstance(scan, np.ndarray) else scan.float().mean(dim=(2, 3))
