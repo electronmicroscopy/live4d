@@ -21,6 +21,10 @@ def test_writer_defaults_to_disabled_one_million_images_per_file():
     assert PipelineConfig(writer=dict(name_pattern="run42/scan_$id")).writer["name_pattern"] == "run42/scan_$id"
 
 
+def test_encoder_defaults_to_disabled_keeping_one_series():
+    assert PipelineConfig().encoder == dict(enabled=False, keep=1)
+
+
 def test_detector_radius_accepts_192_pixel_extent():
     PipelineConfig(detector=dict(bf_radius=136, adf_inner=24, adf_outer=136))
     with pytest.raises(ValueError):
@@ -36,7 +40,8 @@ def test_detector_radius_accepts_192_pixel_extent():
     dict(writer=dict(name_pattern="runs/../../up")), dict(writer=dict(name_pattern="runs/")),
     dict(writer=dict(images_per_file=0)), dict(writer=dict(format="EM")),
     dict(writer=dict(images_per_file=True)), dict(writer=dict(staging_batches=1)),
-    dict(writer=dict(compression="lz4"))])
+    dict(writer=dict(compression="lz4")), dict(encoder=dict(enabled=1)), dict(encoder=dict(keep=-1)),
+    dict(encoder=dict(keep=True)), dict(encoder=dict(chunk=4096))])
 def test_rejects_invalid_settings(values):
     with pytest.raises(ValueError):
         PipelineConfig(**values)

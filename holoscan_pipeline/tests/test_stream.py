@@ -78,7 +78,7 @@ def image_message(image_id, value, shape=(96, 96), pixels=None):
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
-               appendices=None, placements=None, writer=None, pixels=None):
+               appendices=None, placements=None, writer=None, pixels=None, encoder=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
     appendices = appendices or {}
     context = zmq.Context()
@@ -111,8 +111,9 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                             scan=dict(width=scan[0], height=scan[1]),
                             execute=dict(mode="service" if service else "finite", seconds=3 if service else 10),
                             zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"),
-                            writer=dict(writer or {}, enabled=writer is not None))
-    app = PipelineApp(config, observer=observer)
+                            writer=dict(writer or {}, enabled=writer is not None),
+                            encoder=dict(enabled=encoder is not None))
+    app = PipelineApp(config, observer=observer, encoder_sink=encoder)
     stopping = threading.Event()
 
     def receive():
@@ -703,3 +704,51 @@ def test_hdf5_writer_rejects_non_boolean_enable_h5_writer(flag, tmp_path):
     run_series([(13, [0])], appendices={13: {"enable_h5_writer": flag}}, expect_error=True,
                writer=dict(output_dir=str(tmp_path)))
     assert not list(tmp_path.rglob("*.h5"))
+
+
+def encoded(dataset):
+    """Every pattern of an ANS-encoded series, decoded on the GPU, in scan order."""
+    rows, cols, *shape = dataset.shape
+    return cp.asnumpy(dataset.data.decode_scan_range_device(0, rows * cols)).reshape(-1, *shape)
+
+
+@pytest.mark.parametrize("writing", [False, True])
+def test_ans_encoder_both_sizes_and_partial_series(writing, tmp_path, capfd):
+    # The encoder is one more decoded consumer, beside the detector and, optionally, the writer.
+    pytest.importorskip("quantem.gpu.streaming")
+    from live4d.algorithms.ans_encoding import ResidentSeries
+    sink = ResidentSeries(keep=0)
+    series = [(1, list(range(16)), (96, 96)), (2, list(range(9)), (192, 192)), (3, list(range(16)), (96, 96))]
+    run_series(series, batch_size=5, service=True, pixels=series_pixels, encoder=sink,
+               writer=dict(output_dir=str(tmp_path)) if writing else None)
+    assert not sink.dropped
+    assert [dataset.shape for dataset in sink.datasets] == [(4, 4, 96, 96), (3, 3, 192, 192), (4, 4, 96, 96)]
+    for (sid, ids, shape), dataset in zip(series, sink.datasets):
+        expected = np.stack([series_pixels(sid, image_id, shape) for image_id in ids])
+        np.testing.assert_array_equal(encoded(dataset), expected)
+    records = [json.loads(line.split(" ", 1)[1]) for line in capfd.readouterr().out.splitlines()
+               if line.startswith("[ans-result] ")]
+    assert [(r["series_id"], r["images"], r["kept"]) for r in records] == [(1, 16, True), (2, 9, True), (3, 16, True)]
+
+
+def test_ans_encoder_drops_a_series_with_a_gap_and_keeps_the_next(capfd):
+    pytest.importorskip("quantem.gpu.streaming")
+    from live4d.algorithms.ans_encoding import ResidentSeries
+    sink = ResidentSeries(keep=0)
+    series = [(1, [0, 1, 2, 5, 6], (96, 96)), (2, list(range(4)), (96, 96))]
+    run_series(series, batch_size=2, scan=(5, 1), service=True, pixels=series_pixels, encoder=sink)
+    assert [d["series"] for d in sink.dropped] == ["series_1"]
+    assert len(sink.datasets) == 1 and sink.datasets[0].shape == (2, 2, 96, 96)
+    expected = np.stack([series_pixels(2, image_id, (96, 96)) for image_id in range(4)])
+    np.testing.assert_array_equal(encoded(sink.datasets[0]), expected)
+
+
+def test_ans_encoder_finite_mode_completes_after_every_consumer(tmp_path, capfd):
+    # Detector, writer and encoder all see END; the run completes after the last of them.
+    pytest.importorskip("quantem.gpu.streaming")
+    from live4d.algorithms.ans_encoding import ResidentSeries
+    sink = ResidentSeries()
+    run_series([(1, list(range(9)))], batch_size=4, pixels=series_pixels, encoder=sink,
+               writer=dict(output_dir=str(tmp_path)))
+    expected = np.stack([series_pixels(1, image_id, (96, 96)) for image_id in range(9)])
+    np.testing.assert_array_equal(encoded(sink.datasets[0]), expected)

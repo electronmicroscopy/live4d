@@ -13,21 +13,27 @@ import holoscan as hs
 from .config import PipelineConfig, load_config
 from .operators import (DecompressGpuOp, H5WriterOp, RdmaRxOp, ZmqRxOp, _CompletionLatch,
                         _PublicationWindow)
-from .processing import ScanTensorOp, VirtualDetectorOp
+from .processing import AnsEncoderOp, ScanTensorOp, VirtualDetectorOp
 
 
 class PipelineApp:
     def __init__(self, config: PipelineConfig, *, conn=None, ring=None, credit=None,
-                 ring_device_address=None, observer=None):
+                 ring_device_address=None, observer=None, encoder_sink=None):
         self.config = config
         self.ready = threading.Event()
         writing = config.writer["enabled"]
+        encoding = config.encoder["enabled"]
+        if encoding and encoder_sink is None:
+            from .algorithms.ans_encoding import ResidentSeries
+            encoder_sink = ResidentSeries(config.device, config.encoder["keep"])
+        self.encoder_sink = encoder_sink
         finite = config.execute["mode"] == "finite"
         # One spare queue slot covers a released input until its callback commits consumption.
-        # The HDF5 writer is a second decoded consumer and releases the window as consumer 1.
-        self.decoded_window = _PublicationWindow(config.queue_depth - 1, 2 if writing else 1)
+        # The HDF5 writer is decoded consumer 1; the ANS encoder is the next one.
+        consumers = 1 + writing + encoding
+        self.decoded_window = _PublicationWindow(config.queue_depth - 1, consumers)
         # Requested completion does not drain queues; the last END consumer requests it.
-        self.completion = _CompletionLatch(2) if writing and finite else None
+        self.completion = _CompletionLatch(consumers) if consumers > 1 and finite else None
         self.graph = hs.Graph("dectris-4dstem", default_clock=hs.RealtimeClock)
         graph = self.graph
         if config.transport == "zmq":
@@ -81,6 +87,17 @@ class PipelineApp:
                                 completion_latch=self.completion.handle if self.completion else 0)
             graph.add_flow(decoded.output, writer.input, queue_depth=config.queue_depth)
             graph.partition("writer").add(writer)
+        if encoding:
+            class BoundEncoder(AnsEncoderOp):
+                def __init__(self):
+                    super().__init__(sink=encoder_sink, release=release, consumer=1 + writing,
+                                     finite=finite, completion=completion)
+
+            encoder = graph.op(BoundEncoder, "ans_encoder", device_id=config.device,
+                               scan_width=config.scan["width"], scan_height=config.scan["height"])
+            graph.add_flow(decoded.output, encoder.input, queue_depth=config.queue_depth)
+            # Its own partition: the once-per-chunk encode wait stays off the receiver and detector threads.
+            graph.partition("encoder").add(encoder)
         deployment = hs.execution.DeploymentBinding()
         deployment.bind_tensor_output_device(
             operator_path="decompress_gpu" if config.transport == "zmq" else "rdma_rx",

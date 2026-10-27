@@ -240,3 +240,66 @@ class VirtualDetectorOp(hs.Operator):
                     ctx.request_completion()
             if self.release is not None:
                 self.release(int(batch.batch_id))
+
+
+class AnsEncoderOp(hs.Operator):
+    """ANS-encode each series on the GPU as it arrives: a decoded-batch consumer in its own partition.
+
+    Each activation copies the batch's images once, on the runtime-managed CUDA stream, into a reused
+    staging chunk and releases the batch; a full chunk is encoded by `algorithms.ans_encoding`.
+    """
+    inp = hs.Input("input", DecodedBatch)
+    device_id = hs.Param(0)
+    scan_width = hs.Param(1000)
+    scan_height = hs.Param(1000)
+
+    def __init__(self, *, sink, release, consumer, finite=True, completion=None):
+        super().__init__()
+        self.sink, self.release, self.consumer = sink, release, consumer
+        self.finite, self.completion = finite, completion
+
+    def setup(self, spec):
+        spec.input(self.inp)
+
+    def contract(self):
+        return hs.Contract().trigger(hs.OnEach(self.inp))
+
+    def start(self):
+        from .algorithms.ans_encoding import SeriesEncoder
+
+        self.device = cp.cuda.Device(self.device_id)
+        self.encoder = SeriesEncoder(self.sink, (self.scan_height, self.scan_width))
+        self.series = None
+
+    def compute(self, ctx):
+        batch = self.inp.receive().data
+        runtime_stream = ctx.stream()
+        with self.device, runtime_stream, cp.cuda.Stream.from_external(runtime_stream):
+            if batch.pipeline_ready:
+                cp.from_dlpack(batch.frames)   # exercise the runtime Tensor-to-CuPy handoff
+            else:
+                if batch.start_of_series:
+                    self.series = parse_start(bytes(batch.start_metadata))
+                    if self.series.id != batch.series_id:
+                        raise ValueError("Invalid ordered series boundary")
+                    self.encoder.start(self.series)
+                    self.started = time.perf_counter()
+                if self.series is None or self.series.id != batch.series_id:
+                    raise ValueError("Image batch has no matching START")
+                if tuple(batch.frames.shape[1:]) != self.series.shape:
+                    raise ValueError("Image geometry does not match START")
+                count = len(batch.image_ids)
+                if count:
+                    # The runtime orders input readiness and release on this activation's stream.
+                    frames = cp.from_dlpack(batch.frames)[:count]
+                    self.encoder.add(frames, np.asarray(batch.image_ids, dtype=np.int64))
+                if batch.end_of_series:
+                    summary = self.encoder.end()
+                    if summary is not None:
+                        _log_series("ans-result", dict(summary, series_id=int(batch.series_id),
+                                                       device=self.device_id, stage="ans",
+                                                       encode_interval_s=time.perf_counter() - self.started))
+                    self.series = None
+                    if self.finite and (self.completion is None or self.completion.arrive()):
+                        ctx.request_completion()
+        self.release(int(batch.batch_id), self.consumer)
