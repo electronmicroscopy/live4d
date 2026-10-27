@@ -49,7 +49,8 @@ Verified on an RTX PRO 6000 Blackwell (driver 595), 1024×1024 binned beam-on re
 120 kHz paced; three series back to back in one run. Live on an ARINA over RDMA, both ring types:
 `COMPLETE` scans in `--continuous` mode; with the GPU ring, 60 consecutive 256×256 scans in one
 run, every one `COMPLETE` (all 65,536 positions, 85–87 kHz, the scan's own rate), 0 frames
-dropped by the DCU.
+dropped by the DCU; and 21 consecutive 512×512 scans `COMPLETE` (262,144 positions each,
+about 108 kHz).
 
 Limits: the Holoscan 5 receivers take uint16 frames only (the DCU sends uint32 for long dwells:
 use the Holoscan 4 image) and batches of at most 1000 frames. The Holoscan 4 image does not run on

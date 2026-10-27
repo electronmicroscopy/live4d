@@ -237,6 +237,11 @@ put stream   mode           '"disabled"'      # the ZMQ stream is not used
 
 and the per-scan values (trigger mode, `nimages`, `ntrigger`, frame time, binning) as for ZMQ.
 
+**After a restart of the detector** all of these are back at their factory defaults (e.g.
+compression `bslz4`, binning `1x1`, trigger mode `ints`, `bstream` mode `none`), so set them
+again. A restart can also leave the sensor retracted (`detector/status/sensor_movement_state`
+reads `retracted`): insert it again before scanning, as your site does it.
+
 - **`rdma_device` must not be empty.** It names the DCU's own RDMA port; its one allowed value
   is listed by `curl http://<DCU_IP>/bstream/api/1.8.0/config/rdma_device`.
 - **Check the RDMA stream's state before arming:**
@@ -456,6 +461,10 @@ Here the sender starts first, because the pipeline connects to it.
   Shorten the dwell, or use the Holoscan 4 image.
 - **RDMA: `no RDMA sender answers`:** see Step 2. The DCU's RDMA sender serves one receiver at a
   time.
+- **RDMA: `Invalid RDMA stream` right after a disarm:** the detector had been armed before the
+  pipeline connected (or with no pipeline running), so the pipeline received that series' END
+  without its START, and the RDMA receiver stops on that. Start the pipeline again with the
+  detector disarmed, wait for `ready`, then arm. Always: pipeline `ready` first, arm second.
 - **RDMA: the pipeline is `ready` but no series starts after `arm`:** read the DCU's
   `bstream/api/1.8.0/status/state` and `status/dropped`. If the state is `error` (the DCU drops
   everything, and `dropped` counts each START, frame and END), reset the module and set it up again,
@@ -464,6 +473,10 @@ Here the sender starts first, because the pipeline connects to it.
   `rdma_device` (it is empty after the reset; see "Before a session"). The state must then show
   `ready`. Start the pipeline, arm, and the pipeline prints `[rdma] series … started` within a
   second.
+- **RDMA: the DCU's RDMA stream stays `ready` at `arm` (never `acquire`) and sends nothing:**
+  seen after several receiver restarts in one evening; `bstream/command/initialize` did not help,
+  a restart of the detector did (then set everything again, see "Before a session"). The cause is
+  on the DCU side and not known yet.
 - **RDMA with `--rdma-ring-memory gpu` (the default) fails to register the ring:** the host has no
   GPUDirect RDMA (`nvidia_peermem`). Use `--rdma-ring-memory host_mapped`.
 - **"no kernel image is available":** the image was not built for this GPU. On a Blackwell GPU use

@@ -234,6 +234,10 @@ changing anything used live.
   clear it. The fix is `bstream/command/initialize`, then setting `mode`, `rdma_batch_size` and
   `rdma_device` again (README, "If something goes wrong"). Diagnose with GETs; let the user run
   the reset.
+- **An END without its START stops the RDMA receiver** (`Invalid RDMA stream`): `RdmaRxOp`
+  treats it as a protocol error. It happens when the detector was armed before the pipeline
+  connected and is disarmed afterwards. Make sure the detector is disarmed before starting the
+  pipeline; arm only after `[holoscan] ready`.
 - `--rdma-ring-memory gpu` (default) needs GPUDirect RDMA on the host (`nvidia_peermem`);
   `host_mapped` works without it. Both were run live.
 - `--accumulate latest | all | reset | swap` map image id → position as `id % positions` (pass =
