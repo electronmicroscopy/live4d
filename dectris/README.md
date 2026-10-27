@@ -32,7 +32,7 @@ Live4D operators or generated schemas; use the unified container for the applica
 | Native verbs binding | `imxrdma.Context`, `QueuePair`, `MemoryRegion` |
 | Connection and ownership | `VerbsConn`, `watch_liveness` |
 | TCP handshake | `TcpConnector`, `ImagemuxCodec`, `LocalInfo`, `Link`, `Peer` |
-| Frame protocol | `FrameReader`, `FrameHeader`, `FrameKind`, `RemoteRegion`, `QpEndpoint` |
+| Frame protocol | `FrameReader`, `FrameHeader`, `FrameKind`, `RemoteRegion`, `QpEndpoint`, `MultiRingHello` |
 | Cumulative credits | `CreditTracker` |
 | GPU utilities | `Dispatcher`, `DeviceRing` |
 | Series and scan geometry | `Series`, `Start`, `Batch`, `End`, `ScanShape`, `scan_positions` |
@@ -48,6 +48,14 @@ The receiver connects to the sender's imagemux TCP handshake endpoint. Hello/Acc
 exchange QP parameters, receiver ring address/length/rkey, and the sender's credit-word
 address/rkey. The socket stays open as a liveness signal. No `rdma_cm` connection manager
 is used.
+
+Protocol versions 2 and 3 are supported; `ImagemuxCodec(version)` selects one, and imagemux
+accepts only its own version. In protocol 3, `MultiRingHello` advertises 1 to 256 rings, each
+with its own descriptor. imagemux writes series round robin into the rings, and each ring has
+its own sequence numbers, positions, and credit word at `credit_addr + 8 * ring`. Frame headers
+carry the ring index at offset 84, and the immediate is `ring << 24 | (sequence & 0xffffff)`.
+`VerbsConn(..., rings=N)` allocates N equal rings in one registration and lists them in
+`rings`. `FrameReader(ring_len, version=3, ring=i)` reads ring `i`.
 
 The sender writes a 128-byte frame header and payload into the registered ring. The final
 write uses WRITE_WITH_IMM; its sequence number identifies the completed frame. Frames are

@@ -16,7 +16,7 @@ class PipelineConfig:
     zmq: dict = field(default_factory=lambda: dict(endpoint="tcp://127.0.0.1:5555"))
     rdma: dict = field(default_factory=lambda: dict(remote_address="", local_address="", device="",
                                                  ring_memory="gpu", ring_mib=64, max_batch=512,
-                                                 timeout=10.0))
+                                                 timeout=10.0, protocol=2, rings=1))
     writer: dict = field(default_factory=lambda: dict(enabled=False, output_dir="/data",
                                                    name_pattern="series_$id",
                                                    format="nxmx", images_per_file=1000000, staging_batches=4))
@@ -27,7 +27,7 @@ class PipelineConfig:
                         execute=dict(mode="finite", seconds=0.0),
                         zmq=dict(endpoint="tcp://127.0.0.1:5555"),
                         rdma=dict(remote_address="", local_address="", device="", ring_memory="gpu",
-                                  ring_mib=64, max_batch=512, timeout=10.0),
+                                  ring_mib=64, max_batch=512, timeout=10.0, protocol=2, rings=1),
                         writer=dict(enabled=False, output_dir="/data", name_pattern="series_$id",
                                     format="nxmx", images_per_file=1000000, staging_batches=4))
         for name, values in defaults.items():
@@ -57,6 +57,12 @@ class PipelineConfig:
             raise ValueError("rdma.max_batch must be between 1 and 1024")
         if type(rdma["ring_mib"]) is not int or rdma["ring_mib"] < 1 or rdma["timeout"] <= 0:
             raise ValueError("RDMA ring size and timeout must be positive")
+        if rdma["protocol"] not in (2, 3) or type(rdma["protocol"]) is not int:
+            raise ValueError("rdma.protocol must be 2 or 3")
+        if type(rdma["rings"]) is not int or not 1 <= rdma["rings"] <= 256:
+            raise ValueError("rdma.rings must be an integer between 1 and 256")
+        if rdma["protocol"] == 2 and rdma["rings"] != 1:
+            raise ValueError("rdma.rings above 1 requires rdma.protocol 3")
         writer = self.writer
         if type(writer["enabled"]) is not bool:
             raise ValueError("writer.enabled must be true or false")

@@ -11,8 +11,8 @@ import time
 import holoscan as hs
 
 from .config import PipelineConfig, load_config
-from .operators import (DecompressGpuOp, H5WriterOp, RdmaRxOp, ZmqRxOp, _CompletionLatch,
-                        _PublicationWindow)
+from .operators import (DecompressGpuOp, H5WriterOp, RdmaRingsRxOp, RdmaRxOp, ZmqRxOp,
+                        _CompletionLatch, _PublicationWindow)
 from .processing import ScanTensorOp, VirtualDetectorOp
 
 
@@ -45,12 +45,19 @@ class PipelineApp:
                 raise ValueError("RDMA graph requires a connected receiver and registered ring")
             # These owners must outlive the compiled graph and its runtime session.
             self.conn = conn
-            decoded = RdmaRxOp(graph, "rdma_rx", qp_handle=conn.native_handle,
-                               ring_address=ring.addr, ring_device_address=ring_device_address,
-                               ring_bytes=ring.length, ring_memory=config.rdma["ring_memory"],
-                               credit_address=credit.addr, credit_rkey=credit.rkey,
-                               batch_size=config.batch_size, max_batch=config.rdma["max_batch"],
-                               device=config.device, publication_window=self.decoded_window.handle)
+            rdma = config.rdma
+            common = dict(qp_handle=conn.native_handle, ring_address=ring.addr,
+                          ring_device_address=ring_device_address,
+                          ring_memory=rdma["ring_memory"], credit_address=credit.addr,
+                          credit_rkey=credit.rkey, batch_size=config.batch_size,
+                          max_batch=rdma["max_batch"], device=config.device,
+                          publication_window=self.decoded_window.handle)
+            if rdma["protocol"] == 3:
+                # ``ring`` is the registration holding every ring back to back.
+                decoded = RdmaRingsRxOp(graph, "rdma_rx", ring_bytes=ring.length // rdma["rings"],
+                                        ring_count=rdma["rings"], **common)
+            else:
+                decoded = RdmaRxOp(graph, "rdma_rx", ring_bytes=ring.length, **common)
             graph.partition("receiver").add(decoded)
         scan = graph.op(ScanTensorOp, "scan", scan_width=config.scan["width"],
                         scan_height=config.scan["height"])
@@ -143,9 +150,10 @@ def main():
     rdma = config.rdma
     host, _, port = rdma["remote_address"].rpartition(":")
     verbs = VerbsConn(rdma["local_address"], config.device, rdma["ring_mib"] << 20,
-                      rdma["device"] or None, ring_memory=rdma["ring_memory"])
+                      rdma["device"] or None, ring_memory=rdma["ring_memory"], rings=rdma["rings"])
     try:
-        link = TcpConnector(host, ImagemuxCodec(), lambda: LocalInfo(verbs.ring, verbs.endpoint),
+        link = TcpConnector(host, ImagemuxCodec(rdma["protocol"]),
+                            lambda: LocalInfo(verbs.ring, verbs.endpoint, verbs.rings),
                             verbs.connect, port=int(port), timeout_s=rdma["timeout"]).connect()
         closing, sender_gone = watch_liveness(link)
         try:

@@ -17,40 +17,52 @@ pytestmark = pytest.mark.skipif(
 
 
 class RingRecord:
-    def __init__(self, wire, sequence, start, end):
+    def __init__(self, wire, sequence, start, end, ring=0, imm=None):
         self.wire = wire
         self.sequence = sequence
         self.start = start
         self.end = end
+        self.ring = ring
+        self.imm = sequence & 0xFFFFFFFF if imm is None else imm
 
 
 class RingWriter:
-    """Build the aligned frame stream that imagemux writes into a ring."""
+    """Build the aligned frame stream that imagemux writes into a ring.
 
-    def __init__(self, ring_bytes):
+    ``version=3`` writes ring ``ring`` of a multi-ring receiver. ``records`` is shared by the
+    writers of all rings, so it keeps imagemux's write order across rings."""
+
+    def __init__(self, ring_bytes, *, version=2, ring=0, records=None):
         self.ring_bytes = ring_bytes
+        self.version = version
+        self.ring = ring
         self.position = 0
         self.sequence = 0
-        self.records = []
+        self.records = [] if records is None else records
 
     def write(self, kind, data=b"", *, series_id=0, image=None):
-        from dectris.imagemux import FrameHeader, FrameKind, frame_span
+        from dectris.imagemux import FrameHeader, FrameKind, ImageHeader, frame_span, immediate
 
         offset = self.position % self.ring_bytes
         span = frame_span(len(data))
         if kind != FrameKind.WRAP and offset + span > self.ring_bytes:
-            self.write(FrameKind.WRAP)
+            self.write(FrameKind.WRAP, series_id=series_id)
             offset = 0
 
         header = FrameHeader(kind, self.sequence, self.position, len(data), series_id,
-                             image=image) if image is not None else FrameHeader(
-                                 kind, self.sequence, self.position, len(data), series_id)
+                             image if image is not None else ImageHeader(), self.ring, self.version)
         start = self.position
         wire = header.encode() + data
         self.position += self.ring_bytes - offset if kind == FrameKind.WRAP else span
-        self.records.append(RingRecord(wire, self.sequence, start, self.position))
+        self.records.append(RingRecord(wire, self.sequence, start, self.position, self.ring,
+                                       immediate(self.ring, self.sequence, self.version)))
         self.sequence += 1
         return self.records[-1]
+
+
+def _ring_writers(ring_bytes, rings):
+    records = []
+    return [RingWriter(ring_bytes, version=3, ring=i, records=records) for i in range(rings)], records
 
 
 class BatchWindow:
@@ -135,9 +147,12 @@ def _end(writer, series_id):
 
 
 class Loopback:
-    """Two local queue pairs with a registered host-mapped receiver ring."""
+    """Two local queue pairs with registered host-mapped receiver rings.
 
-    def __init__(self, ring_bytes):
+    ``rings`` equal rings share one registration, ring i at ``i * ring_bytes``, with one
+    credit word each, as ``VerbsConn`` and imagemux protocol 3 lay them out."""
+
+    def __init__(self, ring_bytes, rings=1):
         import cupy as cp
         import numpy as np
         from dectris import imxrdma
@@ -146,11 +161,12 @@ class Loopback:
         self.cp = cp
         self.np = np
         self.ctx = imxrdma.Context(local_addr=LOCAL_ADDR)
-        self.ring_mem = cp.cuda.PinnedMemory(ring_bytes, cp.cuda.runtime.hostAllocMapped)
+        self.ring_mem = cp.cuda.PinnedMemory(ring_bytes * rings, cp.cuda.runtime.hostAllocMapped)
         self.ring_address = self.ring_mem.ptr
         self.ring_device_address = mapped_device_pointer(self.ring_address, 0)
-        self.ring_mr = self.ctx.register(self.ring_address, ring_bytes, remote_write=True)
-        self.credit = np.zeros(1, dtype=np.uint64)
+        self.ring_mr = self.ctx.register(self.ring_address, ring_bytes * rings, remote_write=True)
+        self.rings = rings
+        self.credit = np.zeros(rings, dtype=np.uint64)
         self.credit_mr = self.ctx.register(self.credit.ctypes.data, self.credit.nbytes,
                                            remote_write=True)
         self.rx = self.ctx.create_qp(recv_depth=64, send_depth=64, signal_every=1)
@@ -163,11 +179,14 @@ class Loopback:
         self.imms = np.empty(64, dtype=np.uint32)
         self.ring_bytes = ring_bytes
 
-    @property
-    def credit_position(self):
+    def ring_credit(self, ring):
         import ctypes
 
-        return ctypes.c_uint64.from_address(self.credit.ctypes.data).value
+        return ctypes.c_uint64.from_address(self.credit.ctypes.data + 8 * ring).value
+
+    @property
+    def credit_position(self):
+        return self.ring_credit(0)
 
     def send(self, records, *, on_wait=None, timeout=20.0):
         import numpy as np
@@ -188,18 +207,19 @@ class Loopback:
         for index, (record, source_offset) in enumerate(zip(records, offsets)):
             deadline = time.monotonic() + timeout
             waited = False
-            while record.end - self.credit_position > self.ring_bytes:
+            while record.end - self.ring_credit(record.ring) > self.ring_bytes:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"credit did not reach frame {record.sequence}")
+                    raise TimeoutError(f"credit did not reach frame {record.sequence} "
+                                       f"of ring {record.ring}")
                 if not waited and on_wait is not None:
-                    on_wait(index, self.credit_position)
+                    on_wait(index, self.ring_credit(record.ring))
                     waited = True
                 poll_sender()
                 time.sleep(0.0001)
             while not self.tx.write(
                 self.source_mr, source_offset, len(record.wire),
-                self.ring_mr.address + (record.start % self.ring_bytes), self.ring_mr.rkey,
-                imm=record.sequence & 0xFFFFFFFF,
+                self.ring_mr.address + record.ring * self.ring_bytes
+                + (record.start % self.ring_bytes), self.ring_mr.rkey, imm=record.imm,
             ):
                 if time.monotonic() >= deadline:
                     raise TimeoutError("sender queue remained full")
@@ -234,12 +254,12 @@ class Loopback:
 
 def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
                     stop_after_first_data=False, publication_window=0, release=None,
-                    sink_delay_s=0):
+                    sink_delay_s=0, protocol=2):
     import cupy as cp
     import holoscan as hs
     import numpy as np
 
-    from live4d.operators import RdmaRxOp
+    from live4d.operators import RdmaRingsRxOp, RdmaRxOp
     from live4d.schemas.decoded_batch import DecodedBatch
 
     records = []
@@ -292,15 +312,18 @@ def _build_receiver(loopback, batch_size, max_batch=32, queue_depth=2,
                 all_ends.set()
 
     graph = hs.Graph("rdma-source-loopback", default_clock=hs.RealtimeClock)
-    source = RdmaRxOp(
-        graph, "rdma_rx", qp_handle=loopback.rx.native_handle,
-        ring_address=loopback.ring_address,
+    common = dict(
+        qp_handle=loopback.rx.native_handle, ring_address=loopback.ring_address,
         ring_device_address=loopback.ring_device_address,
         ring_bytes=loopback.ring_bytes, ring_memory="host_mapped",
         credit_address=loopback.credit_mr.address, credit_rkey=loopback.credit_mr.rkey,
         batch_size=batch_size, max_batch=max_batch, device=0,
         publication_window=publication_window,
     )
+    if protocol == 3:
+        source = RdmaRingsRxOp(graph, "rdma_rx", ring_count=loopback.rings, **common)
+    else:
+        source = RdmaRxOp(graph, "rdma_rx", **common)
     sink = graph.op(TypedSink, "typed_sink")
     graph.add_flow(source.output, sink.input, queue_depth=queue_depth)
     graph.partition("receiver").add(source)
@@ -579,5 +602,169 @@ def test_failed_receive_completion_fails_the_graph():
                 hs.RunTermination.STOPPED,
             ), session.summary()
             assert "RDMA connection failed" in session.summary()
+    finally:
+        loopback.close()
+
+
+# ---- Protocol 3: several rings, series written round robin ----------------------------------
+
+
+def _wait_for_failure(session, timeout=20):
+    import holoscan as hs
+
+    deadline = time.monotonic() + timeout
+    while not session.wait(timeout=0.02) and time.monotonic() < deadline:
+        pass
+    assert session.termination not in (
+        hs.RunTermination.REQUESTED_COMPLETED, hs.RunTermination.COMPLETED,
+        hs.RunTermination.STOPPED,
+    ), session.summary()
+    return session.summary()
+
+
+def test_rings_deliver_round_robin_series_in_order_at_both_sizes():
+    ring_bytes = 1 << 20
+    loopback = Loopback(ring_bytes, rings=3)
+    try:
+        writers, records = _ring_writers(ring_bytes, 3)
+        # Series go to rings 0, 1, 2, 0, ...: sizes change between series, one is empty, and
+        # every non-empty series ends with a partial batch of B=2.
+        series = [(20, (96, 96), [0, 1, 2]), (21, (192, 192), []),
+                  (22, (192, 192), [5, 6, 7, 8, 9]), (23, (96, 96), [4])]
+        starts = {}
+        expected = []
+        for index, (series_id, shape, ids) in enumerate(series):
+            writer = writers[index % 3]
+            starts[series_id] = _start(writer, series_id, len(ids), shape)
+            values = [series_id * 10 + image_id for image_id in ids]
+            if ids:
+                _image(writer, series_id, ids, values, shape)
+            _end(writer, series_id)
+            expected += [(ids[i:i + 2], values[i:i + 2]) for i in range(0, len(ids), 2)]
+
+        # All completions queue before the graph starts, so later rings arrive while earlier
+        # series are still unread.
+        loopback.send(records)
+        plan, received, ready, _, _ = _build_receiver(loopback, batch_size=2, protocol=3)
+        _run_until_output(plan, ready, lambda: sum(item["end"] for item in received) == 4)
+
+        assert [(item["start"], item["end"], item["series_id"]) for item in received
+                if item["start"] or item["end"]] == [
+                    (start, not start, series_id) for series_id, _, _ in series
+                    for start in (True, False)]
+        for series_id, (_, metadata) in starts.items():
+            start, = [item for item in received if item["start"] and item["series_id"] == series_id]
+            assert start["start_metadata"] == metadata
+        _assert_pixels(received, expected)
+        shapes = {series_id: shape for series_id, shape, _ in series}
+        assert received[0]["pipeline_ready"]
+        for item in received[1:]:
+            assert item["frame_shape"][1:] == shapes[item["series_id"]]
+        assert [len(item["image_ids"]) for item in received if item["image_ids"]] == [2, 1, 2, 2, 1, 1]
+        assert [item["series_images"] for item in received if item["end"]] == [3, 0, 5, 1]
+        assert [loopback.ring_credit(i) for i in range(3)] == [w.position for w in writers]
+    finally:
+        loopback.close()
+
+
+def test_rings_return_credit_to_each_rings_word():
+    # Each ring holds START plus two images, so series 40 needs ring 0 credits before its first
+    # batch of four is full; series 41 then goes to ring 1, credited through its own word.
+    ring_bytes = 37_376
+    loopback = Loopback(ring_bytes, rings=2)
+    try:
+        writers, records = _ring_writers(ring_bytes, 2)
+        _start(writers[0], 40, 6)
+        values = [3, 5, 7, 11, 13, 17]
+        for image_id, value in enumerate(values):
+            _image(writers[0], 40, [image_id], [value])
+        _end(writers[0], 40)
+        _start(writers[1], 41, 1)
+        _image(writers[1], 41, [0], [99])
+        _end(writers[1], 41)
+
+        plan, received, ready, _, _ = _build_receiver(loopback, batch_size=4, max_batch=1,
+                                                      protocol=3)
+        sender, sender_errors = _start_sender(loopback, records)
+        try:
+            _run_until_output(plan, ready, lambda: sum(item["end"] for item in received) == 2,
+                              timeout=20)
+        finally:
+            _join_sender(sender, sender_errors, timeout=25)
+        _assert_pixels(received, [([0, 1, 2, 3], values[:4]), ([4, 5], values[4:]), ([0], [99])])
+        assert loopback.ring_credit(0) == writers[0].position > ring_bytes
+        assert loopback.ring_credit(1) == writers[1].position
+    finally:
+        loopback.close()
+
+
+def test_rings_fail_when_the_sender_moves_on_without_end():
+    loopback = Loopback(1 << 20, rings=2)
+    try:
+        writers, records = _ring_writers(loopback.ring_bytes, 2)
+        _start(writers[0], 30, 2)
+        _image(writers[0], 30, [0], [1])  # imagemux dropped the rest of series 30
+        _start(writers[1], 31, 1)
+        plan, _, ready, _, _ = _build_receiver(loopback, batch_size=2, protocol=3)
+        import holoscan as hs
+
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 20, "READY")
+            sender, sender_errors = _start_sender(loopback, records)
+            summary = _wait_for_failure(session)
+            _join_sender(sender, sender_errors, timeout=20)
+        assert "before END of series 30 in ring 0" in summary, summary
+    finally:
+        loopback.close()
+
+
+@pytest.mark.parametrize("ring,imm,expected", [
+    (1, 0x0200_0000, "immediate names ring 2 of 2"),
+    (1, 0x0000_0000, "frame header in ring 0 does not match"),
+    (0, 0x0000_0001, "ring 0 announced sequence 1, expected 0"),
+])
+def test_rings_reject_misannounced_frames(ring, imm, expected):
+    loopback = Loopback(1 << 20, rings=2)
+    try:
+        writers, records = _ring_writers(loopback.ring_bytes, 2)
+        _start(writers[ring], 50, 0)
+        records[0].imm = imm
+        plan, _, ready, _, _ = _build_receiver(loopback, batch_size=2, protocol=3)
+        import holoscan as hs
+
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 20, "READY")
+            sender, sender_errors = _start_sender(loopback, records)
+            summary = _wait_for_failure(session)
+            _join_sender(sender, sender_errors, timeout=20)
+        assert expected in summary, summary
+    finally:
+        loopback.close()
+
+
+@pytest.mark.parametrize("start_shape,image_shape,expected", [
+    ((96, 96), (192, 192), "RDMA image geometry does not match START"),
+    ((192, 192), (96, 96), "RDMA image geometry does not match START"),
+    ((128, 128), None, "Invalid START image geometry"),
+])
+def test_rings_reject_invalid_geometry_in_a_later_ring(start_shape, image_shape, expected):
+    loopback = Loopback(1 << 20, rings=2)
+    try:
+        writers, records = _ring_writers(loopback.ring_bytes, 2)
+        _start(writers[0], 60, 1)
+        _image(writers[0], 60, [0], [1])
+        _end(writers[0], 60)
+        _start(writers[1], 61, 1, start_shape)
+        if image_shape is not None:
+            _image(writers[1], 61, [0], [2], image_shape)
+        plan, _, ready, _, _ = _build_receiver(loopback, batch_size=2, protocol=3)
+        import holoscan as hs
+
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 20, "READY")
+            sender, sender_errors = _start_sender(loopback, records)
+            summary = _wait_for_failure(session)
+            _join_sender(sender, sender_errors, timeout=20)
+        assert expected in summary, summary
     finally:
         loopback.close()

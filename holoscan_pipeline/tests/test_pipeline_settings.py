@@ -21,6 +21,14 @@ def test_writer_defaults_to_disabled_one_million_images_per_file():
     assert PipelineConfig(writer=dict(name_pattern="run42/scan_$id")).writer["name_pattern"] == "run42/scan_$id"
 
 
+def test_rdma_protocol_selects_rings():
+    config = PipelineConfig()
+    assert (config.rdma["protocol"], config.rdma["rings"]) == (2, 1)
+    config = PipelineConfig(rdma=dict(protocol=3, rings=4))
+    assert (config.rdma["protocol"], config.rdma["rings"]) == (3, 4)
+    assert PipelineConfig(rdma=dict(protocol=3, rings=256)).rdma["rings"] == 256
+
+
 def test_detector_radius_accepts_192_pixel_extent():
     PipelineConfig(detector=dict(bf_radius=136, adf_inner=24, adf_outer=136))
     with pytest.raises(ValueError):
@@ -30,6 +38,9 @@ def test_detector_radius_accepts_192_pixel_extent():
 @pytest.mark.parametrize("values", [dict(batch_size=0), dict(batch_size=1001), dict(batch_size=True),
     dict(queue_depth=17), dict(transport="udp"), dict(transport="rdma"),
     dict(rdma=dict(max_batch=0)), dict(rdma=dict(ring_memory="host")),
+    dict(rdma=dict(protocol=1)), dict(rdma=dict(protocol="3")), dict(rdma=dict(protocol=3, rings=0)),
+    dict(rdma=dict(protocol=3, rings=257)), dict(rdma=dict(protocol=3, rings=True)),
+    dict(rdma=dict(rings=2)),
     dict(scan=dict(width=0)), dict(execute=dict(mode="unknown")), dict(zmq=dict(extra=1)),
     dict(writer=dict(enabled=1)), dict(writer=dict(output_dir="")),
     dict(writer=dict(name_pattern="/abs/series_$id")), dict(writer=dict(name_pattern="../up_$id")),
@@ -49,3 +60,5 @@ def test_shipped_configs():
     buffle = load_config(root / "buffle_rdma.yaml")
     assert buffle.transport == "rdma" and buffle.execute["mode"] == "service"
     assert buffle.scan == dict(width=1000, height=1000)
+    rings = load_config(root / "rdma_rings.yaml")
+    assert (rings.rdma["protocol"], rings.rdma["rings"], rings.rdma["ring_mib"]) == (3, 4, 64)

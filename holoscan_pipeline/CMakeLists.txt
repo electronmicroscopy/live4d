@@ -43,7 +43,8 @@ add_library(dectris_holoscan_ops SHARED
   cpp/common/fast_cbor_parse.c cpp/common/batch_window.cpp cpp/common/bitshuffle_kernel_gpu.cu
   cpp/common/cbor_value.cpp cpp/common/nxmx_writer.cpp
   cpp/operators/zmq_rx_operator.cu cpp/operators/decompress_gpu_operator.cu
-  cpp/operators/rdma_rx_operator.cu cpp/operators/h5_writer_operator.cu)
+  cpp/operators/rdma_rx_operator.cu cpp/operators/rdma_rings_rx_operator.cu
+  cpp/operators/h5_writer_operator.cu)
 set_target_properties(dectris_holoscan_ops PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON
   BUILD_RPATH "${NVCOMP_RUNTIME_DIR}"

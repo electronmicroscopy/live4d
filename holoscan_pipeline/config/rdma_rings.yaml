@@ -1,0 +1,21 @@
+# imagemux protocol 3: series are written round robin into several receiver rings.
+transport: rdma
+batch_size: 512
+queue_depth: 4
+device: 0
+execute:
+  mode: service
+  seconds: 0
+scan:
+  width: 1000
+  height: 1000
+rdma:
+  remote_address: 192.0.2.20:31003
+  local_address: 192.0.2.10
+  device: ""
+  ring_memory: host_mapped
+  protocol: 3
+  rings: 4
+  ring_mib: 64       # per ring
+  max_batch: 512
+  timeout: 10
