@@ -73,6 +73,7 @@ class PipelineApp:
         if writing:
             writer = H5WriterOp(graph, "h5_writer", output_dir=config.writer["output_dir"],
                                 name_pattern=config.writer["name_pattern"],
+                                format=config.writer["format"],
                                 images_per_file=config.writer["images_per_file"],
                                 staging_batches=config.writer["staging_batches"],
                                 batch_size=config.batch_size, device=config.device,

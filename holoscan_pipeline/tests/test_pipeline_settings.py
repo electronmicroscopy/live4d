@@ -13,7 +13,8 @@ def test_defaults_and_transport_batch_settings():
 def test_writer_defaults_to_disabled_one_million_images_per_file():
     config = PipelineConfig()
     assert config.writer == dict(enabled=False, output_dir="/data", name_pattern="series_$id",
-                                 images_per_file=1000000, staging_batches=4)
+                                 format="nxmx", images_per_file=1000000, staging_batches=4)
+    assert PipelineConfig(writer=dict(format="em")).writer["format"] == "em"
     config = PipelineConfig(writer=dict(enabled=True, output_dir="/out", images_per_file=7))
     assert config.writer["enabled"] and config.writer["images_per_file"] == 7
     assert config.writer["name_pattern"] == "series_$id"
@@ -33,7 +34,7 @@ def test_detector_radius_accepts_192_pixel_extent():
     dict(writer=dict(enabled=1)), dict(writer=dict(output_dir="")),
     dict(writer=dict(name_pattern="/abs/series_$id")), dict(writer=dict(name_pattern="../up_$id")),
     dict(writer=dict(name_pattern="runs/../../up")), dict(writer=dict(name_pattern="runs/")),
-    dict(writer=dict(images_per_file=0)),
+    dict(writer=dict(images_per_file=0)), dict(writer=dict(format="EM")),
     dict(writer=dict(images_per_file=True)), dict(writer=dict(staging_batches=1)),
     dict(writer=dict(compression="lz4"))])
 def test_rejects_invalid_settings(values):

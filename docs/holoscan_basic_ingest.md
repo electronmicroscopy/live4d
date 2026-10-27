@@ -145,7 +145,8 @@ Default downstream settings are 512 images/batch, queue depth 4, CUDA device 0, 
 1000×1000 raster. When the START `header_appendix` map contains integer `scan_width` and
 `scan_height`, that series uses them instead of `scan.width/height`; otherwise it uses the
 configured raster. A START that announces only one of them, or a non-positive or non-integer
-value, is rejected. The configured raster also sizes the READY warm-up. The RDMA example selects `host_mapped`, while an
+value, is rejected. All START `header_appendix` keys are listed in
+[header_appendix keys](header_appendix.md). The configured raster also sizes the READY warm-up. The RDMA example selects `host_mapped`, while an
 omitted `rdma.ring_memory` defaults to `gpu`. An omitted `detector` section uses BF radius
 16 and ADF inner/outer radii 24/48.
 
@@ -197,11 +198,21 @@ image. Files appear under their final names when complete; `.tmp` names mark fil
 Per-image `start_time` datasets are not written because batches carry no image timestamps.
 Unlike imagemux, which uses HDF5 1.14 format bounds, files use the HDF5 1.10 format.
 
+`writer.format: em` selects imagemux's DECTRIS EM format (`DECTRIS_EM`, novena's `hdf5 em 1.0`):
+the same files, plus an external link `/entry/instrument/electron_microscope` in the master file to
+`/electron_microscope` in `<name>_em_metadata.h5` beside it. The link stores only the file name, so
+the file set can move. When the START `header_appendix` contains an `electron_microscope` map,
+the writer creates the metadata file from it at START, in novena's layout; otherwise the
+acquisition controller writes the file, and the link resolves once it exists. The `[h5-series]`
+record reports `em_metadata_file`, or `null` when the writer did not create one. The default
+`nxmx` writes neither. See [header_appendix keys](header_appendix.md#em-metadata-electron_microscope).
+
 ```yaml
 writer:
   enabled: true
   output_dir: /data          # mount a writable host directory here
   name_pattern: series_$id
+  format: nxmx               # em adds the link to <name>_em_metadata.h5
   images_per_file: 1000000
   staging_batches: 4         # pinned staging batches between GPU compression and disk
 ```

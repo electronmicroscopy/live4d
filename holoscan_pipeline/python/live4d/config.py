@@ -19,7 +19,7 @@ class PipelineConfig:
                                                  timeout=10.0))
     writer: dict = field(default_factory=lambda: dict(enabled=False, output_dir="/data",
                                                    name_pattern="series_$id",
-                                                   images_per_file=1000000, staging_batches=4))
+                                                   format="nxmx", images_per_file=1000000, staging_batches=4))
 
     def __post_init__(self):
         defaults = dict(scan=dict(width=1000, height=1000),
@@ -29,7 +29,7 @@ class PipelineConfig:
                         rdma=dict(remote_address="", local_address="", device="", ring_memory="gpu",
                                   ring_mib=64, max_batch=512, timeout=10.0),
                         writer=dict(enabled=False, output_dir="/data", name_pattern="series_$id",
-                                    images_per_file=1000000, staging_batches=4))
+                                    format="nxmx", images_per_file=1000000, staging_batches=4))
         for name, values in defaults.items():
             given = getattr(self, name)
             if not isinstance(given, dict) or set(given) - set(values):
@@ -67,6 +67,8 @@ class PipelineConfig:
                 or pattern.endswith("/") or ".." in pattern.split("/")
                 or pattern.split("/")[-1] == "."):
             raise ValueError("writer.name_pattern must be a relative file name stem below output_dir")
+        if writer["format"] not in ("nxmx", "em"):
+            raise ValueError("writer.format must be 'nxmx' or 'em'")
         if type(writer["images_per_file"]) is not int or writer["images_per_file"] < 1:
             raise ValueError("writer.images_per_file must be a positive integer")
         if type(writer["staging_batches"]) is not int or not 2 <= writer["staging_batches"] <= 64:

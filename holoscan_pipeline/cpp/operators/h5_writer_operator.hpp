@@ -25,6 +25,7 @@ namespace holoscan::ops {
 struct H5WriterParams {
   std::string output_dir{"."};
   std::string name_pattern{"series_$id"};
+  std::string format{"nxmx"};  // "em" adds imagemux's DectrisEm link to <name>_em_metadata.h5
   uint64_t images_per_file{1000000};
   int64_t batch_size{512};
   int64_t staging_batches{4};
@@ -38,6 +39,7 @@ HOLOSCAN_PARAM_SCHEMA(
     H5WriterParams, holoscan::param_schema("holoscan.dectris.H5WriterParams", 1),
     holoscan::field<&H5WriterParams::output_dir>("output_dir"),
     holoscan::field<&H5WriterParams::name_pattern>("name_pattern"),
+    holoscan::field<&H5WriterParams::format>("format"),
     holoscan::field<&H5WriterParams::images_per_file>("images_per_file"),
     holoscan::field<&H5WriterParams::batch_size>("batch_size").range(int64_t{1}, int64_t{1000}),
     holoscan::field<&H5WriterParams::staging_batches>("staging_batches").range(int64_t{2}, int64_t{64}),

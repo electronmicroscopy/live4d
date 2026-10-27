@@ -43,6 +43,7 @@ writer enabled, not how much headroom the writer costs.
 ## Documentation
 
 - [Build, configure, run, and troubleshoot Live4D](docs/holoscan_basic_ingest.md)
+- [START header_appendix keys](docs/header_appendix.md)
 - [Reusable imagemux RDMA package and protocol tests](dectris/README.md)
 - [Stream2 wire-format reference](pipeline/docs/stream_format.md)
 - [Earlier Python experiments and migration notes](pipeline/README.md)

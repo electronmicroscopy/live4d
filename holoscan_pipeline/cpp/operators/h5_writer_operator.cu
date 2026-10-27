@@ -149,6 +149,8 @@ Contract H5WriterOp::contract() const {
 
 void H5WriterOp::start() {
   if (params().images_per_file == 0) throw std::invalid_argument("images_per_file must be positive");
+  if (params().format != "nxmx" && params().format != "em")
+    throw std::invalid_argument("format must be 'nxmx' or 'em'");
   window_ = ::dectris::access(params().publication_window);
   completion_ = ::dectris::access_latch(params().completion_latch);
   active_series_ = false;
@@ -419,6 +421,7 @@ void H5WriterOp::writer_loop() {
     nxmx::DataFile file;
     uint64_t written{}, dropped{}, files{}, bytes{};
     bool enabled{true};
+    bool em_metadata{};  // <name>_em_metadata.h5 written from header_appendix
     std::string name_source;
     std::chrono::steady_clock::time_point first_batch{}, last_write{};
   };
@@ -434,6 +437,9 @@ void H5WriterOp::writer_loop() {
     line += ", \"compression_ratio\": " + (series->bytes ? std::to_string(double(raw) / series->bytes) : "null");
     line += ", \"data_files\": " + std::to_string(series->files);
     line += ", \"dropped_images\": " + std::to_string(series->dropped);
+    line += ", \"em_metadata_file\": " + (series->em_metadata
+                                              ? json_string(series->layout.em_metadata_file().string())
+                                              : std::string("null"));
     line += ", \"ended\": " + std::string(ended ? "true" : "false");
     line += ", \"image_shape\": [" + std::to_string(series->layout.height) + ", " +
             std::to_string(series->layout.width) + "]";
@@ -485,6 +491,7 @@ void H5WriterOp::writer_loop() {
         series->enabled = job.write;
         auto& layout = series->layout;
         layout.images_per_file = params().images_per_file;
+        layout.em_metadata_link = params().format == "em";
         layout.height = job.height;
         layout.width = job.width;
         if (!job.write) {
@@ -496,8 +503,9 @@ void H5WriterOp::writer_loop() {
           // A non-empty header_appendix name_pattern overrides the configured one for this series.
           std::string pattern = params().name_pattern;
           bool from_appendix = false;
-          if (const auto* appendix = start.get("header_appendix");
-              appendix && appendix->untagged().kind == ::dectris::cbor::Value::Kind::kMap) {
+          const auto* appendix = start.get("header_appendix");
+          if (appendix && appendix->untagged().kind != ::dectris::cbor::Value::Kind::kMap) appendix = nullptr;
+          if (appendix) {
             if (const auto* announced_pattern = appendix->get("name_pattern")) {
               const auto text = announced_pattern->as_text();
               if (!text) throw std::runtime_error("header_appendix name_pattern must be a string");
@@ -515,7 +523,19 @@ void H5WriterOp::writer_loop() {
               !channels->untagged().items.empty() && channels->untagged().items[0].as_text())
             layout.channel = *channels->untagged().items[0].as_text();
           // A series announcing no images gets no files; images that arrive anyway are dropped.
-          if (layout.number_of_images > 0) nxmx::write_master_file(layout, start);
+          if (layout.number_of_images > 0) {
+            // In the EM format, an announced electron_microscope map becomes the metadata file;
+            // without one, the controller writes it.
+            const auto* em = appendix && layout.em_metadata_link ? appendix->get("electron_microscope")
+                                                                 : nullptr;
+            if (em) {
+              for (const auto& key : nxmx::write_em_metadata_file(layout, *em))
+                HOLOSCAN_LOG_WARN("series {}: header_appendix {} is not part of the EM metadata format; ignored",
+                                  job.series_id, key);
+              series->em_metadata = true;
+            }
+            nxmx::write_master_file(layout, start);
+          }
         }
       } else if (job.kind == JobKind::kBatch) {
         Slot& slot = slots_[job.slot];

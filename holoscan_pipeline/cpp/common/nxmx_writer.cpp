@@ -397,6 +397,184 @@ std::string with_suffix(const fs::path& path, const char* suffix) {
   return path.string() + suffix;
 }
 
+// EM metadata format 1.0 as written by novena (em_metadata/EmMetadata.h): bools are int8,
+// floats double, unsigned integers uint64, vectors 1-D, and units appear only where novena
+// sets them, spelled as novena spells them.
+enum class EmType { kText, kBool, kUInt, kFloat, kFloat32Array, kFloat64Array };
+
+struct EmField {
+  const char* name;
+  EmType type;
+  const char* units{""};
+  std::vector<std::string_view> choices{};  // allowed text values; the first is the default
+};
+
+struct EmGroup {
+  const char* path;  // below /electron_microscope; empty for the group itself
+  const char* nx_class;
+  std::vector<EmField> fields;
+};
+
+const std::vector<EmGroup>& em_groups() {
+  using T = EmType;
+  const auto aux = [](const char* path) {
+    return EmGroup{path, "NXdetector", {{"description", T::kText}, {"gain", T::kFloat},
+                                        {"offset", T::kFloat}, {"data", T::kFloat32Array}}};
+  };
+  static const std::vector<EmGroup> groups{
+      {"", "NXem_instrument",
+       {{"instrument_type", T::kText}, {"manufacturer", T::kText}, {"model", T::kText},
+        {"location", T::kText}}},
+      {"experiment", "NXcollection",
+       {{"persons", T::kText}, {"time", T::kText}, {"sample", T::kText},
+        {"description", T::kText}}},
+      {"electron_source", "NXebeam_column",
+       {{"gun_type", T::kText}, {"accelerating_voltage", T::kFloat, "V"},
+        {"beam_current", T::kFloat, "A"}, {"spot_size", T::kUInt}}},
+      {"illumination_system", "NXem_optical_system",
+       {{"mode", T::kText}, {"submode", T::kText}, {"scan_magnification", T::kFloat},
+        {"scan_field_of_view_x", T::kFloat, "m"}, {"scan_field_of_view_y", T::kFloat, "m"},
+        {"working_distance", T::kFloat, "m"}, {"beam_diameter", T::kFloat, "m"},
+        {"semi_convergence_angle", T::kFloat, "mrad"}, {"defocus", T::kFloat, "m"},
+        {"beam_defining_aperture_type", T::kText},
+        {"beam_defining_aperture_size", T::kFloat, "m"}}},
+      {"imaging_system", "NXem_optical_system",
+       {{"mode", T::kText}, {"image_magnification", T::kFloat}, {"pixel_size_x", T::kFloat, "m"},
+        {"pixel_size_y", T::kFloat, "m"}, {"camera_length", T::kFloat, "m"},
+        {"reciprocal_pixel_size_x", T::kFloat, "mrad"},
+        {"reciprocal_pixel_size_y", T::kFloat, "mrad"}, {"rotation", T::kFloat, "degrees"},
+        {"defocus", T::kFloat, "m"}}},
+      {"scan_controller", "NXscan_controller",
+       {{"manufacturer", T::kText}, {"model", T::kText}, {"enabled", T::kBool},
+        {"rotation", T::kFloat, "degrees"}, {"rotation_offset", T::kFloat, "degrees"},
+        {"scan_type", T::kText, "", {"regular", "irregular"}}}},
+      {"scan_controller/regular_scan", "NXparameters",
+       {{"scan_pattern", T::kText, "", {"raster", "serpentine"}}, {"dwell_time", T::kFloat, "s"},
+        {"flyback_time_line", T::kFloat, "s"}, {"flyback_time_frame", T::kFloat, "s"},
+        {"frame_interval", T::kFloat, "s"}, {"n_frames", T::kUInt}, {"n_pixels_x", T::kUInt},
+        {"n_pixels_y", T::kUInt}, {"pixel_size_x", T::kFloat, "m"},
+        {"pixel_size_y", T::kFloat, "m"}}},
+      {"scan_controller/irregular_scan", "NXparameters",
+       {{"n_scan_positions", T::kUInt}, {"dwell_time", T::kFloat64Array, "s"},
+        {"position_x", T::kFloat64Array, "m"}, {"position_y", T::kFloat64Array, "m"}}},
+      aux("scan_controller/aux_detector_1"), aux("scan_controller/aux_detector_2"),
+      aux("scan_controller/aux_detector_3"), aux("scan_controller/aux_detector_4"),
+      {"sample_stage", "NXcollection",
+       {{"manufacturer", T::kText}, {"model", T::kText}, {"position_x", T::kFloat, "m"},
+        {"position_y", T::kFloat, "m"}, {"position_z", T::kFloat, "m"},
+        {"tilt_alpha", T::kFloat, "degrees"}, {"tilt_beta", T::kFloat, "degrees"}}}};
+  return groups;
+}
+
+std::string em_key(std::string_view path, std::string_view name = {}) {
+  std::string key = "electron_microscope";
+  for (std::string_view part : {path, name}) {
+    if (part.empty()) continue;
+    key += '.';
+    key += part;
+  }
+  for (char& ch : key) if (ch == '/') ch = '.';
+  return key;
+}
+
+// The map at path below metadata, or nullptr when a level is absent.
+const Value* em_map(const Value& metadata, std::string_view path) {
+  const Value* map = &metadata;
+  std::string_view prefix = path;
+  for (size_t at = 0; map && at < path.size();) {
+    const size_t slash = std::min(path.find('/', at), path.size());
+    map = map->get(path.substr(at, slash - at));
+    prefix = path.substr(0, slash);
+    at = slash + 1;
+    if (map && map->untagged().kind != Value::Kind::kMap)
+      throw std::invalid_argument("header_appendix " + em_key(prefix) + " must be a map");
+  }
+  return map;
+}
+
+std::vector<double> em_numbers(const Value& value, const std::string& key) {
+  const Value& v = value.untagged();
+  std::vector<double> numbers;
+  if (v.kind == Value::Kind::kArray) {
+    for (const Value& item : v.items) {
+      const auto number = item.as_double();
+      if (!number) throw std::invalid_argument("header_appendix " + key + " must be an array of numbers");
+      numbers.push_back(*number);
+    }
+    return numbers;
+  }
+  const auto array = cbor::numeric_array(v);
+  using A = cbor::NumericArray::Type;
+  if (!array || array->shape.size() != 1 || (array->type != A::kFloat32 && array->type != A::kFloat64))
+    throw std::invalid_argument("header_appendix " + key + " must be an array of numbers");
+  for (size_t i = 0; i < array->elements(); ++i) {
+    if (array->type == A::kFloat32) {
+      float x;
+      std::memcpy(&x, array->data.data() + i * sizeof(x), sizeof(x));
+      numbers.push_back(x);
+    } else {
+      double x;
+      std::memcpy(&x, array->data.data() + i * sizeof(x), sizeof(x));
+      numbers.push_back(x);
+    }
+  }
+  return numbers;
+}
+
+Id em_dataset(hid_t parent, std::string_view path, const EmField& field, const Value* value) {
+  const std::string key = em_key(path, field.name);
+  const auto invalid = [&](const std::string& expected) {
+    return std::invalid_argument("header_appendix " + key + " must be " + expected);
+  };
+  switch (field.type) {
+    case EmType::kText: {
+      std::string text = field.choices.empty() ? "" : std::string(field.choices.front());
+      if (value) {
+        if (!value->as_text()) throw invalid("a string");
+        text = *value->as_text();
+        if (!field.choices.empty() &&
+            std::find(field.choices.begin(), field.choices.end(), text) == field.choices.end()) {
+          std::string allowed;
+          for (const auto choice : field.choices)
+            allowed += (allowed.empty() ? "\"" : " or \"") + std::string(choice) + "\"";
+          throw invalid(allowed);
+        }
+      }
+      return dataset(parent, field.name, text);
+    }
+    case EmType::kBool: {
+      if (value && !value->as_bool()) throw invalid("a boolean");
+      const int8_t flag = value ? *value->as_bool() : 0;
+      return dataset(parent, field.name, H5T_NATIVE_INT8, scalar_space(), &flag);
+    }
+    case EmType::kUInt: {
+      if (value && (!value->as_int() || *value->as_int() < 0)) throw invalid("a non-negative integer");
+      const uint64_t number = value ? static_cast<uint64_t>(*value->as_int()) : 0;
+      return dataset(parent, field.name, H5T_NATIVE_UINT64, scalar_space(), &number);
+    }
+    case EmType::kFloat: {
+      if (value && !value->as_double()) throw invalid("a number");
+      const double number = value ? *value->as_double() : 0.0;
+      return dataset(parent, field.name, H5T_NATIVE_DOUBLE, scalar_space(), &number);
+    }
+    case EmType::kFloat64Array: {
+      const std::vector<double> numbers = value ? em_numbers(*value, key) : std::vector<double>{0.0};
+      return dataset(parent, field.name, H5T_NATIVE_DOUBLE, simple_space({numbers.size()}), numbers.data());
+    }
+    case EmType::kFloat32Array: {
+      const std::vector<double> numbers = value ? em_numbers(*value, key) : std::vector<double>{0.0};
+      const std::vector<float> narrow(numbers.begin(), numbers.end());
+      return dataset(parent, field.name, H5T_NATIVE_FLOAT, simple_space({narrow.size()}), narrow.data());
+    }
+  }
+  throw std::logic_error("unknown EM metadata type");
+}
+
+void write_em_field(hid_t parent, std::string_view path, const EmField& field, const Value* value) {
+  Id d = em_dataset(parent, path, field, value);
+  if (*field.units) attr(d, "units", field.units);
+}
+
 }  // namespace
 
 void register_filters() {
@@ -432,6 +610,8 @@ fs::path SeriesLayout::data_file(uint64_t file_number) const {
   return with_suffix(prefix, suffix);
 }
 
+fs::path SeriesLayout::em_metadata_file() const { return with_suffix(prefix, "_em_metadata.h5"); }
+
 void write_master_file(const SeriesLayout& layout, const Value& start) {
   if (layout.number_of_images == 0 || layout.images_per_file == 0)
     throw std::invalid_argument("NXmx series requires images and images per file");
@@ -443,6 +623,13 @@ void write_master_file(const SeriesLayout& layout, const Value& start) {
     try {
       write_entry(file, layout);
       write_detector(file, layout, start);
+      if (layout.em_metadata_link) {
+        // Relative, like imagemux, so the file set can move; resolved only when followed.
+        const std::string target = layout.em_metadata_file().filename().string();
+        check(H5Lcreate_external(target.c_str(), "/electron_microscope", file,
+                                 "/entry/instrument/electron_microscope", H5P_DEFAULT, H5P_DEFAULT),
+              "link EM metadata");
+      }
       write_sample(file, layout, start);
       check(H5Fflush(file, H5F_SCOPE_LOCAL), "flush master file");
     } catch (...) {
@@ -452,6 +639,58 @@ void write_master_file(const SeriesLayout& layout, const Value& start) {
     }
   }
   fs::rename(temp, path);
+}
+
+std::vector<std::string> write_em_metadata_file(const SeriesLayout& layout, const Value& metadata) {
+  if (metadata.untagged().kind != Value::Kind::kMap)
+    throw std::invalid_argument("header_appendix electron_microscope must be a map");
+  const auto& groups = em_groups();
+  std::vector<std::string> ignored;
+  // Keys that name neither a field nor a subgroup of the map's group.
+  for (const auto& g : groups) {
+    const Value* map = em_map(metadata, g.path);
+    if (!map) continue;
+    const std::string_view path = g.path;
+    const auto& items = map->untagged().items;
+    for (size_t i = 0; i + 1 < items.size(); i += 2) {
+      const auto name = items[i].as_text();
+      if (!name) {
+        ignored.push_back(em_key(path, "<non-text key>"));
+        continue;
+      }
+      const bool field = std::any_of(g.fields.begin(), g.fields.end(),
+                                     [&](const EmField& f) { return *name == f.name; });
+      const std::string child = path.empty() ? *name : std::string(path) + "/" + *name;
+      const bool subgroup = std::any_of(groups.begin(), groups.end(),
+                                        [&](const EmGroup& o) { return child == o.path; });
+      if (!field && !subgroup) ignored.push_back(em_key(path, *name));
+    }
+  }
+
+  const fs::path path = layout.em_metadata_file();
+  const fs::path temp = with_suffix(path, kTempSuffix);
+  fs::create_directories(path.parent_path());
+  {
+    Id file(H5Fcreate(temp.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, file_access()),
+            "create EM metadata file");
+    try {
+      for (const auto& g : groups) {
+        const std::string name = std::string("/electron_microscope") + (*g.path ? "/" : "") + g.path;
+        Id h5 = group(file, name.c_str(), g.nx_class);
+        if (!*g.path) attr(h5, "format_version", "1.0");
+        const Value* map = em_map(metadata, g.path);
+        for (const auto& field : g.fields)
+          write_em_field(h5, g.path, field, map ? map->get(field.name) : nullptr);
+      }
+      check(H5Fflush(file, H5F_SCOPE_LOCAL), "flush EM metadata file");
+    } catch (...) {
+      std::error_code ignored_error;
+      fs::remove(temp, ignored_error);
+      throw;
+    }
+  }
+  fs::rename(temp, path);
+  return ignored;
 }
 
 DataFile::~DataFile() {

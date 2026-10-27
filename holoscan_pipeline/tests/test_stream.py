@@ -423,6 +423,206 @@ def test_hdf5_writer_both_sizes_partial_empty_and_dropped_images(tmp_path, capfd
     assert not list(tmp_path.glob("*.tmp"))
 
 
+READ_EM = """
+import json, sys
+import h5py
+master_name, metadata_name = sys.argv[1], sys.argv[2]
+out = {}
+with h5py.File(master_name, "r") as m:
+    link = m["/entry/instrument"].get("electron_microscope", getlink=True)
+    out["link"] = [link.filename, link.path] if isinstance(link, h5py.ExternalLink) else None
+
+def text(v):
+    return v.decode() if isinstance(v, bytes) else v
+
+def visit(name, obj):
+    attrs = {k: text(v) for k, v in obj.attrs.items()}
+    if isinstance(obj, h5py.Group):
+        out["groups"][name] = attrs
+        return
+    string = h5py.check_string_dtype(obj.dtype)
+    if string:
+        kind = "str" if string.length is None and string.encoding == "utf-8" else repr(obj.dtype)
+        value = text(obj[()])
+    else:
+        kind = obj.dtype.name + ("[]" if obj.shape else "")
+        value = obj[()].tolist()
+    out["fields"][name] = dict(kind=kind, value=value, units=attrs.get("units"))
+
+if metadata_name != "-":
+    with h5py.File(metadata_name, "r") as f:
+        out["groups"], out["fields"] = {}, {}
+        out["groups"]["electron_microscope"] = {k: text(v) for k, v in f["electron_microscope"].attrs.items()}
+        f["electron_microscope"].visititems(lambda n, o: visit("electron_microscope/" + n, o))
+print(json.dumps(out))
+"""
+
+
+def read_em(master, metadata=None):
+    result = subprocess.run([sys.executable, "-I", "-c", READ_EM, str(master), str(metadata or "-")],
+                            check=True, capture_output=True, text=True)
+    return json.loads(result.stdout)
+
+
+# The EM metadata format 1.0 as novena writes it (em_metadata/EmMetadata.h): group -> NX_class
+# and field -> (HDF5 type, units). Written out independently of the writer's own table.
+F, S, B, U = "float64", "str", "int8", "uint64"
+EM_LAYOUT = {
+    "": ("NXem_instrument", dict(instrument_type=(S, None), manufacturer=(S, None),
+                                 model=(S, None), location=(S, None))),
+    "experiment": ("NXcollection", dict(persons=(S, None), time=(S, None), sample=(S, None),
+                                        description=(S, None))),
+    "electron_source": ("NXebeam_column", dict(gun_type=(S, None), accelerating_voltage=(F, "V"),
+                                               beam_current=(F, "A"), spot_size=(U, None))),
+    "illumination_system": ("NXem_optical_system", dict(
+        mode=(S, None), submode=(S, None), scan_magnification=(F, None),
+        scan_field_of_view_x=(F, "m"), scan_field_of_view_y=(F, "m"), working_distance=(F, "m"),
+        beam_diameter=(F, "m"), semi_convergence_angle=(F, "mrad"), defocus=(F, "m"),
+        beam_defining_aperture_type=(S, None), beam_defining_aperture_size=(F, "m"))),
+    "imaging_system": ("NXem_optical_system", dict(
+        mode=(S, None), image_magnification=(F, None), pixel_size_x=(F, "m"),
+        pixel_size_y=(F, "m"), camera_length=(F, "m"), reciprocal_pixel_size_x=(F, "mrad"),
+        reciprocal_pixel_size_y=(F, "mrad"), rotation=(F, "degrees"), defocus=(F, "m"))),
+    "scan_controller": ("NXscan_controller", dict(
+        manufacturer=(S, None), model=(S, None), enabled=(B, None), rotation=(F, "degrees"),
+        rotation_offset=(F, "degrees"), scan_type=(S, None))),
+    "scan_controller/regular_scan": ("NXparameters", dict(
+        scan_pattern=(S, None), dwell_time=(F, "s"), flyback_time_line=(F, "s"),
+        flyback_time_frame=(F, "s"), frame_interval=(F, "s"), n_frames=(U, None),
+        n_pixels_x=(U, None), n_pixels_y=(U, None), pixel_size_x=(F, "m"), pixel_size_y=(F, "m"))),
+    "scan_controller/irregular_scan": ("NXparameters", dict(
+        n_scan_positions=(U, None), dwell_time=("float64[]", "s"), position_x=("float64[]", "m"),
+        position_y=("float64[]", "m"))),
+    **{f"scan_controller/aux_detector_{n}": ("NXdetector", dict(
+        description=(S, None), gain=(F, None), offset=(F, None), data=("float32[]", None)))
+       for n in range(1, 5)},
+    "sample_stage": ("NXcollection", dict(
+        manufacturer=(S, None), model=(S, None), position_x=(F, "m"), position_y=(F, "m"),
+        position_z=(F, "m"), tilt_alpha=(F, "degrees"), tilt_beta=(F, "degrees"))),
+}
+
+
+def em_path(group, name=None):
+    return "/".join(p for p in ("electron_microscope", group, name) if p)
+
+
+def em_default(group, name, kind):
+    if (group, name) == ("scan_controller", "scan_type"):
+        return "regular"
+    if (group, name) == ("scan_controller/regular_scan", "scan_pattern"):
+        return "raster"
+    return {S: "", "float64[]": [0.0], "float32[]": [0.0]}.get(kind, 0)
+
+
+def assert_em_file(tree, given):
+    # Every group and field of the format, with novena's types and units; given values where
+    # announced and novena's defaults elsewhere.
+    expected_groups = {em_path(g): dict(NX_class=c) for g, (c, _) in EM_LAYOUT.items()}
+    expected_groups["electron_microscope"]["format_version"] = "1.0"
+    assert tree["groups"] == expected_groups
+    expected = {}
+    for g, (_, fields) in EM_LAYOUT.items():
+        for name, (kind, units) in fields.items():
+            value = given
+            for part in [*filter(None, g.split("/")), name]:
+                value = value.get(part, {}) if isinstance(value, dict) else {}
+            value = em_default(g, name, kind) if value == {} else value
+            if kind == B:
+                value = int(value)
+            expected[em_path(g, name)] = dict(kind=kind, value=value, units=units)
+    assert tree["fields"] == expected
+
+
+EM_FULL = {
+    "instrument_type": "TEM", "manufacturer": "FEI Co", "model": "Tecnai", "location": "Baden",
+    "experiment": {"persons": "A. Person", "time": "2026-10-27 12:00:00", "sample": "Au",
+                   "description": "µ-STEM test"},
+    "electron_source": {"gun_type": "Schottky FEG", "accelerating_voltage": 200000,
+                        "beam_current": 5.0e-11, "spot_size": 7},
+    "illumination_system": {"mode": "STEM", "submode": "scanning", "scan_magnification": 225000.0,
+                            "scan_field_of_view_x": 2.56e-7, "scan_field_of_view_y": 1.28e-7,
+                            "semi_convergence_angle": 20.5, "beam_defining_aperture_type": "C2",
+                            "beam_defining_aperture_size": 5.0e-5},
+    "imaging_system": {"mode": "diffraction", "camera_length": 0.12,
+                       "reciprocal_pixel_size_x": 0.46, "reciprocal_pixel_size_y": 0.47},
+    "scan_controller": {
+        "manufacturer": "Point Electronic GmbH", "model": "Revolon", "enabled": True,
+        "rotation": -12.5, "rotation_offset": 3.0, "scan_type": "irregular",
+        "regular_scan": {"scan_pattern": "serpentine", "dwell_time": 8.3e-6, "n_frames": 1,
+                         "n_pixels_x": 4, "n_pixels_y": 2, "pixel_size_x": 1.0e-9,
+                         "pixel_size_y": 2.0e-9},
+        "irregular_scan": {"n_scan_positions": 3, "dwell_time": [1e-6, 2e-6, 3e-6],
+                           "position_x": [0.0, 1e-9, 2e-9], "position_y": [0, 0, 1e-9]},
+        "aux_detector_2": {"description": "HAADF", "gain": 2.0, "offset": -1.0,
+                           "data": [0.5, 1.5, 2.5]}},
+    "sample_stage": {"position_z": -1.0e-6, "tilt_alpha": 15.0},
+}
+
+
+def test_hdf5_writer_em_format_writes_metadata_from_header_appendix(tmp_path, capfd):
+    # writer.format em: a header_appendix electron_microscope map becomes <name>_em_metadata.h5
+    # in novena's layout, linked from the master file, for both image sizes. Series 1 announces
+    # a full map with two unknown keys, series 2 (192x192) a partial map under an appendix name
+    # pattern, series 3 none: it gets only the link, for the controller to fill.
+    em_partial = {"electron_source": {"accelerating_voltage": 300000.0},
+                  "scan_controller": {"regular_scan": {"n_pixels_x": 4}}}
+    em_unknown = dict(EM_FULL, dose=12.0, experiment=dict(EM_FULL["experiment"], operator_id=7))
+    series = [(1, [0, 1]), (2, [0], (192, 192)), (3, [0])]
+    run_series(series, service=True, pixels=series_pixels,
+               appendices={1: {"electron_microscope": em_unknown},
+                           2: {"name_pattern": "sub/custom_$id", "electron_microscope": em_partial},
+                           3: {"scan_width": 4, "scan_height": 2}},
+               writer=dict(output_dir=str(tmp_path), format="em", name_pattern="run_$id"))
+    captured = capfd.readouterr()
+
+    tree = read_em(tmp_path / "run_1_master.h5", tmp_path / "run_1_em_metadata.h5")
+    assert tree["link"] == ["run_1_em_metadata.h5", "/electron_microscope"]
+    assert_em_file(tree, EM_FULL)
+    log = captured.out + captured.err
+    for key in ("electron_microscope.dose", "electron_microscope.experiment.operator_id"):
+        assert f"series 1: header_appendix {key} is not part of the EM metadata format" in log
+
+    sub = tmp_path / "sub"
+    tree = read_em(sub / "custom_2_master.h5", sub / "custom_2_em_metadata.h5")
+    assert tree["link"] == ["custom_2_em_metadata.h5", "/electron_microscope"]
+    assert_em_file(tree, em_partial)
+
+    assert read_em(tmp_path / "run_3_master.h5")["link"] == ["run_3_em_metadata.h5", "/electron_microscope"]
+    assert not (tmp_path / "run_3_em_metadata.h5").exists()
+    records = {r["series_id"]: r for r in h5_series_records(captured.out)}
+    assert records[1]["em_metadata_file"] == str(tmp_path / "run_1_em_metadata.h5")
+    assert records[2]["em_metadata_file"] == str(sub / "custom_2_em_metadata.h5")
+    assert records[3]["em_metadata_file"] is None
+    for prefix, shape, image_id in ((tmp_path / "run_1", (96, 96), 1), (sub / "custom_2", (192, 192), 0)):
+        meta, data = read_series(prefix, tmp_path)
+        np.testing.assert_array_equal(data[image_id, 0], series_pixels(int(prefix.name[-1]), image_id, shape))
+    assert not list(tmp_path.rglob("*.tmp"))
+
+    # nxmx ignores the map, even an invalid one: no link and no metadata file.
+    nxmx = tmp_path / "nxmx"
+    run_series([(4, [0])], pixels=series_pixels, writer=dict(output_dir=str(nxmx)),
+               appendices={4: {"electron_microscope": {"electron_source": {"accelerating_voltage": "x"}}}})
+    assert read_em(nxmx / "series_4_master.h5")["link"] is None
+    assert not list(nxmx.glob("*_em_metadata.h5"))
+
+
+@pytest.mark.parametrize("em", [
+    "TEM", {"experiment": "x"}, {"scan_controller": {"regular_scan": 1}},
+    {"electron_source": {"accelerating_voltage": "200 kV"}},
+    {"electron_source": {"accelerating_voltage": True}},
+    {"scan_controller": {"enabled": 1}}, {"electron_source": {"spot_size": -1}},
+    {"electron_source": {"spot_size": 1.5}}, {"model": 3},
+    {"scan_controller": {"scan_type": "spiral"}},
+    {"scan_controller": {"regular_scan": {"scan_pattern": "Raster"}}},
+    {"scan_controller": {"aux_detector_1": {"data": [1.0, "x"]}}},
+    {"scan_controller": {"irregular_scan": {"position_x": 1.0}}}])
+def test_hdf5_writer_em_format_rejects_invalid_metadata(em, tmp_path):
+    # An invalid announced value fails the run before any file of the series is written.
+    run_series([(14, [0])], appendices={14: {"electron_microscope": em}}, expect_error=True,
+               writer=dict(output_dir=str(tmp_path), format="em"))
+    assert not list(tmp_path.rglob("*.h5")) and not list(tmp_path.rglob("*.tmp"))
+
+
 def test_hdf5_writer_finite_mode_completes_after_last_write(tmp_path, capfd):
     # A slow detector and a writer both see END; completion waits for the later one.
     count = 33
