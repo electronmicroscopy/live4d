@@ -1,9 +1,11 @@
-# The pipeline image with lossless ANS encoding (encoder.enabled): quantem.gpu, pinned to one commit.
+# The pipeline image with lossless ANS encoding (encoder.enabled) and 0°/90° drift (algorithms.scan_drift):
+# quantem.gpu and quantem (branch hackathon), each pinned to one commit.
 #   docker build -f docker/Dockerfile.holoscan --target pipeline -t live4d:pipeline .
 #   docker build -f docker/Dockerfile.ans -t live4d:ans .
 ARG PIPELINE_IMAGE=live4d:pipeline
 FROM ${PIPELINE_IMAGE}
-ARG QUANTEM_GPU_COMMIT=96d58fb
+ARG QUANTEM_GPU_COMMIT=a8cb286
+ARG QUANTEM_COMMIT=749e5cb
 # quantem.gpu imports h5py in the pipeline process, where the HDF5 writer has loaded the system
 # HDF5 globally. Two HDF5 libraries in one process fail in either import order, so h5py and the
 # hdf5plugin filters are built against the system HDF5: one process, one HDF5.
@@ -12,6 +14,7 @@ RUN --mount=type=secret,id=build_resolv,target=/etc/resolv.conf,mode=0444 \
       --no-binary h5py,hdf5plugin --force-reinstall --no-deps "h5py>=3.11" hdf5plugin
 RUN --mount=type=secret,id=build_resolv,target=/etc/resolv.conf,mode=0444 \
     python3 -m pip install --no-cache-dir \
-      "quantem.gpu @ git+https://github.com/bobleesj/quantem.gpu.git@${QUANTEM_GPU_COMMIT}"
+      "quantem.gpu @ git+https://github.com/bobleesj/quantem.gpu.git@${QUANTEM_GPU_COMMIT}" \
+      "quantem @ git+https://github.com/bobleesj/quantem.git@${QUANTEM_COMMIT}"
 # No GPU at build time: check the HDF5 stack only (quantem.gpu's CUDA code loads at run time).
 RUN python3 -c "import h5py, hdf5plugin; print('HDF5', h5py.version.hdf5_version)"
