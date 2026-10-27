@@ -245,6 +245,27 @@ and the per-scan values (trigger mode, `nimages`, `ntrigger`, frame time, binnin
   included, even with the pipeline connected; re-arming does not clear it (see "If something goes
   wrong").
 
+## Live benchmark panel
+
+The in-process browser viewer (`--viewer-port 8050`) includes a **Live benchmarks** panel.
+It polls `/telemetry` once per second independently of image updates and keeps a bounded
+60-sample history. It shows detector-frame throughput (a rolling one-second estimate and
+scan average), progress, host batch time p50/p95/p99, batch interval jitter, application CPU
+and resident RAM, host CPU/RAM, visible GPU utilization/temperature/power, and interface
+RX/TX bandwidth. GPU memory is shown as unavailable when unsupported by the driver.
+The 120k fps reference is a display reference, not a sender configuration or a measured capacity.
+
+Throughput is observed at the sink after CPU submission, without adding GPU synchronizations.
+The first batch is excluded from the scan-rate numerator because it precedes the timing interval.
+Host batch time includes validation, existing waits and CPU submission; it is not CUDA kernel
+execution time or sender-to-result latency. Timing distributions cover the latest 2048 batches.
+Backlog and end-to-end latency are not instrumented. Resource values are host-wide except for
+application CPU/RAM; application CPU can exceed 100% (one logical CPU). Interface counters
+include other applications' traffic and do not measure detector-specific loss. Scan missing and
+duplicate positions are checked at scan end; they are unknown while a scan is in progress.
+The previous scan's summary remains visible when continuous mode waits for the next scan.
+The standalone subscriber viewer has no access to sink measurements and hides this panel.
+
 ## Run an experiment
 
 ### The setup

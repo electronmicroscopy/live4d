@@ -38,6 +38,9 @@ class BatchSink:
         self.live_publisher = live_publisher
         self._live_every_rows = int(live_every_rows)
         self.replace_accumulator(acc)
+        self.telemetry = getattr(live_publisher, "telemetry", None)
+        if self.telemetry is not None:
+            self.telemetry.begin(self._n_positions)
         self._throttle = None
         if live_publisher is not None and self._rows_frames <= 0:
             from realtime_stem.streaming.live_stream import Throttle   # lazy: no zmq otherwise
@@ -71,6 +74,7 @@ class BatchSink:
 
     def feed(self, frames, ids) -> None:
         """Fold one batch: `frames` (B, H, W), `ids` (B,) raster scan indices (host or device)."""
+        entered = time.perf_counter() if self.telemetry is not None else None
         if self._start is None:
             self._start = time.perf_counter()
 
@@ -99,6 +103,8 @@ class BatchSink:
         self._batches += 1
         self._frames += n
         self._last = time.perf_counter()
+        if self.telemetry is not None:
+            self.telemetry.record(n, entered, self._last)
         if self._batches % self.print_every == 0:
             elapsed = max(time.perf_counter() - self._start, 1e-9)
             print(f"[sink] batches={self._batches} frames={self._frames} "
@@ -132,6 +138,8 @@ class BatchSink:
         gives the positions visited and the number of passes instead.
         """
         covered = int(self._seen.sum()) if self._seen is not None else 0
+        if self.telemetry is not None:
+            self.telemetry.finish(covered, self._wrap_ids)
         missing = self._n_positions - covered
         if self._wrap_ids:
             passes = self._frames / self._n_positions

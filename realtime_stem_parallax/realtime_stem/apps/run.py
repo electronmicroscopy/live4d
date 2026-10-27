@@ -428,15 +428,21 @@ def main() -> None:
                 acc, args.out_dir, k, args.save_passes_dtype, executor=saver))
 
     control = None
+    telemetry = None
     if args.viewer_port:
         from realtime_stem.apps.control import LiveControl
         from realtime_stem.streaming.live_stream import Fanout
         from realtime_stem.streaming.web.server import FrameStore, StorePublisher, serve
         store = FrameStore()
         publisher = Fanout(publisher, StorePublisher(store))
+        from realtime_stem.streaming.telemetry import Telemetry
+        telemetry = Telemetry(args.endpoint if args.transport == "zmq"
+                              else f"tcp://{args.rdma_remote}")
+        publisher.telemetry = telemetry
+        telemetry.start()
         control = LiveControl(algorithm, args, publisher=publisher, on_new_accumulator=hook)
         viewer = serve(store, args.viewer_host, args.viewer_port, endpoint="run.py, in process",
-                       control=control)
+                       control=control, telemetry=telemetry)
         host = "127.0.0.1" if args.viewer_host in ("", "0.0.0.0") else args.viewer_host
         print(f"[run] viewer on http://{host}:{viewer.server_address[1]}/ with live control of "
               f"the reconstruction", flush=True)
@@ -572,6 +578,8 @@ def main() -> None:
         if control is not None and not stopped:
             wait_with_viewer(control, stop, algorithm, args.out_dir)
     finally:
+        if telemetry is not None:
+            telemetry.close()
         if session is not None:
             session.close()
         if saver is not None:

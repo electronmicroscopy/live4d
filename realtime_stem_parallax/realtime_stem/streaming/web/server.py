@@ -15,6 +15,7 @@ Endpoints (all GET):
     /                the page;  /static/<file>  its scripts
     /events          Server-Sent Events: the state (below) of each new snapshot
     /state           the state of the newest snapshot (or ?seq=), as JSON
+    /telemetry       live sink measurements and host resources (in-process viewer only)
     /view            ?seq&ch&y0&x0&h&w&oh&ow[&hp&lp&order]: a region, block-averaged by the
                      largest integer that keeps it at least oh × ow, optionally high/low-passed
                      (Butterworth of `order`, 12 by default, cutoff periods in full-resolution
@@ -272,6 +273,7 @@ class _Handler(BaseHTTPRequestHandler):
     store: FrameStore = None          # set by make_server
     endpoint: str = ""
     control = None                    # a live control (apps/control.py) when run.py serves the page
+    telemetry = None
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):     # quiet: the page polls /view a lot
@@ -345,6 +347,10 @@ class _Handler(BaseHTTPRequestHandler):
         if self.control is None:
             return self._error(404, "no live control: run.py --viewer-port serves one")
         self._json(self.control.state())
+
+    def _get_telemetry(self, url, q):
+        self._json(self.telemetry.snapshot() if self.telemetry is not None
+                   else {"available": False})
 
     def do_POST(self):
         url = urlsplit(self.path)
@@ -421,11 +427,11 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 def make_server(store: FrameStore, host: str = "127.0.0.1", port: int = 8050,
-                endpoint: str = "", control=None) -> ThreadingHTTPServer:
+                endpoint: str = "", control=None, telemetry=None) -> ThreadingHTTPServer:
     """The viewer's HTTP server over `store`; with a `control` (state() → dict, update(dict) →
     dict) the page also offers the reconstruction's live parameters (/params)."""
     handler = type("Handler", (_Handler,), {"store": store, "endpoint": endpoint,
-                                            "control": control})
+                                            "control": control, "telemetry": telemetry})
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     return server
@@ -448,10 +454,10 @@ class StorePublisher:
         pass
 
 
-def serve(store: FrameStore, host: str, port: int, endpoint: str = "", control=None):
+def serve(store: FrameStore, host: str, port: int, endpoint: str = "", control=None, telemetry=None):
     """Start the viewer's server on a daemon thread; returns the server (its address is
     server.server_address)."""
-    server = make_server(store, host, port, endpoint=endpoint, control=control)
+    server = make_server(store, host, port, endpoint=endpoint, control=control, telemetry=telemetry)
     threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True,
                      name="viewer").start()
     return server
