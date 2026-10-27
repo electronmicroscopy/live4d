@@ -1,0 +1,1 @@
+--binned --scan 256 256 --energy 200000 --semiangle 30 --angular-sampling 1.066 --scan-sampling 1.98 --defocus=-300 --rotation=3.75

@@ -16,3 +16,7 @@ rdma:
   ring_mib: 64
   max_batch: 512
   timeout: 10
+
+# Optional reconstruction: requires explicit acquisition settings when enabled.
+parallax:
+  enabled: false

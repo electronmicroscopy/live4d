@@ -9,8 +9,11 @@ the series metadata.
 
 ```text
 ZMQ → pinned compressed batches → GPU BSLZ4 decode ─┐
-                                                 ├→ DecodedBatch → scan positions → BF/ADF
-RDMA → registered ingress ring → GPU tensor loan ─┘              └→ optional NXmx HDF5 writer
+                                                 ├→ DecodedBatch
+RDMA → registered ingress ring → GPU tensor loan ─┘       ├→ scan positions → BF/ADF
+                                                         ├→ parallax (optional)
+                                                         ├→ NXmx / EM HDF5 writer (optional)
+                                                         └→ ANS encoder (optional)
 ```
 
 ## Project structure and algorithms
@@ -403,3 +406,11 @@ Keep historical measurements tied to their tested revision: the tensor-retiremen
 in `4b4b12f` changed `delivered_fps` from per-batch GPU-completion timing to host-submission
 timing. Older and newer rates need that distinction when compared. Transport-only RDMA
 WRITE or NIC-loopback measurements do not establish Live4D processing capacity.
+
+## Optional parallax reconstruction
+
+`parallax.enabled: true` adds a consumer directly to decoded batches, alongside
+BF/ADF, optional HDF5, and optional ANS. Build the `parallax` target in the shared
+Dockerfile to add PyTorch; both targets launch `live4d`. Physics values must be
+explicit in YAML. See [setup, offline replay, and migration](parallax/GUIDE.md).
+The parallax viewer's throughput/host timings measure that branch only.

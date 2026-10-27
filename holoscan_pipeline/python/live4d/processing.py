@@ -146,7 +146,6 @@ class VirtualDetectorOp(hs.Operator):
                 stream.synchronize()
                 del view
                 if self.ready is not None:
-                    print("[holoscan] ready", flush=True)
                     self.ready.set()
                 if self.release is not None:
                     self.release(int(batch.batch_id))
@@ -303,3 +302,85 @@ class AnsEncoderOp(hs.Operator):
                     if self.finite and (self.completion is None or self.completion.arrive()):
                         ctx.request_completion()
         self.release(int(batch.batch_id), self.consumer)
+
+
+class ParallaxOp(hs.Operator):
+    """Optional read-only decoded consumer; PyTorch uses this partition's CUDA stream."""
+    inp = hs.Input("input", DecodedBatch)
+    device_id = hs.Param(0)
+
+    def __init__(self, *, runtime, ready=None, release=None, consumer=0,
+                 finite=True, completion=None):
+        super().__init__()
+        self.runtime, self.ready, self.release = runtime, ready, release
+        self.consumer, self.finite, self.completion = consumer, finite, completion
+        self.series = None
+        self.received = 0
+
+    def setup(self, spec):
+        spec.input(self.inp)
+
+    def contract(self):
+        return hs.Contract().trigger(hs.OnEach(self.inp))
+
+    def compute(self, ctx):
+        from contextlib import contextmanager
+        import torch
+        from .parallax.ingest.sink import ACC_LOCK
+        sample = self.inp.receive()
+        batch = sample.data
+        runtime_stream = ctx.stream()
+        handle = runtime_stream.__cuda_stream__()[1]
+        stream = torch.cuda.ExternalStream(int(handle), device=self.device_id)
+
+        @contextmanager
+        def execution_context():
+            with torch.cuda.device(self.device_id), torch.cuda.stream(stream):
+                yield
+
+        try:
+            with ACC_LOCK, runtime_stream, execution_context():
+                if batch.pipeline_ready:
+                    view = torch.from_dlpack(batch.frames)
+                    # READY initializes PyTorch and exercises the runtime Tensor handoff.
+                    stream.synchronize()
+                    del view
+                    if self.ready is not None:
+                        self.ready.set()
+                    return
+                if batch.start_of_series:
+                    if self.series is not None:
+                        raise ValueError("Parallax START arrived before END")
+                    self.series = parse_start(bytes(batch.start_metadata))
+                    if self.series.id != batch.series_id:
+                        raise ValueError("Invalid parallax series boundary")
+                    scan = self.series.scan or ScanShape(self.runtime.config.scan["width"],
+                                                        self.runtime.config.scan["height"])
+                    self.runtime.start_series(self.series.shape, (scan.height, scan.width))
+                    self.received = 0
+                if self.series is None or self.series.id != batch.series_id:
+                    raise ValueError("Parallax batch has no matching START")
+                if tuple(batch.frames.shape[1:]) != self.series.shape:
+                    raise ValueError("Parallax image geometry does not match START")
+                if self.runtime.queued_control is not None:
+                    self.runtime.queued_control.apply_pending()
+                count = len(batch.image_ids)
+                if count > batch.frames.shape[0]:
+                    raise ValueError("Parallax valid length exceeds tensor capacity")
+                if count:
+                    frames = torch.from_dlpack(batch.frames)[:count]
+                    ids = np.asarray(batch.image_ids, dtype=np.int64)
+                    self.runtime.sink.feed(frames, ids)
+                    self.received += count
+                    del frames
+                if batch.end_of_series:
+                    if int(batch.series_images) != self.received:
+                        raise ValueError("Parallax END image count does not match delivered images")
+                    stream.synchronize()
+                    self.runtime.finish_series()
+                    self.series = None
+                    if self.finite and (self.completion is None or self.completion.arrive()):
+                        ctx.request_completion()
+        finally:
+            if self.release is not None:
+                self.release(int(batch.batch_id), self.consumer)

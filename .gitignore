@@ -11,3 +11,6 @@ dist/
 *.egg-info/
 
 /daqsim/
+
+# Retain local recordings and outputs left by the removed standalone application.
+/realtime_stem_parallax/

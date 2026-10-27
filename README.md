@@ -13,7 +13,8 @@ configuration, batching/ownership contracts, and validation commands.
 The application selects image dimensions from each series' START metadata and supports
 a configured raster scan and BF/ADF integration. It prints per-series JSON summaries and
 can optionally save the diffraction images as NXmx HDF5 with GPU bitshuffle/zstd compression;
-it does not yet provide a live image viewer or export BF/ADF maps from the CLI.
+the optional parallax branch adds reconstruction, live tuning, and a browser viewer.
+BF/ADF maps are not shown in that viewer. See [parallax setup and migration](docs/parallax/GUIDE.md).
 
 ## HDF5 writer and the Python GIL
 
@@ -57,6 +58,5 @@ guide to select a transport and configure the sender endpoint before acquisition
 | `holoscan_pipeline/` | The `live4d` application, numerical algorithms, typed ingest operators, and tests |
 | `docker/` | Unified HSDK 5/CUDA 13 container and compose service |
 | `dectris/` | Reusable imagemux protocol, handshake, native verbs backend, and ring ownership |
-| `realtime_stem_parallax/` | Live parallax / tcBF reconstruction with a browser viewer and live tuning; its Holoscan 5 image uses this repository's ZMQ and RDMA receivers, and it still builds its earlier Holoscan 4.4 image with its own ingest |
 | `pipeline/` | Earlier Python/PyTorch experiments; separate dependencies and configuration from Live4D |
 | `simple_listener/` | Historical Stream2 decoding example with a hard-coded endpoint and older CBOR callback |

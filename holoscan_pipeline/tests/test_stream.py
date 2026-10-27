@@ -78,7 +78,7 @@ def image_message(image_id, value, shape=(96, 96), pixels=None):
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
-               appendices=None, placements=None, writer=None, pixels=None, encoder=None):
+               appendices=None, placements=None, writer=None, pixels=None, encoder=None, parallax=None, batch_hook=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
     appendices = appendices or {}
     context = zmq.Context()
@@ -104,6 +104,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                 pixels = cp.asnumpy(positioned.images)
                 observed.append((int(batch.series_id), list(batch.image_ids), pixels))
             time.sleep(processing_delay)
+        if batch_hook is not None:
+            batch_hook(batch, positioned)
         if batch.end_of_series:
             results.append(positioned.result)
 
@@ -112,7 +114,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                             execute=dict(mode="service" if service else "finite", seconds=3 if service else 10),
                             zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"),
                             writer=dict(writer or {}, enabled=writer is not None),
-                            encoder=dict(enabled=encoder is not None))
+                            encoder=dict(enabled=encoder is not None),
+                            parallax=parallax or {})
     app = PipelineApp(config, observer=observer, encoder_sink=encoder)
     stopping = threading.Event()
 
@@ -752,3 +755,170 @@ def test_ans_encoder_finite_mode_completes_after_every_consumer(tmp_path, capfd)
                writer=dict(output_dir=str(tmp_path)))
     expected = np.stack([series_pixels(1, image_id, (96, 96)) for image_id in range(9)])
     np.testing.assert_array_equal(encoded(sink.datasets[0]), expected)
+
+
+@pytest.mark.parametrize("writing", [False, True])
+@pytest.mark.parametrize("encoding", [False, True])
+@pytest.mark.parametrize("slow_branch", ["detector", "parallax"])
+def test_parallax_shared_fanout_and_last_end(writing, encoding, slow_branch, tmp_path, monkeypatch):
+    """All enabled consumers must finish, including a deliberately slow branch."""
+    pytest.importorskip("torch")
+    from live4d.parallax.ingest.sink import BatchSink
+    from live4d.algorithms.parallax.engine import ParallaxAccumulator, preprocess_geometry
+    from types import SimpleNamespace
+    if slow_branch == "parallax":
+        original = BatchSink.feed
+        def slow(self, frames, ids):
+            time.sleep(.015)
+            return original(self, frames, ids)
+        monkeypatch.setattr(BatchSink, "feed", slow)
+
+    class EncoderSink:
+        def __init__(self):
+            self.kept = []
+        def begin(self, sid, scan, shape):
+            data = []
+            return SimpleNamespace(total=scan[0] * scan[1], scan_shape=scan,
+                data=data, add=lambda first, chunk: data.append(cp.asnumpy(chunk)))
+        def complete(self, encoder):
+            self.kept.append(np.concatenate(encoder.data))
+        def drop(self, encoder, reason):
+            raise AssertionError(reason)
+
+    sink = EncoderSink() if encoding else None
+    settings = dict(enabled=True, energy=300000, semiangle=4, angular_sampling=1,
+                    scan_sampling=2, defocus=-100, rotation=0, out_dir=str(tmp_path / "parallax"))
+    _, results, plan, _ = run_series([(8, list(range(16)))], scan=(4, 4),
+        batch_size=3, queue_depth=2, encoder=sink, parallax=settings,
+        processing_delay=.015 if slow_branch == "detector" else 0,
+        writer=dict(output_dir=str(tmp_path / "h5")) if writing else None)
+    assert plan.ok and results[0]["images"] == 16
+    geo = preprocess_geometry((96, 96), (4, 4), (2, 2), 300000, 4,
+                              angular_sampling=(1, 1), aberration_coefs={"C10": -100},
+                              rotation_angle=0)
+    reference = ParallaxAccumulator(geo, device="cpu")
+    frames = np.broadcast_to(np.arange(1, 17, dtype=np.uint16)[:, None, None], (16, 96, 96)).copy()
+    reference.process(frames, np.arange(16))
+    np.testing.assert_allclose(np.load(tmp_path / "parallax/parallax_recon.npy"), reference.result(),
+                               rtol=1e-6, atol=.001)
+    if encoding:
+        assert len(sink.kept) == 1
+        np.testing.assert_array_equal(sink.kept[0], frames)
+    if writing:
+        _, stored = read_series(tmp_path / "h5/series_8", tmp_path)
+        np.testing.assert_array_equal(stored[:, 0], frames)
+
+
+def test_parallax_empty_partial_and_changed_geometry(tmp_path):
+    pytest.importorskip("torch")
+    settings = dict(enabled=True, energy=300000, semiangle=4, angular_sampling=1,
+                    scan_sampling=2, defocus=-100, rotation=0, out_dir=str(tmp_path))
+    _, results, plan, _ = run_series([(1, [], (96, 96)), (2, [0, 1, 2], (192, 192)),
+                                      (3, [0], (96, 96))], service=True,
+                                     parallax=settings, batch_size=2)
+    assert plan.ok and [result["images"] for result in results] == [0, 3, 1]
+    assert len(list(tmp_path.glob("parallax_recon_scan*.npy"))) == 3
+
+
+
+def test_parallax_live_http_tuning_applies_on_runtime_callback(tmp_path):
+    pytest.importorskip("torch")
+    import socket
+    from urllib.request import Request, urlopen
+    from live4d.algorithms.parallax.engine import ParallaxAccumulator, preprocess_geometry
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    tuned = []
+    def tune(batch, positioned):
+        if len(batch.image_ids) and not tuned:
+            request = Request(f"http://127.0.0.1:{port}/params", data=json.dumps(dict(c10=-50000)).encode(),
+                              headers={"Content-Type": "application/json"}, method="POST")
+            with urlopen(request, timeout=5) as response:
+                tuned.append(json.load(response))
+    settings = dict(enabled=True, energy=300000, semiangle=4, angular_sampling=1,
+                    scan_sampling=2, defocus=-100, rotation=0, out_dir=str(tmp_path),
+                    accumulate="latest", viewer_port=port, live_every=100)
+    run_series([(1, list(range(16)))], scan=(4, 4), batch_size=3, queue_depth=2,
+               parallax=settings, batch_hook=tune)
+    assert tuned
+    geo = preprocess_geometry((96, 96), (4, 4), (2, 2), 300000, 4,
+                              angular_sampling=(1, 1), aberration_coefs={"C10": -50000},
+                              rotation_angle=0)
+    reference = ParallaxAccumulator(geo, device="cpu")
+    frames = np.broadcast_to(np.arange(1, 17, dtype=np.uint16)[:, None, None], (16, 96, 96)).copy()
+    reference.process(frames, np.arange(16))
+    np.testing.assert_allclose(np.load(tmp_path / "parallax_recon.npy"), reference.result(),
+                               rtol=1e-6, atol=.001)
+    np.testing.assert_array_equal(np.load(tmp_path / "parallax_shifts.npy"), geo.shifts)
+
+
+def test_parallax_interruption_saves_partial_without_end(tmp_path, capfd):
+    pytest.importorskip("torch")
+    from live4d.algorithms.parallax.engine import ParallaxAccumulator, preprocess_geometry
+    context = zmq.Context()
+    sender = context.socket(zmq.PUSH)
+    sender.setsockopt(zmq.LINGER, 0)
+    sender.setsockopt(zmq.SNDTIMEO, 5000)
+    port = sender.bind_to_random_port("tcp://127.0.0.1")
+    config = PipelineConfig(batch_size=2, scan=dict(width=4, height=4),
+        zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"), parallax=dict(enabled=True,
+        energy=300000, semiangle=4, angular_sampling=1, scan_sampling=2,
+        defocus=-100, rotation=0, out_dir=str(tmp_path)))
+    app = PipelineApp(config)
+    def interrupt():
+        assert app.ready.wait(20)
+        sender.send(cbor2.dumps(start_message(1, 16)))
+        for iid in range(2):
+            sender.send(cbor2.dumps(image_message(iid, iid + 1)))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if app.parallax_runtime.sink is not None and app.parallax_runtime.sink.frames == 2:
+                break
+            time.sleep(.01)
+        signal.raise_signal(signal.SIGTERM)
+    thread = threading.Thread(target=interrupt)
+    thread.start()
+    try:
+        termination = app.run()
+        assert termination.name == "STOPPED"
+        assert app.parallax_runtime.sink.frames == 2
+        assert not app.parallax_runtime.active
+        reference = ParallaxAccumulator(preprocess_geometry((96, 96), (4, 4), (2, 2),
+            300000, 4, angular_sampling=(1, 1), aberration_coefs={"C10": -100},
+            rotation_angle=0), device="cpu")
+        frames = np.broadcast_to(np.array([1, 2], dtype=np.uint16)[:, None, None], (2, 96, 96)).copy()
+        reference.process(frames, np.arange(2))
+        np.testing.assert_allclose(np.load(tmp_path / "parallax_recon.npy"), reference.result(),
+                                   rtol=1e-6, atol=.001)
+        output = capfd.readouterr().out
+        assert "interrupted acquisition" in output and "14 missing" in output
+        assert "[series-end]" not in output
+    finally:
+        thread.join(timeout=15)
+        sender.close()
+        context.term()
+
+
+def test_parallax_compute_failure_saves_partial_and_closes_viewer(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    import socket
+    from urllib.error import URLError
+    from urllib.request import urlopen
+    from live4d.parallax.ingest.sink import BatchSink
+    original = BatchSink.feed
+    def fail(self, frames, ids):
+        original(self, frames, ids)
+        raise RuntimeError("injected parallax failure")
+    monkeypatch.setattr(BatchSink, "feed", fail)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    settings = dict(enabled=True, energy=300000, semiangle=4, angular_sampling=1,
+                    scan_sampling=2, defocus=-100, rotation=0, out_dir=str(tmp_path),
+                    viewer_port=port)
+    run_series([(1, list(range(8)))], scan=(4, 4), batch_size=2,
+               parallax=settings, expect_error=True)
+    assert np.load(tmp_path / "parallax_recon.npy").sum() > 0
+    with pytest.raises(URLError):
+        urlopen(f"http://127.0.0.1:{port}/state", timeout=1)

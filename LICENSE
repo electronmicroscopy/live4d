@@ -19,3 +19,7 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Parallax reconstruction, recording utilities, and viewer were migrated from
+EM_Realtime_Processing / realtime-stem (https://github.com/kucukogluberk/EM_Realtime_Processing).
+The original ingest operator license is retained in docs/parallax/INGEST_LICENSE.

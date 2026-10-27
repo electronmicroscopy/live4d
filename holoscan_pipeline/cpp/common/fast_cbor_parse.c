@@ -113,30 +113,6 @@ int fast_extract_series_id(const uint8_t* data, size_t size, uint64_t* series_id
     return -1;
 }
 
-int fast_extract_uint_field(const uint8_t* data, size_t size, const char* key, uint64_t* value) {
-    if (data == NULL || key == NULL || value == NULL) return -1;
-    const size_t key_len = strlen(key);
-    const uint8_t* ptr = data;
-    const uint8_t* end = data + size;
-    uint64_t n;
-    while (ptr < end && (*ptr >> 5) == 6)
-        if (read_cbor_uint(&ptr, end, &n)) return -1;
-    if (ptr >= end || (*ptr >> 5) != 5 || read_cbor_uint(&ptr, end, &n)) return -1;
-    while (n--) {
-        uint64_t len;
-        if (ptr >= end || (*ptr >> 5) != 3 || read_cbor_uint(&ptr, end, &len)
-            || len > (uint64_t)(end - ptr)) return -1;
-        const int matches = len == key_len && memcmp(ptr, key, key_len) == 0;
-        ptr += len;
-        if (matches) {
-            if (ptr >= end || (*ptr >> 5) != 0) return -1;
-            return read_cbor_uint(&ptr, end, value);
-        }
-        if (skip_cbor(&ptr, end, 0)) return -1;
-    }
-    return -1;
-}
-
 int fast_extract_start_metadata(const uint8_t* data, size_t size,
                                 dectris_start_metadata_t* metadata) {
     if (data == NULL || metadata == NULL || size == 0 ||

@@ -1,0 +1,167 @@
+{
+  "date": "2026-10-27",
+  "main": "a83f583",
+  "gpu": "NVIDIA RTX A3000 Laptop GPU, 6 GiB",
+  "driver": "615.71.09",
+  "transport": "ZMQ, one connection, same host",
+  "simulator": "daqsim-and-rdma-26.10.22.48491-g15b27e55d8",
+  "binning": "2x2",
+  "image_shape": [
+    96,
+    96
+  ],
+  "batch_size": 512,
+  "queue_depth": 4,
+  "scan_shape": [
+    1800,
+    2000
+  ],
+  "source_frames": 3600000,
+  "source_target_fps": 120000,
+  "warmup_frames": 128,
+  "completed_wall_seconds": 30.770781993865967,
+  "completed_combined_fps": 74025.22303313816,
+  "completion": {
+    "time": 1793139928.5753887,
+    "termination": "STOPPED",
+    "series": 2,
+    "bf": {
+      "series_id": 6,
+      "images": 2277814,
+      "announced_images": 3600000,
+      "positions": 2277814,
+      "scan_positions": 3600000,
+      "gap_events": 94892,
+      "missing_images": 1322186,
+      "batches": 4449,
+      "batch_sizes": {
+        "512": 4448,
+        "438": 1
+      },
+      "bf_sum": 0.0,
+      "adf_sum": 0.0,
+      "device": 0,
+      "processed_images": 2277814,
+      "processing_dtype": "float32",
+      "totals_dtype": "float64",
+      "delivered_interval_s": 30.137583089992404,
+      "delivered_fps": 75563.52456001056
+    },
+    "parallax_frames": 2277814,
+    "parallax_complete": false
+  },
+  "resources": [
+    {
+      "elapsed": 1.5778914150432684,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"214.52%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.465GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3079, 25",
+      "parallax_frames_lower_bound": 128000
+    },
+    {
+      "elapsed": 4.160047960001975,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"173.58%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 25",
+      "parallax_frames_lower_bound": 307200
+    },
+    {
+      "elapsed": 6.7464804100454785,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"180.12%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.465GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3079, 27",
+      "parallax_frames_lower_bound": 512000
+    },
+    {
+      "elapsed": 9.32176610204624,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"178.05%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 25",
+      "parallax_frames_lower_bound": 716800
+    },
+    {
+      "elapsed": 11.900835506035946,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"174.88%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 24",
+      "parallax_frames_lower_bound": 896000
+    },
+    {
+      "elapsed": 14.48481295502279,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"178.69%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 24",
+      "parallax_frames_lower_bound": 1100800
+    },
+    {
+      "elapsed": 17.064410237013362,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"171.89%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.71%\",\"MemUsage\":\"1.465GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 24",
+      "parallax_frames_lower_bound": 1280000
+    },
+    {
+      "elapsed": 19.650642180000432,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"178.89%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 22",
+      "parallax_frames_lower_bound": 1484800
+    },
+    {
+      "elapsed": 22.237553677055985,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"177.17%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 25",
+      "parallax_frames_lower_bound": 1689600
+    },
+    {
+      "elapsed": 24.81949928100221,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"175.55%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 24",
+      "parallax_frames_lower_bound": 1868800
+    },
+    {
+      "elapsed": 27.409837493032683,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"175.06%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.465GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3079, 23",
+      "parallax_frames_lower_bound": 2048000
+    },
+    {
+      "elapsed": 29.998681242053863,
+      "stats": "{\"BlockIO\":\"23MB / 2.28MB\",\"CPUPerc\":\"176.21%\",\"Container\":\"live4d-integration-isolated-stress\",\"ID\":\"da2494ec896f\",\"MemPerc\":\"4.72%\",\"MemUsage\":\"1.466GiB / 31.08GiB\",\"Name\":\"live4d-integration-isolated-stress\",\"NetIO\":\"0B / 0B\",\"PIDs\":\"38\"}",
+      "gpu": "3077, 25",
+      "parallax_frames_lower_bound": 2252800
+    },
+    {
+      "elapsed": 31.38630188605748,
+      "stats": "",
+      "gpu": "15, 0",
+      "parallax_frames_lower_bound": 2252800
+    }
+  ],
+  "diagnostics": [
+    {
+      "cause_id": null,
+      "endpoint": "",
+      "id": 413,
+      "json_pointer": "",
+      "provided": "python.gil",
+      "required": "",
+      "service": "",
+      "severity": 0,
+      "source": {
+        "graph": 1,
+        "graph_generation": 25,
+        "port": 0,
+        "vertex": 2
+      },
+      "token": "OPERATOR_SERIALIZATION_DOMAIN_SPLIT_ADVISORY"
+    }
+  ],
+  "target_met": false,
+  "rdma_verified": false,
+  "actual_ans_verified": false,
+  "checks": {
+    "cpu": {
+      "passed": 329,
+      "skipped": 32,
+      "deselected_missing_probe": 5
+    },
+    "gpu": {
+      "passed": 61,
+      "skipped": 14
+    },
+    "known_baseline_failures": 5
+  }
+}

@@ -13,9 +13,19 @@ follow the series, while pool capacity covers the larger images. BF/ADF
 radii remain configured in input-image pixels; they do not scale automatically.
 
 Read [README.md](README.md) and [the pipeline guide](docs/holoscan_basic_ingest.md)
-before changing the pipeline. `realtime_stem_parallax/` is a separate application built on
-these receivers; read its own [AGENTS.md](realtime_stem_parallax/AGENTS.md) before working there. Use this repository's documented build and test
-commands.
+before changing the pipeline. Parallax numerical code lives in
+`holoscan_pipeline/python/live4d/algorithms/parallax/`; lifecycle, tuning, viewer,
+telemetry, recording tools, and offline replay live in `live4d/parallax/`.
+There is one live application (`python -m live4d`) and HSDK5 graph. Parallax is
+optional and disabled by default; never supply guessed acquisition physics.
+Offline replay (`python -m live4d.parallax.offline`) shares the YAML and numerical code.
+Run migrated tests in `holoscan_pipeline/tests/parallax/`; regenerate CLI docs with
+`python -m live4d.parallax.scripts.gen_cli_reference` after CLI changes.
+Keep decoded tensors read-only; each enabled branch releases its own publication
+consumer and joins the finite-mode completion latch. Keep batch PyTorch work and live tuning on the runtime stream inside active callbacks.
+Queue HTTP tuning requests; never retain a runtime stream for another thread or callback.
+After interrupted shutdown, synchronize before saving application-owned partial results.
+
 
 Use the [Holoscan SDK 5 documentation](https://docs.nvidia.com/holoscan/sdk-user-guide/)
 as the reference for Holoscan development. Select the documentation version

@@ -54,3 +54,27 @@ def test_shipped_configs():
     buffle = load_config(root / "buffle_rdma.yaml")
     assert buffle.transport == "rdma" and buffle.execute["mode"] == "service"
     assert buffle.scan == dict(width=1000, height=1000)
+
+
+PARALLAX_PHYSICS = dict(energy=200000, semiangle=30, angular_sampling=1.066,
+                        scan_sampling=1.98, defocus=-300, rotation=3.75)
+
+
+def test_parallax_optional_and_requires_explicit_physics():
+    assert PipelineConfig().parallax["enabled"] is False
+    for missing in PARALLAX_PHYSICS:
+        values = dict(PARALLAX_PHYSICS)
+        del values[missing]
+        with pytest.raises(ValueError, match=missing):
+            PipelineConfig(parallax=dict(enabled=True, **values))
+    config = PipelineConfig(parallax=dict(enabled=True, **PARALLAX_PHYSICS))
+    assert config.parallax["angular_sampling"] == 1.066
+
+
+@pytest.mark.parametrize("bad", [dict(energy=float("nan")), dict(rotation=float("inf")),
+    dict(scan_sampling=0), dict(accumulate="bad"), dict(upsampling=True),
+    dict(viewer_port=70000), dict(center=[1]), dict(unrecognized=2),
+    dict(pass_average=.3), dict(save_passes=True), dict(enabled=1)])
+def test_parallax_rejects_invalid_settings(bad):
+    with pytest.raises(ValueError):
+        PipelineConfig(parallax=dict(PARALLAX_PHYSICS, **bad))

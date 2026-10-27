@@ -13,7 +13,20 @@ import holoscan as hs
 from .config import PipelineConfig, load_config
 from .operators import (DecompressGpuOp, H5WriterOp, RdmaRxOp, ZmqRxOp, _CompletionLatch,
                         _PublicationWindow)
-from .processing import AnsEncoderOp, ScanTensorOp, VirtualDetectorOp
+from .processing import AnsEncoderOp, ParallaxOp, ScanTensorOp, VirtualDetectorOp
+
+
+class _Readiness:
+    def __init__(self, event, parties):
+        self.event, self.remaining = event, parties
+        self.lock = threading.Lock()
+
+    def set(self):
+        with self.lock:
+            self.remaining -= 1
+            if self.remaining == 0:
+                print("[holoscan] ready", flush=True)
+                self.event.set()
 
 
 class PipelineApp:
@@ -21,6 +34,11 @@ class PipelineApp:
                  ring_device_address=None, observer=None, encoder_sink=None):
         self.config = config
         self.ready = threading.Event()
+        self.parallax_runtime = None
+        parallax = config.parallax["enabled"]
+        if parallax:
+            from .parallax.runtime import ParallaxRuntime
+            self.parallax_runtime = ParallaxRuntime(config, device=f"cuda:{config.device}", live=True)
         writing = config.writer["enabled"]
         encoding = config.encoder["enabled"]
         if encoding and encoder_sink is None:
@@ -30,7 +48,7 @@ class PipelineApp:
         finite = config.execute["mode"] == "finite"
         # One spare queue slot covers a released input until its callback commits consumption.
         # The HDF5 writer is decoded consumer 1; the ANS encoder is the next one.
-        consumers = 1 + writing + encoding
+        consumers = 1 + writing + encoding + parallax
         self.decoded_window = _PublicationWindow(config.queue_depth - 1, consumers)
         # Requested completion does not drain queues; the last END consumer requests it.
         self.completion = _CompletionLatch(consumers) if consumers > 1 and finite else None
@@ -61,7 +79,7 @@ class PipelineApp:
         scan = graph.op(ScanTensorOp, "scan", scan_width=config.scan["width"],
                         scan_height=config.scan["height"])
         graph.add_flow(decoded.output, scan.input, queue_depth=config.queue_depth)
-        ready, completion = self.ready, self.completion
+        ready, completion = _Readiness(self.ready, 1 + parallax), self.completion
         release = self.decoded_window.release
 
         class BoundDetector(VirtualDetectorOp):
@@ -98,6 +116,18 @@ class PipelineApp:
             graph.add_flow(decoded.output, encoder.input, queue_depth=config.queue_depth)
             # Its own partition: the once-per-chunk encode wait stays off the receiver and detector threads.
             graph.partition("encoder").add(encoder)
+        if parallax:
+            runtime = self.parallax_runtime
+
+            class BoundParallax(ParallaxOp):
+                def __init__(self):
+                    super().__init__(runtime=runtime, ready=ready, release=release,
+                                     consumer=1 + writing + encoding,
+                                     finite=finite, completion=completion)
+
+            reconstruct = graph.op(BoundParallax, "parallax", device_id=config.device)
+            graph.add_flow(decoded.output, reconstruct.input, queue_depth=config.queue_depth)
+            graph.partition("parallax").add(reconstruct)
         deployment = hs.execution.DeploymentBinding()
         deployment.bind_tensor_output_device(
             operator_path="decompress_gpu" if config.transport == "zmq" else "rdma_rx",
@@ -113,23 +143,31 @@ class PipelineApp:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 previous[sig] = signal.signal(sig, lambda *_: stopping.set())
         try:
+            if self.parallax_runtime is not None:
+                self.parallax_runtime.open()
             with hs.run_async(self.plan) as session:
-                deadline = None
-                reported = False
-                while not session.wait(timeout=0.05):
-                    if self.ready.is_set() and not reported:
-                        reported = True
-                        seconds = self.config.execute["seconds"]
-                        deadline = time.monotonic() + seconds if seconds else None
-                    if (stopping.is_set() or (sender_gone is not None and sender_gone.is_set())
-                            or (deadline is not None and time.monotonic() >= deadline)):
-                        session.request_stop()
-                if session.termination not in (hs.RunTermination.REQUESTED_COMPLETED,
-                                                hs.RunTermination.COMPLETED,
-                                                hs.RunTermination.STOPPED):
-                    raise RuntimeError(f"Holoscan run failed: {session.summary()}")
-                return session.termination
+                try:
+                    deadline = None
+                    reported = False
+                    while not session.wait(timeout=0.05):
+                        if self.ready.is_set() and not reported:
+                            reported = True
+                            seconds = self.config.execute["seconds"]
+                            deadline = time.monotonic() + seconds if seconds else None
+                        if (stopping.is_set() or (sender_gone is not None and sender_gone.is_set())
+                                or (deadline is not None and time.monotonic() >= deadline)):
+                            session.request_stop()
+                    if session.termination not in (hs.RunTermination.REQUESTED_COMPLETED,
+                                                    hs.RunTermination.COMPLETED,
+                                                    hs.RunTermination.STOPPED):
+                        raise RuntimeError(f"Holoscan run failed: {session.summary()}")
+                    return session.termination
+                finally:
+                    if self.parallax_runtime is not None:
+                        self.parallax_runtime.close()
         finally:
+            if self.parallax_runtime is not None:
+                self.parallax_runtime.close()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 

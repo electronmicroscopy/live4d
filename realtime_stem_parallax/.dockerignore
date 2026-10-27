@@ -1,6 +1,0 @@
-# The image only needs the operator sources; the Python package is bind-mounted at run time.
-*
-!operators
-!operators/**
-operators/**/__pycache__
-operators/build
