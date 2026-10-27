@@ -1,6 +1,6 @@
-"""live4d.live.encoding: SeriesEncoder stages batches into chunks for quantem.gpu's LiveEncoder.
+"""live4d.algorithms.ans_encoding: SeriesEncoder stages batches into chunks for quantem.gpu's LiveEncoder.
 
-Runs on a CUDA device without Holoscan: batches go straight to SeriesEncoder, as AnsEncoderOp hands
+Runs on a CUDA device without Holoscan: batches go straight to SeriesEncoder, as processing.AnsEncoderOp hands
 them over, and every kept series is decoded and compared with the counts that were sent.
 """
 import cupy as cp
@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from dectris.messages import ScanShape, Series
-from live4d.live.encoding import CHUNK, SeriesEncoder, series_scan
+from live4d.algorithms.ans_encoding import CHUNK, SeriesEncoder, series_scan
 
 pytest.importorskip("quantem.gpu.streaming")
 

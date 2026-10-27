@@ -13,7 +13,7 @@ import holoscan as hs
 from .config import PipelineConfig, load_config
 from .operators import (DecompressGpuOp, H5WriterOp, RdmaRxOp, ZmqRxOp, _CompletionLatch,
                         _PublicationWindow)
-from .processing import ScanTensorOp, VirtualDetectorOp
+from .processing import AnsEncoderOp, ScanTensorOp, VirtualDetectorOp
 
 
 class PipelineApp:
@@ -24,7 +24,9 @@ class PipelineApp:
         writing = config.writer["enabled"]
         encoding = config.encoder["enabled"]
         if encoding and encoder_sink is None:
-            raise ValueError("encoder.enabled needs an encoder_sink (live4d.live.LiveFrames)")
+            from .algorithms.ans_encoding import ResidentSeries
+            encoder_sink = ResidentSeries(config.device, config.encoder["keep"])
+        self.encoder_sink = encoder_sink
         finite = config.execute["mode"] == "finite"
         # One spare queue slot covers a released input until its callback commits consumption.
         # The HDF5 writer is decoded consumer 1; the ANS encoder is the next one.
@@ -86,8 +88,6 @@ class PipelineApp:
             graph.add_flow(decoded.output, writer.input, queue_depth=config.queue_depth)
             graph.partition("writer").add(writer)
         if encoding:
-            from .live.encoding import AnsEncoderOp
-
             class BoundEncoder(AnsEncoderOp):
                 def __init__(self):
                     super().__init__(sink=encoder_sink, release=release, consumer=1 + writing,
@@ -96,7 +96,7 @@ class PipelineApp:
             encoder = graph.op(BoundEncoder, "ans_encoder", device_id=config.device,
                                scan_width=config.scan["width"], scan_height=config.scan["height"])
             graph.add_flow(decoded.output, encoder.input, queue_depth=config.queue_depth)
-            # Its own partition: the once-per-chunk encode wait never stalls the receiver or detectors.
+            # Its own partition: the once-per-chunk encode wait stays off the receiver and detector threads.
             graph.partition("encoder").add(encoder)
         deployment = hs.execution.DeploymentBinding()
         deployment.bind_tensor_output_device(

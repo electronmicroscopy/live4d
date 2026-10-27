@@ -234,6 +234,33 @@ completion does not drain queues. At END the writer prints an `[h5-series]` JSON
 written and dropped counts, data files, compressed bytes, and `written_fps` over the series'
 write interval.
 
+## ANS encoding
+
+`encoder.enabled: true` adds `AnsEncoderOp` (`processing.py`) as one more decoded-batch consumer:
+window consumer 1 without the HDF5 writer, 2 with it. It runs in its own `encoder` partition and
+keeps every series on the GPU in lossless ANS form through quantem.gpu's `LiveEncoder`, which also
+corrects flagged pixels. The result of each series is the `Dataset4dstemGPU` that
+`quantem.gpu.io.load` returns for the same counts. Build `docker/Dockerfile.ans` on the pipeline
+image to install quantem.gpu.
+
+```yaml
+encoder:
+  enabled: true
+  keep: 1        # series kept resident on the GPU by the default sink (0: all)
+```
+
+Each activation copies the batch's images once, on the runtime stream, into a reused staging chunk
+of 4096 patterns (`algorithms/ans_encoding.py`) and releases the batch without a host wait. A full
+chunk is encoded in place; `LiveEncoder` reads the encoded sizes back once per chunk, which blocks
+only the encoder partition. The scan raster of a series is the `header_appendix` scan, else a square
+raster of `number_of_images`, else `scan`. A series whose image ids skip or repeat is dropped by the
+encoder; the detector still reports it. In finite mode the run completes after the last END
+consumer, encoder included. Each kept or dropped series prints an `[ans-result]` record with
+`images`, `encoded_bytes`, `raw_bytes`, `kept` and `encode_interval_s`.
+
+`PipelineApp(config, encoder_sink=...)` replaces the default sink (`ResidentSeries`), for example
+to save each series or to show it while it arrives; the sink contract is in `ans_encoding.py`.
+
 ## Shared messages and GPU ownership
 
 `DecodedBatch` carries a monotonic `batch_id`, series ID, image IDs, and a runtime-owned

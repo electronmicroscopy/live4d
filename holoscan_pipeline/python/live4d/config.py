@@ -20,8 +20,8 @@ class PipelineConfig:
     writer: dict = field(default_factory=lambda: dict(enabled=False, output_dir="/data",
                                                    name_pattern="series_$id",
                                                    format="nxmx", images_per_file=1000000, staging_batches=4))
-    # ANS encoding of every series on the GPU (live4d.live); needs quantem.gpu and a sink.
-    encoder: dict = field(default_factory=lambda: dict(enabled=False))
+    # Lossless ANS encoding of every series on the GPU (quantem.gpu); keep: series kept resident (0: all).
+    encoder: dict = field(default_factory=lambda: dict(enabled=False, keep=1))
 
     def __post_init__(self):
         defaults = dict(scan=dict(width=1000, height=1000),
@@ -32,7 +32,7 @@ class PipelineConfig:
                                   ring_mib=64, max_batch=512, timeout=10.0),
                         writer=dict(enabled=False, output_dir="/data", name_pattern="series_$id",
                                     format="nxmx", images_per_file=1000000, staging_batches=4),
-                        encoder=dict(enabled=False))
+                        encoder=dict(enabled=False, keep=1))
         for name, values in defaults.items():
             given = getattr(self, name)
             if not isinstance(given, dict) or set(given) - set(values):
@@ -78,6 +78,8 @@ class PipelineConfig:
             raise ValueError("writer.staging_batches must be an integer between 2 and 64")
         if type(self.encoder["enabled"]) is not bool:
             raise ValueError("encoder.enabled must be true or false")
+        if type(self.encoder["keep"]) is not int or self.encoder["keep"] < 0:
+            raise ValueError("encoder.keep must be a nonnegative integer")
         if self.transport == "rdma":
             host, sep, port = rdma["remote_address"].rpartition(":")
             if not host or not sep or not port.isdigit() or not 1 <= int(port) <= 65535 or not rdma["local_address"]:

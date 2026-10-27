@@ -55,7 +55,6 @@ guide to select a transport and configure the sender endpoint before acquisition
 | Directory | Purpose |
 | --- | --- |
 | `holoscan_pipeline/` | The `live4d` application, numerical algorithms, typed ingest operators, and tests |
-| `holoscan_pipeline/python/live4d/live/` | Live scans: each series ANS-encoded on the GPU as it arrives (quantem.gpu), Show4DSTEM page, saved scans by name ([docs/live.md](docs/live.md)); image `docker/Dockerfile.live` |
 | `docker/` | Unified HSDK 5/CUDA 13 container and compose service |
 | `dectris/` | Reusable imagemux protocol, handshake, native verbs backend, and ring ownership |
 | `pipeline/` | Earlier Python/PyTorch experiments; separate dependencies and configuration from Live4D |
