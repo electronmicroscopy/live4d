@@ -3,7 +3,7 @@
 #   docker build -f docker/Dockerfile.ans -t live4d:ans .
 ARG PIPELINE_IMAGE=live4d:pipeline
 FROM ${PIPELINE_IMAGE}
-ARG QUANTEM_GPU_COMMIT=96d58fb
+ARG QUANTEM_GPU_COMMIT=a8cb286
 # quantem.gpu imports h5py in the pipeline process, where the HDF5 writer has loaded the system
 # HDF5 globally. Two HDF5 libraries in one process fail in either import order, so h5py and the
 # hdf5plugin filters are built against the system HDF5: one process, one HDF5.
