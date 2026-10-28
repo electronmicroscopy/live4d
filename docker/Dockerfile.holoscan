@@ -30,9 +30,11 @@ FROM pipeline AS parallax
 RUN --mount=type=secret,id=build_resolv,target=/etc/resolv.conf,mode=0444 \
     python3 -m pip install --no-cache-dir torch==2.11.0+cu130 \
       --index-url https://download.pytorch.org/whl/cu130
+# Both distributions provide dectris/__init__.py; retain our public RDMA exports.
 RUN --mount=type=secret,id=build_resolv,target=/etc/resolv.conf,mode=0444 \
-    python3 -m pip install --no-cache-dir lz4 dectris-compression
-RUN python3 -c "import live4d.parallax.offline; from importlib.resources import files; assert (files('live4d.parallax.streaming.web') / 'static/index.html').is_file()"
+    python3 -m pip install --no-cache-dir lz4 dectris-compression \
+    && python3 -m pip install --no-cache-dir --force-reinstall --no-deps ./dectris
+RUN python3 -c "from dectris import ImagemuxCodec, LocalInfo, TcpConnector, VerbsConn, watch_liveness; import dectris.compression; import live4d.parallax.offline; from importlib.resources import files; assert (files('live4d.parallax.streaming.web') / 'static/index.html').is_file()"
 
 # Preserve the baseline image for builds without --target.
 FROM pipeline AS default
