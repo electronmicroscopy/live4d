@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_rdma_batches import LOCAL_ADDR, Loopback, RingWriter, _start, _image, _end, pytestmark
+from test_rdma_batches import (LOCAL_ADDR, Loopback, RingWriter, _start, _image, _end,
+                               _ring_writers, pytestmark)
 
 
 @pytest.mark.parametrize("devices", [(0,), (0, 0), (0, 1)])
@@ -140,3 +141,88 @@ def test_application_routes_complete_acquisitions_and_reuses_branches(devices):
         stopping.set()
         consumer.join(20)
         producer.join(20)
+
+
+@pytest.mark.parametrize("devices", [(0, 0), (0, 1)])
+def test_application_routes_protocol_3_series_to_lanes(devices):
+    import cupy as cp
+    import numpy as np
+    from live4d.app import PipelineApp
+    from live4d.config import PipelineConfig
+
+    if cp.cuda.runtime.getDeviceCount() <= max(devices):
+        pytest.skip("requires two visible GPUs")
+    acquisitions = [((96, 96), 0), ((192, 192), 3), ((192, 192), 5), ((96, 96), 1)]
+    rings, ring_bytes = 2, 1 << 20
+    loopback = Loopback(ring_bytes, rings=rings)
+    observed, results, errors = [], [], []
+    stopping = threading.Event()
+
+    def observer(batch, positioned):
+        if len(batch.image_ids):
+            observed.append((int(batch.series_id), cp.cuda.runtime.getDevice(),
+                             list(batch.image_ids), cp.asnumpy(positioned.images)))
+        if batch.end_of_series:
+            results.append(dict(positioned.result))
+            if len(results) == len(acquisitions):
+                stopping.set()
+
+    try:
+        writers, sent = _ring_writers(ring_bytes, rings)
+        for index, (shape, count) in enumerate(acquisitions):
+            writer = writers[index % rings]
+            _start(writer, 501 + index, count, shape)
+            if count:
+                _image(writer, 501 + index, list(range(count)), [index + 7] * count, shape)
+            _end(writer, 501 + index)
+        loopback.send(sent)
+
+        config = PipelineConfig(transport="rdma", devices=devices, batch_size=2, queue_depth=2,
+            execute=dict(mode="service"), scan=dict(width=4, height=2),
+            rdma=dict(remote_address="127.0.0.1:1", local_address=LOCAL_ADDR,
+                      ring_memory="host_mapped", ring_mib=1, protocol=3, rings=rings))
+        app = PipelineApp(config, conn=loopback.rx,
+                          ring=SimpleNamespace(addr=loopback.ring_address, length=ring_bytes * rings),
+                          credit=SimpleNamespace(addr=loopback.credit_mr.address,
+                                                 rkey=loopback.credit_mr.rkey),
+                          observer=observer)
+        assert app.plan.ok, app.plan.summary()
+        assert len(app.windows) == len({id(item) for item in app.windows}) == len(devices)
+
+        def run():
+            try:
+                app.run(stop_event=stopping)
+            except BaseException as error:
+                errors.append(error)
+        consumer = threading.Thread(target=run)
+        consumer.start()
+        try:
+            consumer.join(30)
+            assert not consumer.is_alive()
+            assert not errors, errors
+            assert len(results) == len(acquisitions)
+            for index, (shape, count) in enumerate(acquisitions):
+                sid, device, value = 501 + index, devices[index % len(devices)], index + 7
+                result, = [r for r in results if r["series_id"] == sid]
+                assert result["device"] == device
+                assert result["images"] == result["announced_images"] == result["positions"] == count
+                assert result["gap_events"] == result["missing_images"] == 0
+                y, x = np.ogrid[:shape[0], :shape[1]]
+                squared = (2*y-(shape[0]-1))**2 + (2*x-(shape[1]-1))**2
+                bf = int((squared <= 4*16**2).sum())
+                adf = int(((squared >= 4*24**2) & (squared <= 4*48**2)).sum())
+                assert result["bf_sum"] == bf * value * count
+                assert result["adf_sum"] == adf * value * count
+                batches = [(d, ids, pixels) for s, d, ids, pixels in observed if s == sid]
+                assert [i for _, ids, _ in batches for i in ids] == list(range(count))
+                for d, ids, pixels in batches:
+                    assert d == device and tuple(pixels.shape) == (len(ids), *shape)
+                    np.testing.assert_array_equal(pixels, np.full(pixels.shape, value, np.uint16))
+            assert [loopback.ring_credit(i) for i in range(rings)] == [w.position for w in writers]
+            with pytest.raises(RuntimeError, match="new RDMA PipelineApp"):
+                app.run()
+        finally:
+            stopping.set()
+            consumer.join(20)
+    finally:
+        loopback.close()

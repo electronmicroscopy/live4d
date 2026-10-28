@@ -878,13 +878,15 @@ def test_rings_reject_invalid_geometry_in_a_later_ring(start_shape, image_shape,
 # ---- Protocol 3 with GPU lanes: host-staged batches, one upload operator per lane ------------
 
 
-def _build_ring_lanes(loopback, lanes, batch_size, max_batch=32, queue_depth=4, hold=None):
+def _build_ring_lanes(loopback, lanes, batch_size, max_batch=32, queue_depth=4, hold=None,
+                      devices=None):
     import cupy as cp
     import holoscan as hs
 
     from live4d.operators import RawUploadGpuOp, RdmaRingsHostRxOp
     from live4d.schemas.decoded_batch import DecodedBatch
 
+    devices = devices or (0,) * lanes
     records = [[] for _ in range(lanes)]
     ready_lanes = set()
     ready_lock = threading.Lock()
@@ -909,11 +911,13 @@ def _build_ring_lanes(loopback, lanes, batch_size, max_batch=32, queue_depth=4, 
 
             def compute(self, ctx):
                 batch = self.inp.receive_data()
-                with cp.cuda.Device(0), ctx.stream():
+                with cp.cuda.Device(devices[lane]), ctx.stream():
                     tensor = cp.from_dlpack(batch.frames)
                     pixels = cp.asnumpy(tensor[:len(batch.image_ids)]).copy() \
                         if batch.image_ids else None
+                    tensor_device = int(tensor.device.id)
                 item = {
+                    "device": tensor_device,
                     "batch_id": int(batch.batch_id),
                     "pipeline_ready": bool(batch.pipeline_ready),
                     "start": bool(batch.start_of_series),
@@ -951,14 +955,15 @@ def _build_ring_lanes(loopback, lanes, batch_size, max_batch=32, queue_depth=4, 
     deployment = hs.execution.DeploymentBinding()
     for lane in range(lanes):
         upload = RawUploadGpuOp(graph, f"upload{lane}", publication_window=outputs[lane].handle,
-                                input_window=inputs[lane].handle, destination=lane, device=0)
+                                input_window=inputs[lane].handle, destination=lane,
+                                device=devices[lane])
         sink = graph.op(make_sink(lane), f"sink{lane}")
         graph.add_flow(source.output, upload.input, queue_depth=queue_depth)
         graph.add_flow(upload.output, sink.input, queue_depth=queue_depth)
         graph.partition(f"upload{lane}").add(upload)
         graph.partition(f"sink{lane}").add(sink)
         deployment.bind_tensor_output_device(operator_path=f"upload{lane}", output_port="output",
-                                             device=hs.execution.DeviceId(0))
+                                             device=hs.execution.DeviceId(devices[lane]))
     plan = hs.compile(graph, hs.CompileOptions(deployment=deployment))
     if not plan.ok:
         raise RuntimeError(plan.summary())
@@ -1079,6 +1084,43 @@ def test_ring_lanes_return_credit_on_the_host_copy():
         _assert_pixels(received[1], [([0], [99])])
         assert loopback.ring_credit(0) == writers[0].position > ring_bytes
         assert loopback.ring_credit(1) == writers[1].position
+    finally:
+        _close_windows(windows)
+        loopback.close()
+
+
+def test_ring_lanes_upload_each_lane_to_its_own_gpu():
+    import cupy as cp
+
+    if cp.cuda.runtime.getDeviceCount() < 2:
+        pytest.skip("requires two visible GPUs")
+    ring_bytes = 1 << 20
+    loopback = Loopback(ring_bytes, rings=2)
+    windows = None
+    try:
+        writers, sent = _ring_writers(ring_bytes, 2)
+        series = [(50, (96, 96), [0, 1, 2]), (51, (192, 192), [0, 1]),
+                  (52, (96, 96), [5]), (53, (192, 192), [0, 1, 2, 3])]
+        expected = {0: [], 1: []}
+        for index, (series_id, shape, ids) in enumerate(series):
+            writer = writers[index % 2]
+            _start(writer, series_id, len(ids), shape)
+            values = [series_id * 10 + image_id for image_id in ids]
+            _image(writer, series_id, ids, values, shape)
+            _end(writer, series_id)
+            expected[index % 2] += [(ids[i:i + 2], values[i:i + 2])
+                                    for i in range(0, len(ids), 2)]
+
+        loopback.send(sent)
+        plan, received, ready, windows = _build_ring_lanes(loopback, 2, batch_size=2,
+                                                           devices=(0, 1))
+        _run_until_output(plan, ready,
+                          lambda: sum(item["end"] for lane in received for item in lane) == len(series))
+
+        for lane in range(2):
+            assert {item["device"] for item in received[lane]} == {lane}
+            _assert_pixels(received[lane], expected[lane])
+        assert [loopback.ring_credit(i) for i in range(2)] == [w.position for w in writers]
     finally:
         _close_windows(windows)
         loopback.close()

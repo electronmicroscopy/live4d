@@ -20,6 +20,10 @@ def _multi_lane(config: PipelineConfig) -> bool:
     return config.devices is not None
 
 
+def _workload(config: PipelineConfig):
+    return config.workload["repeats"] if config.workload["enabled"] else None
+
+
 class PipelineApp:
     def __init__(self, config: PipelineConfig, *, conn=None, ring=None, credit=None,
                  ring_device_address=None, observer=None, encoder_sink=None, receiver_ready=None):
@@ -79,11 +83,12 @@ class PipelineApp:
         graph.add_flow(decoded.output, scan.input, queue_depth=config.queue_depth)
         ready, completion = self.ready, self.completion
         release = self.decoded_window.release
+        workload = _workload(config)
 
         class BoundDetector(VirtualDetectorOp):
             def __init__(self):
                 super().__init__(ready=ready, finite=finite, observer=observer, release=release,
-                                 completion=completion)
+                                 completion=completion, workload=workload)
 
         detector = graph.op(BoundDetector, "detector", device_id=config.device,
                             scan_width=config.scan["width"], scan_height=config.scan["height"],
@@ -131,9 +136,9 @@ class PipelineApp:
             self.conn = conn
         elif conn is not None or ring is not None or credit is not None:
             raise ValueError("Multiple devices own their RDMA connection; do not pass conn, ring or credit")
-        if config.writer["enabled"] or config.encoder["enabled"] or encoder_sink is not None:
-            raise ValueError("The HDF5 writer and the ANS encoder are not supported with `devices` "
-                             "yet; omit `devices` to use them")
+        if config.encoder["enabled"] or encoder_sink is not None:
+            raise ValueError("The ANS encoder is not supported with `devices` yet; "
+                             "omit `devices` to use it")
         writing = config.writer["enabled"]
         self.finite = config.execute["mode"] == "finite"
         self.lane_done = threading.Event()
@@ -213,12 +218,13 @@ class PipelineApp:
         scan = graph.op(ScanTensorOp, prefix + "scan", scan_width=config.scan["width"],
                         scan_height=config.scan["height"])
         finite, done = self.finite, self.lane_done.set
+        workload = _workload(config)
 
         class BoundDetector(VirtualDetectorOp):
             def __init__(self):
                 super().__init__(ready=ready, finite=finite, observer=observer,
                                  release=window.release, completion=latch, results=results,
-                                 done=done, announce_ready=False)
+                                 done=done, announce_ready=False, workload=workload)
 
         detector = graph.op(BoundDetector, prefix + "detector", device_id=device,
                             scan_width=config.scan["width"], scan_height=config.scan["height"],

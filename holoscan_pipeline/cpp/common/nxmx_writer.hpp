@@ -6,7 +6,7 @@
 // arrive pre-compressed in bitshuffle/zstd HDF5 framing and are stored without filtering.
 // With em_metadata_link (imagemux's DectrisEm format), /entry/instrument/electron_microscope
 // is an external link to /electron_microscope in <prefix>_em_metadata.h5.
-// Host-only; HDF5 calls must stay on one thread.
+// Host-only; every call holds one process-wide lock, so several writers may share a process.
 
 #include <hdf5.h>
 

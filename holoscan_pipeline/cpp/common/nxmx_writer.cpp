@@ -575,11 +575,17 @@ void write_em_field(hid_t parent, std::string_view path, const EmField& field, c
   if (*field.units) attr(d, "units", field.units);
 }
 
+std::recursive_mutex& hdf5_mutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
+}
+
 }  // namespace
 
 void register_filters() {
   static std::once_flag once;
   std::call_once(once, [] {
+    const std::lock_guard lock(hdf5_mutex());
     if (H5Zfilter_avail(kBitshuffleFilter) > 0) return;
     static const H5Z_class2_t placeholder{
         H5Z_CLASS_T_VERS, kBitshuffleFilter, 1, 1,
@@ -613,6 +619,7 @@ fs::path SeriesLayout::data_file(uint64_t file_number) const {
 fs::path SeriesLayout::em_metadata_file() const { return with_suffix(prefix, "_em_metadata.h5"); }
 
 void write_master_file(const SeriesLayout& layout, const Value& start) {
+  const std::lock_guard lock(hdf5_mutex());
   if (layout.number_of_images == 0 || layout.images_per_file == 0)
     throw std::invalid_argument("NXmx series requires images and images per file");
   const fs::path path = layout.master_file();
@@ -642,6 +649,7 @@ void write_master_file(const SeriesLayout& layout, const Value& start) {
 }
 
 std::vector<std::string> write_em_metadata_file(const SeriesLayout& layout, const Value& metadata) {
+  const std::lock_guard lock(hdf5_mutex());
   if (metadata.untagged().kind != Value::Kind::kMap)
     throw std::invalid_argument("header_appendix electron_microscope must be a map");
   const auto& groups = em_groups();
@@ -701,6 +709,7 @@ DataFile::~DataFile() {
 }
 
 void DataFile::open(const SeriesLayout& layout, uint64_t file_number) {
+  const std::lock_guard lock(hdf5_mutex());
   close();
   path_ = layout.data_file(file_number);
   file_number_ = file_number;
@@ -734,6 +743,7 @@ void DataFile::open(const SeriesLayout& layout, uint64_t file_number) {
 }
 
 void DataFile::write_chunk(uint64_t image_id, const void* data, size_t bytes) {
+  const std::lock_guard lock(hdf5_mutex());
   if (image_id < first_image_ || image_id - first_image_ >= images_)
     throw std::out_of_range("image is outside the open data file");
   hsize_t offset[4] = {image_id - first_image_, 0, 0, 0};
@@ -742,6 +752,7 @@ void DataFile::write_chunk(uint64_t image_id, const void* data, size_t bytes) {
 }
 
 void DataFile::close() {
+  const std::lock_guard lock(hdf5_mutex());
   if (file_ < 0) return;
   const hid_t dataset = dataset_, file = file_;
   dataset_ = file_ = -1;

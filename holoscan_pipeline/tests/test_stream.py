@@ -16,6 +16,7 @@ import zmq
 
 from live4d.app import PipelineApp
 from live4d.config import PipelineConfig
+from live4d.algorithms.gpu_load import fft_load
 from live4d.algorithms.virtual_detectors import build_masks, integrate
 
 
@@ -41,6 +42,17 @@ def test_virtual_detector_algorithms_match_independent_sums(shape):
     assert masks.dtype == cp.float32
     assert actual.dtype == np.float32
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("repeats", [1, 2, 3])
+def test_fft_load_matches_independent_unitary_fft_sums(repeats):
+    values = np.arange(2 * 96 * 96, dtype=np.uint32).reshape(2, 96, 96)
+    frames = ((values * 13) % 251).astype(np.uint16)
+    expected = frames.astype(np.complex128)
+    for _ in range(repeats):
+        expected = np.fft.fft2(expected, norm="ortho")
+    np.testing.assert_allclose(float(fft_load(cp.asarray(frames), repeats)),
+                               np.abs(expected).sum(), rtol=1e-4)
 
 
 def start_message(series_id, count, shape=(96, 96), dtype="uint16", appendix=None):
@@ -79,7 +91,7 @@ def image_message(image_id, value, shape=(96, 96), pixels=None):
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
                appendices=None, placements=None, writer=None, pixels=None, encoder=None,
-               devices=None, extra_observer=None, inspect_app=None):
+               devices=None, extra_observer=None, inspect_app=None, workload=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
     appendices = appendices or {}
     context = zmq.Context()
@@ -115,7 +127,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                             execute=dict(mode="service" if service else "finite", seconds=3 if service else 10),
                             zmq=dict(endpoint=f"tcp://127.0.0.1:{port}"),
                             writer=dict(writer or {}, enabled=writer is not None),
-                            encoder=dict(enabled=encoder is not None))
+                            encoder=dict(enabled=encoder is not None),
+                            workload=dict(workload or {}))
     app = PipelineApp(config, observer=observer, encoder_sink=encoder)
     if inspect_app is not None:
         inspect_app(app)
@@ -248,6 +261,31 @@ def test_consecutive_empty_partial_series_and_scan_gaps(capfd):
         timestamps = [datetime.fromisoformat(row["timestamp_utc"]) for _, row in entries]
         assert all(stamp.utcoffset() == timezone.utc.utcoffset(stamp) for stamp in timestamps)
         assert timestamps == sorted(timestamps)
+
+
+@pytest.mark.parametrize("devices", [None, (0, 0)])
+def test_fft_workload_runs_on_every_batch_and_leaves_results_unchanged(devices, monkeypatch):
+    from live4d import processing
+
+    calls = []
+    original = processing.gpu_load.fft_load
+
+    def counting(frames, repeats):
+        calls.append((len(frames), repeats))
+        return original(frames, repeats)
+
+    monkeypatch.setattr(processing.gpu_load, "fft_load", counting)
+    count = 9
+    _, results, _, _ = run_series([(8, list(range(count)))], batch_size=4, scan=(3, 3),
+                                  devices=devices, workload=dict(enabled=True, repeats=3))
+
+    assert sum(images for images, _ in calls) == count
+    assert {repeats for _, repeats in calls} == {3}
+    result, = results
+    total = sum(range(1, count + 1))
+    assert result["images"] == result["positions"] == count
+    assert result["bf_sum"] == 812 * total
+    assert result["adf_sum"] == 5428 * total
 
 
 def test_deferred_readback_preserves_many_batches_and_totals():
@@ -567,6 +605,31 @@ EM_FULL = {
                            "data": [0.5, 1.5, 2.5]}},
     "sample_stage": {"position_z": -1.0e-6, "tilt_alpha": 15.0},
 }
+
+
+def test_hdf5_writer_with_two_lanes_writes_every_series(tmp_path, capfd):
+    series = [(1, list(range(6))), (2, list(range(5)), (192, 192)), (3, [0, 1, 2]),
+              (4, list(range(7)), (192, 192))]
+    _, results, _, _ = run_series(
+        series, service=True, pixels=series_pixels, devices=(0, 0),
+        writer=dict(output_dir=str(tmp_path), images_per_file=4, name_pattern="run_$id"))
+    assert sorted(r["series_id"] for r in results) == [1, 2, 3, 4]
+
+    names = []
+    for entry in series:
+        sid, ids = entry[:2]
+        shape = entry[2] if len(entry) > 2 else (96, 96)
+        meta, data = read_series(tmp_path / f"run_{sid}", tmp_path)
+        assert meta["shape"] == [len(ids), 1, *shape]
+        for image_id in ids:
+            np.testing.assert_array_equal(data[image_id, 0], series_pixels(sid, image_id, shape))
+        names += [f"run_{sid}_master.h5"] + [f"run_{sid}_data_{n:06d}.h5"
+                                              for n in range(1, (len(ids) + 3) // 4 + 1)]
+    assert sorted(p.name for p in tmp_path.glob("*.h5")) == sorted(names)
+
+    records = sorted(h5_series_records(capfd.readouterr().out), key=lambda r: r["series_id"])
+    assert [(r["series_id"], r["written_images"], r["dropped_images"], r["ended"])
+            for r in records] == [(1, 6, 0, True), (2, 5, 0, True), (3, 3, 0, True), (4, 7, 0, True)]
 
 
 def test_hdf5_writer_em_format_writes_metadata_from_header_appendix(tmp_path, capfd):

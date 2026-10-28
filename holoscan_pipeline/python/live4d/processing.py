@@ -10,7 +10,7 @@ import holoscan as hs
 import numpy as np
 
 from dectris.messages import IMAGE_SHAPE, ScanShape, parse_start, scan_positions
-from .algorithms import virtual_detectors
+from .algorithms import gpu_load, virtual_detectors
 from .schemas.decoded_batch import DecodedBatch
 
 
@@ -87,8 +87,9 @@ class VirtualDetectorOp(hs.Operator):
     adf_outer = hs.Param(48.0)
 
     def __init__(self, *, ready=None, finite=True, observer=None, release=None, completion=None,
-                 results=None, done=None, announce_ready=True):
+                 results=None, done=None, announce_ready=True, workload=None):
         super().__init__()
+        self.workload = workload
         self.ready = ready
         self.finite = finite
         self.completion = completion
@@ -207,6 +208,8 @@ class VirtualDetectorOp(hs.Operator):
                     positions = cp.asarray(positioned.positions)
                     self.image[:, positions[:, 0], positions[:, 1]] = values.T
                     self.placed += len(selected)
+                if self.workload:
+                    gpu_load.fft_load(frames, self.workload)
                 # Host timestamps measure batch submission, before GPU completion.
                 self.last_image = time.perf_counter()
                 if self.first is None:

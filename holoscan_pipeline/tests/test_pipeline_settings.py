@@ -25,6 +25,12 @@ def test_encoder_defaults_to_disabled_keeping_one_series():
     assert PipelineConfig().encoder == dict(enabled=False, keep=1)
 
 
+def test_workload_defaults_to_disabled_with_one_repeat():
+    assert PipelineConfig().workload == dict(enabled=False, repeats=1)
+    config = PipelineConfig(workload=dict(enabled=True, repeats=40))
+    assert config.workload == dict(enabled=True, repeats=40)
+
+
 def test_rdma_protocol_selects_rings():
     config = PipelineConfig()
     assert (config.rdma["protocol"], config.rdma["rings"]) == (2, 1)
@@ -52,7 +58,10 @@ def test_detector_radius_accepts_192_pixel_extent():
     dict(writer=dict(images_per_file=0)), dict(writer=dict(format="EM")),
     dict(writer=dict(images_per_file=True)), dict(writer=dict(staging_batches=1)),
     dict(writer=dict(compression="lz4")), dict(encoder=dict(enabled=1)), dict(encoder=dict(keep=-1)),
-    dict(encoder=dict(keep=True)), dict(encoder=dict(chunk=4096))])
+    dict(encoder=dict(keep=True)), dict(encoder=dict(chunk=4096)),
+    dict(workload=dict(enabled=1)), dict(workload=dict(repeats=0)),
+    dict(workload=dict(repeats=True)), dict(workload=dict(repeats=100001)),
+    dict(workload=dict(kind="fft"))])
 def test_rejects_invalid_settings(values):
     with pytest.raises(ValueError):
         PipelineConfig(**values)
