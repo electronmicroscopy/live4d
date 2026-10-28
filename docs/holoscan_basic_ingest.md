@@ -215,6 +215,18 @@ stayed full for longer than imagemux's send timeout. The source then fails with
 An immediate that names a ring beyond `rdma.rings`, or a header whose ring, sequence, or
 position does not match, also fails the run.
 
+### Protocol 3 with `devices`
+
+With `rdma.protocol: 3` and `devices` set, the receiver keeps one connection and reads its
+rings on the CPU, so `rdma.ring_memory` must be `host_mapped`. `RdmaRingsHostRxOp` copies each
+frame into pinned host staging, returns the ring credit as soon as the copy completes, and tags
+every batch with the lane that processes its series: series k goes to lane k % len(devices),
+whatever ring the sender wrote it into. One `RawUploadGpuOp` per lane copies that lane's batches
+to its GPU, where the scan, detector, and HDF5 writer operators run as with other lanes. The
+sender must send uncompressed images. A series starts only when its lane has finished the
+previous one. Without `devices`, protocol 3 uses `RdmaRingsRxOp` as described above. The ANS
+encoder is not supported with `devices`.
+
 ## HDF5 output
 
 `writer.enabled: true` adds `H5WriterOp` as a second consumer of decoded batches. Each series
@@ -265,7 +277,8 @@ imagemux, so any reader with the standard bitshuffle plugin decodes them, for ex
 `import hdf5plugin`. The GPU bit-shuffles each image in 4096-element blocks, nvCOMP compresses
 the blocks with zstd (at its fixed default level), and a framing kernel writes the bitshuffle
 chunk headers into mapped pinned staging. One writer thread performs every HDF5 call and stores
-the chunks with `H5Dwrite_chunk`, without filtering on the host.
+the chunks with `H5Dwrite_chunk`, without filtering on the host. With `devices`, each lane has its
+own writer; their HDF5 calls take one process-wide lock, so lanes write one at a time.
 
 The data layout uses START `number_of_images`, which the writer therefore requires. Images whose
 IDs fall outside it are counted as `dropped_images` and not written. Unwritten positions read as
@@ -352,6 +365,9 @@ A successful END validates the receiver's internal count but does not require it
 the announced count. Maps stay in GPU memory; the CLI reports totals, not image files.
 
 ## RDMA acquisition routing
+
+This section describes `rdma.protocol: 2`; protocol 3 with `devices` is described under
+[Multiple RDMA rings](#multiple-rdma-rings).
 
 For round-robin acquisition routing, select `transport: rdma`, `execute.mode: service`,
 and `devices: [0, 1]` (or a longer ordered list). Whole acquisitions stay on one GPU;
