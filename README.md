@@ -13,7 +13,8 @@ configuration, batching/ownership contracts, and validation commands.
 The application selects image dimensions from each series' START metadata and supports
 a configured raster scan and BF/ADF integration. It prints per-series JSON summaries and
 can optionally save the diffraction images as NXmx HDF5 with GPU bitshuffle/zstd compression;
-it does not yet provide a live image viewer or export BF/ADF maps from the CLI.
+the optional parallax branch adds reconstruction, live tuning, and a browser viewer.
+BF/ADF maps are not shown in that viewer. See [parallax setup and migration](docs/parallax/GUIDE.md).
 
 ## HDF5 writer and the Python GIL
 

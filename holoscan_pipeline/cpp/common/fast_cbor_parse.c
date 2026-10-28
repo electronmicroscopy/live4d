@@ -346,8 +346,11 @@ static int extract_image_shape(const uint8_t* data, size_t size,
             uint64_t shape_size, width, height;
             if (candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY ||
                 read_cbor_uint(&candidate, end, &wrapper_size) || wrapper_size != 2 ||
-                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY ||
-                read_cbor_uint(&candidate, end, &shape_size) || shape_size != 2 ||
+                candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY) {
+                ++ptr;  // the bytes D8 28 inside an earlier value (e.g. a timestamp), not tag 40
+                continue;
+            }
+            if (read_cbor_uint(&candidate, end, &shape_size) || shape_size != 2 ||
                 candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
                 read_cbor_uint(&candidate, end, &width) || width > UINT32_MAX ||
                 candidate >= end || (*candidate & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED ||
@@ -568,62 +571,63 @@ int fast_extract_compressed_bslz4(
     // Scan for Dectris compression tag pattern
     while (ptr + sizeof(DECTRIS_TAG_PATTERN) <= end) {
         if (memcmp(ptr, DECTRIS_TAG_PATTERN, sizeof(DECTRIS_TAG_PATTERN)) == 0) {
-            // Found tag 56500!
+            // Found tag 56500 (or its bytes inside an earlier value: then keep scanning).
+            const uint8_t* resume = ptr + 1;
             ptr += sizeof(DECTRIS_TAG_PATTERN);
 
             // Next should be an array with 3 elements: [algorithm, elem_size, bytes]
             if (ptr >= end) {
-                fprintf(stderr, "Unexpected end after Dectris tag\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             uint8_t array_byte = *ptr;
             if ((array_byte & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_ARRAY) {
-                fprintf(stderr, "Expected array after Dectris tag, got 0x%02x\n", array_byte);
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             uint8_t array_length = array_byte & CBOR_ADDL_INFO_MASK;
             if (array_length != 3) {
-                fprintf(stderr, "Expected array of length 3, got %d\n", array_length);
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
             ptr++;
 
             // Element 0: algorithm (text string, should be "bslz4")
             if (ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_TEXT) {
-                fprintf(stderr, "Expected text string for algorithm\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             uint64_t algo_len;
             if (read_cbor_uint(&ptr, end, &algo_len) != 0) {
-                fprintf(stderr, "Failed to read algorithm string length\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             if (ptr + algo_len > end) {
-                fprintf(stderr, "Algorithm string extends beyond message\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             // Verify it's "bslz4"
             if (algo_len != 5 || memcmp(ptr, "bslz4", 5) != 0) {
-                fprintf(stderr, "Expected 'bslz4' algorithm, got something else\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
             ptr += algo_len;
 
             // Element 1: elem_size (unsigned integer)
             if (ptr >= end || (*ptr & CBOR_MAJOR_TYPE_MASK) != CBOR_MAJOR_UNSIGNED) {
-                fprintf(stderr, "Expected unsigned int for elem_size\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             uint64_t elem_size;
             if (read_cbor_uint(&ptr, end, &elem_size) != 0) {
-                fprintf(stderr, "Failed to read elem_size\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
             *elem_size_out = (size_t)elem_size;
 
@@ -631,16 +635,16 @@ int fast_extract_compressed_bslz4(
             const uint8_t* compressed_bytes;
             size_t compressed_len;
             if (read_cbor_bytes(&ptr, end, &compressed_bytes, &compressed_len) != 0) {
-                fprintf(stderr, "Failed to read compressed bytes\n");
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             // Extract Dectris header (first 12 bytes):
             // - 8 bytes: original_size (big-endian uint64)
             // - 4 bytes: block_size (big-endian uint32)
             if (compressed_len < 12) {
-                fprintf(stderr, "Compressed data too short for Dectris header: %zu bytes\n", compressed_len);
-                return -1;
+                ptr = resume;  // not the tag
+                continue;
             }
 
             // Read original size from Dectris header

@@ -14,3 +14,7 @@ detector:
   adf_outer: 48.0
 zmq:
   endpoint: tcp://127.0.0.1:5555
+
+# Optional reconstruction: requires explicit acquisition settings when enabled.
+parallax:
+  enabled: false

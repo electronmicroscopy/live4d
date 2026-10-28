@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 import yaml
+from .parallax.settings import validate as validate_parallax
 
 
 @dataclass(frozen=True)
@@ -23,7 +24,10 @@ class PipelineConfig:
     # Lossless ANS encoding of every series on the GPU (quantem.gpu); keep: series kept resident (0: all).
     encoder: dict = field(default_factory=lambda: dict(enabled=False, keep=1))
 
+    parallax: dict = field(default_factory=lambda: dict(enabled=False))
+
     def __post_init__(self):
+        object.__setattr__(self, "parallax", validate_parallax(self.parallax))
         defaults = dict(scan=dict(width=1000, height=1000),
                         detector=dict(bf_radius=16.0, adf_inner=24.0, adf_outer=48.0),
                         execute=dict(mode="finite", seconds=0.0),
