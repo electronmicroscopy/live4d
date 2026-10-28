@@ -79,7 +79,7 @@ def test_shipped_configs():
     lanes = load_config(root / "buffle_rdma_lanes.yaml")
     assert lanes.transport == "rdma" and lanes.gpu_devices == (0, 1)
     assert (lanes.rdma["protocol"], lanes.rdma["ring_memory"]) == (3, "host_mapped")
-    assert lanes.writer["enabled"] and lanes.writer["format"] == "em"
+    assert not lanes.writer["enabled"] and lanes.writer["format"] == "em"
 
 
 def test_device_list_and_legacy_scalar_share_normalized_selection():

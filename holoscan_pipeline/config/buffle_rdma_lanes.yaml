@@ -16,7 +16,7 @@ detector:
   adf_inner: 24.0
   adf_outer: 48.0
 writer:
-  enabled: true      # enable_h5_writer can turn writing off for a series, but cannot turn it on
+  enabled: false     # enable_h5_writer can turn writing off for a series, but cannot turn it on
   format: em         # writes <name>_em_metadata.h5 and links it from the master file
   output_dir: /data  # directory on buffle which holoscan has access too (mounted volume when run in docker)
 rdma:

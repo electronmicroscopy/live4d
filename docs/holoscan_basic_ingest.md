@@ -93,8 +93,9 @@ return from `run_async` alone does not establish readiness.
 
 ### Protocol 3 on Buffle with two GPUs
 
-`holoscan_pipeline/config/buffle_rdma_lanes.yaml` runs the Spark-to-Buffle link with protocol 3,
-two GPU lanes, and the HDF5 writer. Work through these steps in order.
+`holoscan_pipeline/config/buffle_rdma_lanes.yaml` runs the Spark-to-Buffle link with protocol 3
+and two GPU lanes. The HDF5 writer is off in this file; set `writer.enabled: true` to write
+files. Work through these steps in order.
 
 1. Ask the sender's owner which imagemux protocol its software speaks, and set `rdma.protocol`
    to match. A mismatch fails with imagemux closing the connection after the Hello.
@@ -122,8 +123,8 @@ docker run --rm --gpus '"device=1,3"' --network host \
 7. In service mode the receiver exits when the sender closes its connection, for example when
    the sender is restarted or switches streams. Start it again before the next acquisition.
    `execute.mode: finite` stops after the first acquisition.
-8. The writer needs disk space: 96×96 images are about 18 GB uncompressed per million images,
-   and the files are smaller by a data-dependent ratio. A series without an
+8. With `writer.enabled: true` the writer needs disk space: 96×96 images are about 18 GB
+   uncompressed per million images, and the files are smaller by a data-dependent ratio. A series without an
    `electron_microscope` map in its `header_appendix` gets no `_em_metadata.h5` from the writer.
 
 ### Docker Compose alternative
