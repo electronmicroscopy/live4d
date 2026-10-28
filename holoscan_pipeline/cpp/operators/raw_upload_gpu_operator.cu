@@ -98,7 +98,6 @@ expected<void, Error> RawUploadGpuOp::compute(ExecutionContext& context) {
     status = cudaMemsetAsync(writer.data(), 0, image_bytes, stream);
     if (status != cudaSuccess) return make_unexpected(cuda_error("READY tensor", status));
   } else if (count > 0) {
-    // The host side must be one contiguous run of count images in order.
     const size_t total = count * image_bytes;
     for (size_t i = 0; i < count; ++i) {
       if (batch.sizes[i] != image_bytes || batch.offsets[i] != i * image_bytes)
@@ -109,7 +108,6 @@ expected<void, Error> RawUploadGpuOp::compute(ExecutionContext& context) {
     status = cudaMemcpyAsync(writer.data(), batch.payload->data(), total, cudaMemcpyHostToDevice,
                              stream);
     if (status != cudaSuccess) return make_unexpected(cuda_error("host-to-device copy", status));
-    // The pinned host staging is runtime-owned; finish reading it before the input is released.
     status = cudaStreamSynchronize(stream);
     if (status != cudaSuccess) return make_unexpected(cuda_error("upload synchronize", status));
   }
@@ -125,7 +123,6 @@ expected<void, Error> RawUploadGpuOp::compute(ExecutionContext& context) {
   decoded.series_images = batch.series_images;
   decoded.pipeline_ready = batch.pipeline_ready;
   auto capture = context.activation_time();
-  // Several OnEach activations may share a reference time; the fanout join needs one key each.
   capture.timestamp_ns = std::max(capture.timestamp_ns, last_capture_ns_ + 1);
   last_capture_ns_ = capture.timestamp_ns;
   auto published = output.emit_tensor(std::move(loan), decoded,

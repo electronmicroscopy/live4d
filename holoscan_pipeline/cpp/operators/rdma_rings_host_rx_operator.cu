@@ -119,9 +119,6 @@ void RdmaRingsHostRxOp::start() {
   frame_.reset();
 }
 
-// The next series is admitted when the lane it is bound for has finished its previous one, and
-// while finite mode has not yet used its acquisition. Until then its START stays in the ring and
-// the sender is held back by the missing credit.
 bool RdmaRingsHostRxOp::series_admitted() const {
   if (acquisition_limit_ && series_ordinal_ >= acquisition_limit_) return false;
   if (acquisition_windows_.empty()) return true;
@@ -137,7 +134,6 @@ expected<void, Error> RdmaRingsHostRxOp::compute(ExecutionContext& context) {
   if (context.cancellation().stop_requested()) return {};
   HOLOSCAN_TRY(retry_credit_writes());
   HOLOSCAN_TRY(poll_completions());
-  // Every lane receives every batch, so each lane's window must admit the next one.
   for (const auto* window : publication_windows_) {
     if (!window->admits(next_batch_id_ + 1)) return {};
   }
@@ -175,7 +171,6 @@ expected<void, Error> RdmaRingsHostRxOp::compute(ExecutionContext& context) {
       image_count += take;
       frame.images_consumed += static_cast<uint32_t>(take);
 
-      // The bytes are in host staging now, so the ring space is free to reuse.
       if (frame.images_consumed == frame.header.image_count) {
         HOLOSCAN_TRY(record_credit(frame.ring, rings_[frame.ring].reader_position));
         frame_.reset();
@@ -467,7 +462,6 @@ expected<void, Error> RdmaRingsHostRxOp::read_next_frame(size_t ring_index,
     active_series_ = true;
     active_series_id_ = header.series_id;
     active_series_images_ = 0;
-    // Series k is processed by lane k % lanes, whatever ring the sender wrote it into.
     active_destination_ = static_cast<uint32_t>(series_ordinal_ % lanes_);
     ++series_ordinal_;
     pending_control_ = ControlKind::kStart;

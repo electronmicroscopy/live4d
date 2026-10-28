@@ -16,10 +16,6 @@
 
 namespace holoscan::ops {
 
-// imagemux protocol 3 into pinned host batches for several GPU lanes. The rings are mapped host
-// memory: this source reads them on the CPU, copies each frame into host staging, returns the
-// ring credit at once, and tags every batch with the lane that processes its series. Series k goes
-// to lane k % lanes. Each lane's RawUploadGpuOp copies its batches to its own GPU.
 struct RdmaRingsHostRxParams {
   uint64_t qp_handle{};
   uint64_t ring_address{};

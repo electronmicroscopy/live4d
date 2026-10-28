@@ -12,9 +12,6 @@
 
 namespace holoscan::ops {
 
-// Uploads one lane's uncompressed uint16 batches from pinned host memory to its GPU. It takes the
-// same CompressedBatch messages as DecompressGpuOp, ignores batches tagged for other lanes, and
-// emits the DecodedBatch the scan and detector operators consume.
 struct RawUploadGpuParams {
   uint64_t publication_window{};
   uint64_t input_window{};
