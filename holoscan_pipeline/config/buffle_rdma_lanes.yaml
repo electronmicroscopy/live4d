@@ -1,0 +1,31 @@
+# Live detector: Spark enp1s0f0np0 (10.10.10.2) -> Buffle mlx5_0 (10.10.10.1), protocol 3, two GPU lanes.
+# CUDA devices are relative to the GPUs exposed to the container: --gpus '"device=1,3"' gives 0 and 1.
+transport: rdma
+batch_size: 512
+queue_depth: 4
+devices: [0, 1]
+execute:
+  mode: service
+  seconds: 0
+# Raster dimensions are configured here; detector image dimensions come from START.
+scan:
+  width: 1000
+  height: 1000
+detector:
+  bf_radius: 16.0
+  adf_inner: 24.0
+  adf_outer: 48.0
+writer:
+  enabled: true      # enable_h5_writer can turn writing off for a series, but cannot turn it on
+  format: em         # writes <name>_em_metadata.h5 and links it from the master file
+  output_dir: /data  # directory on buffle which holoscan has access too (mounted volume when run in docker)
+rdma:
+  remote_address: 10.10.10.2:31003
+  local_address: 10.10.10.1
+  device: mlx5_0
+  ring_memory: host_mapped
+  protocol: 3
+  rings: 4
+  ring_mib: 64
+  max_batch: 512
+  timeout: 10

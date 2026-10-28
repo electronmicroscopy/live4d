@@ -76,6 +76,10 @@ def test_shipped_configs():
     assert buffle.scan == dict(width=1000, height=1000)
     rings = load_config(root / "rdma_rings.yaml")
     assert (rings.rdma["protocol"], rings.rdma["rings"], rings.rdma["ring_mib"]) == (3, 4, 64)
+    lanes = load_config(root / "buffle_rdma_lanes.yaml")
+    assert lanes.transport == "rdma" and lanes.gpu_devices == (0, 1)
+    assert (lanes.rdma["protocol"], lanes.rdma["ring_memory"]) == (3, "host_mapped")
+    assert lanes.writer["enabled"] and lanes.writer["format"] == "em"
 
 
 def test_device_list_and_legacy_scalar_share_normalized_selection():

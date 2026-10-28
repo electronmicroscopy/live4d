@@ -91,6 +91,41 @@ Wait for `[holoscan] ready` before starting acquisition. This marker follows rec
 initialization, GPU warm-up, and passage through the shared processing operators;
 return from `run_async` alone does not establish readiness.
 
+### Protocol 3 on Buffle with two GPUs
+
+`holoscan_pipeline/config/buffle_rdma_lanes.yaml` runs the Spark-to-Buffle link with protocol 3,
+two GPU lanes, and the HDF5 writer. Work through these steps in order.
+
+1. Ask the sender's owner which imagemux protocol its software speaks, and set `rdma.protocol`
+   to match. A mismatch fails with imagemux closing the connection after the Hello.
+2. The sender must send RDMA (`cbor-rdma`) from the interface in `rdma.remote_address`, with
+   uncompressed images. With `devices` and protocol 3 the images are not decompressed.
+3. Copy the YAML and set `scan` to the raster of the acquisition. The raster comes from this
+   file, not from the sender, unless the series' `header_appendix` carries one.
+4. Create the config file and the writer's output directory before `docker run`. Docker creates
+   a missing mount source as a root-owned directory, and the receiver then fails with
+   `IsADirectoryError: '/etc/dectris.yaml'`.
+5. Expose the GPUs to the container with `--gpus '"device=1,3"'`. `devices: [0, 1]` then selects
+   the first and second of those, whatever their numbers on the host.
+
+```bash
+docker run --rm --gpus '"device=1,3"' --network host \
+  --ulimit memlock=-1:-1 --ulimit stack=33554432 \
+  --device /dev/infiniband \
+  -v "$PWD/data:/data" \
+  -v "$PWD/buffle_rdma_lanes.yaml:/etc/dectris.yaml:ro" \
+  dectris-holoscan:hsdk5 --config /etc/dectris.yaml
+```
+
+6. Wait for `[holoscan] ready`, then trigger. Series go to the lanes in turn, and the `device`
+   field of each `[series-result]` shows the lane's device.
+7. In service mode the receiver exits when the sender closes its connection, for example when
+   the sender is restarted or switches streams. Start it again before the next acquisition.
+   `execute.mode: finite` stops after the first acquisition.
+8. The writer needs disk space: 96×96 images are about 18 GB uncompressed per million images,
+   and the files are smaller by a data-dependent ratio. A series without an
+   `electron_microscope` map in its `header_appendix` gets no `_em_metadata.h5` from the writer.
+
 ### Docker Compose alternative
 
 `docker compose -f docker/compose.holoscan.yaml up --build` uses the ZMQ YAML copied into
