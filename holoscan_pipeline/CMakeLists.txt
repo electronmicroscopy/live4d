@@ -47,6 +47,7 @@ add_library(dectris_holoscan_ops SHARED
   cpp/common/cbor_value.cpp cpp/common/nxmx_writer.cpp
   cpp/operators/zmq_rx_operator.cu cpp/operators/decompress_gpu_operator.cu
   cpp/operators/rdma_rx_operator.cu cpp/operators/rdma_rings_rx_operator.cu
+  cpp/operators/rdma_rings_host_rx_operator.cu cpp/operators/raw_upload_gpu_operator.cu
   cpp/operators/h5_writer_operator.cu)
 set_target_properties(dectris_holoscan_ops PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON CUDA_RESOLVE_DEVICE_SYMBOLS ON

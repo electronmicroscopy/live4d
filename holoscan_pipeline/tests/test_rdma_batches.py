@@ -873,3 +873,212 @@ def test_rings_reject_invalid_geometry_in_a_later_ring(start_shape, image_shape,
         assert expected in summary, summary
     finally:
         loopback.close()
+
+
+# ---- Protocol 3 with GPU lanes: host-staged batches, one upload operator per lane ------------
+
+
+def _build_ring_lanes(loopback, lanes, batch_size, max_batch=32, queue_depth=4, hold=None):
+    import cupy as cp
+    import holoscan as hs
+
+    from live4d.operators import RawUploadGpuOp, RdmaRingsHostRxOp
+    from live4d.schemas.decoded_batch import DecodedBatch
+
+    records = [[] for _ in range(lanes)]
+    ready_lanes = set()
+    ready_lock = threading.Lock()
+    all_ready = threading.Event()
+    finished = [0] * lanes
+    inputs = [BatchWindow(queue_depth - 1) for _ in range(lanes)]
+    outputs = [BatchWindow(queue_depth - 1) for _ in range(lanes)]
+    admission = [BatchWindow(1) for _ in range(lanes)]
+
+    def make_sink(lane):
+        class LaneSink(hs.Operator):
+            inp = hs.Input("input", DecodedBatch)
+
+            def __init__(self):
+                super().__init__()
+
+            def setup(self, spec):
+                spec.input(self.inp)
+
+            def contract(self):
+                return hs.Contract().trigger(hs.OnEach(self.inp))
+
+            def compute(self, ctx):
+                batch = self.inp.receive_data()
+                with cp.cuda.Device(0), ctx.stream():
+                    tensor = cp.from_dlpack(batch.frames)
+                    pixels = cp.asnumpy(tensor[:len(batch.image_ids)]).copy() \
+                        if batch.image_ids else None
+                item = {
+                    "batch_id": int(batch.batch_id),
+                    "pipeline_ready": bool(batch.pipeline_ready),
+                    "start": bool(batch.start_of_series),
+                    "end": bool(batch.end_of_series),
+                    "series_id": int(batch.series_id),
+                    "series_images": int(batch.series_images),
+                    "image_ids": [int(value) for value in batch.image_ids],
+                    "frame_shape": tuple(batch.frames.shape),
+                    "pixels": pixels,
+                }
+                records[lane].append(item)
+                if item["pipeline_ready"]:
+                    with ready_lock:
+                        ready_lanes.add(lane)
+                        if len(ready_lanes) == lanes:
+                            all_ready.set()
+                outputs[lane].release(item["batch_id"])
+                if item["end"]:
+                    if hold and hold.get(lane) is not None:
+                        hold[lane].wait(30)
+                    finished[lane] += 1
+                    admission[lane].release(finished[lane])
+
+        return LaneSink
+
+    graph = hs.Graph("rdma-rings-lanes-loopback", default_clock=hs.RealtimeClock)
+    source = RdmaRingsHostRxOp(
+        graph, "rdma_rx", qp_handle=loopback.rx.native_handle, ring_address=loopback.ring_address,
+        ring_bytes=loopback.ring_bytes, ring_count=loopback.rings,
+        credit_address=loopback.credit_mr.address, credit_rkey=loopback.credit_mr.rkey,
+        publication_windows=[window.handle for window in inputs],
+        acquisition_windows=[window.handle for window in admission], acquisition_limit=0,
+        batch_size=batch_size, max_batch=max_batch)
+    graph.partition("receiver").add(source)
+    deployment = hs.execution.DeploymentBinding()
+    for lane in range(lanes):
+        upload = RawUploadGpuOp(graph, f"upload{lane}", publication_window=outputs[lane].handle,
+                                input_window=inputs[lane].handle, destination=lane, device=0)
+        sink = graph.op(make_sink(lane), f"sink{lane}")
+        graph.add_flow(source.output, upload.input, queue_depth=queue_depth)
+        graph.add_flow(upload.output, sink.input, queue_depth=queue_depth)
+        graph.partition(f"upload{lane}").add(upload)
+        graph.partition(f"sink{lane}").add(sink)
+        deployment.bind_tensor_output_device(operator_path=f"upload{lane}", output_port="output",
+                                             device=hs.execution.DeviceId(0))
+    plan = hs.compile(graph, hs.CompileOptions(deployment=deployment))
+    if not plan.ok:
+        raise RuntimeError(plan.summary())
+    return plan, records, all_ready, inputs + outputs + admission
+
+
+def _close_windows(windows):
+    for window in windows or ():
+        window.close()
+
+
+@pytest.mark.parametrize("lanes", [2, 3])
+def test_ring_lanes_route_series_round_robin_in_order_at_both_sizes(lanes):
+    ring_bytes = 1 << 20
+    loopback = Loopback(ring_bytes, rings=3)
+    windows = None
+    try:
+        writers, sent = _ring_writers(ring_bytes, 3)
+        series = [(20, (96, 96), [0, 1, 2]), (21, (192, 192), []),
+                  (22, (192, 192), [5, 6, 7, 8, 9]), (23, (96, 96), [4]), (24, (96, 96), [0, 1])]
+        expected = {lane: [] for lane in range(lanes)}
+        for index, (series_id, shape, ids) in enumerate(series):
+            writer = writers[index % 3]
+            _start(writer, series_id, len(ids), shape)
+            values = [series_id * 10 + image_id for image_id in ids]
+            if ids:
+                _image(writer, series_id, ids, values, shape)
+            _end(writer, series_id)
+            expected[index % lanes] += [(ids[i:i + 2], values[i:i + 2])
+                                        for i in range(0, len(ids), 2)]
+
+        loopback.send(sent)
+        plan, received, ready, windows = _build_ring_lanes(loopback, lanes, batch_size=2)
+        _run_until_output(plan, ready,
+                          lambda: sum(item["end"] for lane in received for item in lane) == len(series))
+
+        for lane in range(lanes):
+            mine = [entry for index, entry in enumerate(series) if index % lanes == lane]
+            assert received[lane][0]["pipeline_ready"]
+            marks = [(item["start"], item["end"], item["series_id"]) for item in received[lane]
+                     if item["start"] or item["end"]]
+            assert marks == [(start, not start, entry[0]) for entry in mine for start in (True, False)]
+            _assert_pixels(received[lane], expected[lane])
+            shapes = {entry[0]: entry[1] for entry in mine}
+            for item in received[lane][1:]:
+                assert item["frame_shape"][1:] == shapes[item["series_id"]]
+            assert [item["series_images"] for item in received[lane] if item["end"]] == [
+                len(entry[2]) for entry in mine]
+        assert [loopback.ring_credit(i) for i in range(3)] == [w.position for w in writers]
+    finally:
+        _close_windows(windows)
+        loopback.close()
+
+
+def test_ring_lanes_hold_the_next_series_until_its_lane_is_free():
+    import holoscan as hs
+
+    ring_bytes = 1 << 20
+    loopback = Loopback(ring_bytes, rings=3)
+    hold = {0: threading.Event()}
+    windows = None
+    try:
+        writers, sent = _ring_writers(ring_bytes, 3)
+        for index, series_id in enumerate((30, 31, 32)):  # lanes 0, 1, 0
+            _start(writers[index], series_id, 2)
+            _image(writers[index], series_id, [0, 1], [series_id, series_id])
+            _end(writers[index], series_id)
+        loopback.send(sent)
+        plan, received, ready, windows = _build_ring_lanes(loopback, 2, batch_size=2, hold=hold)
+
+        def ended(lane, series_id):
+            return any(item["end"] and item["series_id"] == series_id for item in received[lane])
+
+        with hs.run_async(plan) as session:
+            _wait_until(session, ready.is_set, 30, "READY")
+            _wait_until(session, lambda: ended(0, 30) and ended(1, 31), 30, "series 30 and 31")
+            time.sleep(0.5)
+            # Lane 0 has not released series 30, so series 32 stays in its ring.
+            assert not any(item["series_id"] == 32 for item in received[0])
+            hold[0].set()
+            _wait_until(session, lambda: ended(0, 32), 30, "series 32 once lane 0 is free")
+            session.request_stop()
+            assert session.wait(timeout=10), session.summary()
+        _assert_pixels(received[0], [([0, 1], [30, 30]), ([0, 1], [32, 32])])
+        _assert_pixels(received[1], [([0, 1], [31, 31])])
+    finally:
+        hold[0].set()
+        _close_windows(windows)
+        loopback.close()
+
+
+def test_ring_lanes_return_credit_on_the_host_copy():
+    # Each ring holds START plus two images, so series 40 needs ring 0 credits before its first
+    # batch of four is full. The host copy returns them without any GPU event.
+    ring_bytes = 37_376
+    loopback = Loopback(ring_bytes, rings=2)
+    windows = None
+    try:
+        writers, sent = _ring_writers(ring_bytes, 2)
+        _start(writers[0], 40, 6)
+        values = [3, 5, 7, 11, 13, 17]
+        for image_id, value in enumerate(values):
+            _image(writers[0], 40, [image_id], [value])
+        _end(writers[0], 40)
+        _start(writers[1], 41, 1)
+        _image(writers[1], 41, [0], [99])
+        _end(writers[1], 41)
+
+        plan, received, ready, windows = _build_ring_lanes(loopback, 2, batch_size=4, max_batch=1)
+        sender, sender_errors = _start_sender(loopback, sent)
+        try:
+            _run_until_output(plan, ready,
+                              lambda: sum(item["end"] for lane in received for item in lane) == 2,
+                              timeout=20)
+        finally:
+            _join_sender(sender, sender_errors, timeout=25)
+        _assert_pixels(received[0], [([0, 1, 2, 3], values[:4]), ([4, 5], values[4:])])
+        _assert_pixels(received[1], [([0], [99])])
+        assert loopback.ring_credit(0) == writers[0].position > ring_bytes
+        assert loopback.ring_credit(1) == writers[1].position
+    finally:
+        _close_windows(windows)
+        loopback.close()

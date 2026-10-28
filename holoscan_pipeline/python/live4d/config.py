@@ -72,8 +72,9 @@ class PipelineConfig:
             raise ValueError("rdma.rings must be an integer between 1 and 256")
         if rdma["protocol"] == 2 and rdma["rings"] != 1:
             raise ValueError("rdma.rings above 1 requires rdma.protocol 3")
-        if self.devices is not None and self.transport == "rdma" and rdma["protocol"] == 3:
-            raise ValueError("rdma.protocol 3 is not supported with `devices` yet")
+        if (self.devices is not None and self.transport == "rdma" and rdma["protocol"] == 3
+                and rdma["ring_memory"] != "host_mapped"):
+            raise ValueError("rdma.protocol 3 with `devices` requires rdma.ring_memory host_mapped")
         writer = self.writer
         if type(writer["enabled"]) is not bool:
             raise ValueError("writer.enabled must be true or false")

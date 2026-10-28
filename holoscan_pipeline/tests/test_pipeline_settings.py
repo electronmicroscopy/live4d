@@ -96,9 +96,10 @@ def test_repeated_devices_preserve_independent_routing_entries(transport):
     assert PipelineConfig(transport=transport, devices=[2, 3, 2], rdma=rdma).gpu_devices == (2, 3, 2)
 
 
-def test_protocol_3_is_not_supported_with_devices():
-    rdma = dict(remote_address="sender:31003", local_address="receiver", protocol=3)
+def test_protocol_3_with_devices_requires_host_mapped_rings():
+    rdma = dict(remote_address="sender:31003", local_address="receiver", protocol=3, rings=2)
     PipelineConfig(transport="rdma", rdma=rdma)
     with pytest.raises(ValueError):
-        PipelineConfig(transport="rdma", devices=[0], rdma=rdma)
+        PipelineConfig(transport="rdma", devices=[0, 0], rdma=rdma)
+    PipelineConfig(transport="rdma", devices=[0, 0], rdma=dict(rdma, ring_memory="host_mapped"))
     PipelineConfig(transport="zmq", devices=[0], rdma=dict(protocol=3))

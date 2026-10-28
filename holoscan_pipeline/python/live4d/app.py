@@ -11,8 +11,8 @@ import time
 import holoscan as hs
 
 from .config import PipelineConfig, load_config
-from .operators import (DecompressGpuOp, H5WriterOp, RdmaRingsRxOp, RdmaRxOp, ZmqRxOp,
-                        _CompletionLatch, _PublicationWindow)
+from .operators import (DecompressGpuOp, H5WriterOp, RawUploadGpuOp, RdmaRingsHostRxOp,
+                        RdmaRingsRxOp, RdmaRxOp, ZmqRxOp, _CompletionLatch, _PublicationWindow)
 from .processing import AnsEncoderOp, ScanTensorOp, VirtualDetectorOp
 
 
@@ -124,7 +124,12 @@ class PipelineApp:
 
     def _init_lanes(self, conn, ring, credit, observer, encoder_sink, receiver_ready):
         config = self.config
-        if conn is not None or ring is not None or credit is not None:
+        rings_mode = config.transport == "rdma" and config.rdma["protocol"] == 3
+        if rings_mode:
+            if conn is None or ring is None or credit is None:
+                raise ValueError("RDMA graph requires a connected receiver and registered ring")
+            self.conn = conn
+        elif conn is not None or ring is not None or credit is not None:
             raise ValueError("Multiple devices own their RDMA connection; do not pass conn, ring or credit")
         if config.writer["enabled"] or config.encoder["enabled"] or encoder_sink is not None:
             raise ValueError("The HDF5 writer and the ANS encoder are not supported with `devices` "
@@ -138,17 +143,26 @@ class PipelineApp:
         self.branch_ready, self.windows = [], []
         deployment = hs.execution.DeploymentBinding()
         try:
-            if config.transport == "rdma":
+            if config.transport == "rdma" and not rings_mode:
                 from .rdma import RdmaReceiver
                 self.rdma = self.receiver = RdmaReceiver(config, receiver_ready)
             else:
                 from .zmq import ZmqReceiver
                 self.zmq = self.receiver = ZmqReceiver(config)
-                rx = ZmqRxOp(self.graph, "zmq_rx", endpoint=config.zmq["endpoint"],
-                             batch_size=config.batch_size,
-                             publication_windows=[window.handle for window in self.zmq.inputs],
-                             acquisition_windows=[window.handle for window in self.zmq.acquisitions],
-                             acquisition_limit=1 if self.finite else 0)
+                windows = dict(publication_windows=[window.handle for window in self.zmq.inputs],
+                               acquisition_windows=[window.handle for window in self.zmq.acquisitions],
+                               acquisition_limit=1 if self.finite else 0)
+                if rings_mode:
+                    rdma = config.rdma
+                    rx = RdmaRingsHostRxOp(self.graph, "rdma_rx", qp_handle=conn.native_handle,
+                                           ring_address=ring.addr,
+                                           ring_bytes=ring.length // rdma["rings"],
+                                           ring_count=rdma["rings"], credit_address=credit.addr,
+                                           credit_rkey=credit.rkey, batch_size=config.batch_size,
+                                           max_batch=rdma["max_batch"], **windows)
+                else:
+                    rx = ZmqRxOp(self.graph, "zmq_rx", endpoint=config.zmq["endpoint"],
+                                 batch_size=config.batch_size, **windows)
                 self.graph.partition("receiver").add(rx)
             for index, device in enumerate(config.gpu_devices):
                 prefix = f"gpu{index}_"
@@ -159,11 +173,13 @@ class PipelineApp:
                 self.branch_ready.append(warmed)
                 self.windows.append(window)
                 if self.rdma is None:
-                    source_path = prefix + "decompress_gpu"
-                    decoded = DecompressGpuOp(self.graph, source_path,
-                                              publication_window=window.handle,
-                                              input_window=self.zmq.inputs[index].handle,
-                                              destination=index, device=device)
+                    lane_op, lane_name = ((RawUploadGpuOp, "upload_gpu") if rings_mode
+                                          else (DecompressGpuOp, "decompress_gpu"))
+                    source_path = prefix + lane_name
+                    decoded = lane_op(self.graph, source_path,
+                                      publication_window=window.handle,
+                                      input_window=self.zmq.inputs[index].handle,
+                                      destination=index, device=device)
                     self.graph.add_flow(rx.output, decoded.input, queue_depth=config.queue_depth)
                     self.graph.partition(prefix + "decode").add(decoded)
                     results = self.zmq.completion(index)
@@ -317,7 +333,9 @@ def main():
     if args.endpoint:
         overrides["zmq"] = config.zmq | dict(endpoint=args.endpoint)
     config = replace(config, **overrides)
-    if _multi_lane(config):
+    rings_lanes = (_multi_lane(config) and config.transport == "rdma"
+                   and config.rdma["protocol"] == 3)
+    if _multi_lane(config) and not rings_lanes:
         app = PipelineApp(config)
         try:
             if args.plan:
