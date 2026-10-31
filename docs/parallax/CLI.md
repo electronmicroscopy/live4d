@@ -201,6 +201,19 @@ Live acquisition uses `python -m live4d --config pipeline.yaml`; see [the guide]
 | `--repeats` | `50` | Timed batches per measurement. |
 | `--accumulate` | `['all', 'latest']` | Accumulation modes to time (run.py --accumulate). |
 
+## `python -m live4d.parallax.scripts.bench_obf`
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `--device` | `None` | Devices to time (default: cuda or mps where available, else cpu). |
+| `--preset` | `['binned', 'unbinned']` | Detector modes of the Gd2O3 recordings to time. |
+| `--scan` | `(256, 256)` | Scan grid (sets the canvas, and so the Gram and the readout). |
+| `--upsampling` | `2` | Output-grid upsampling. |
+| `--batch` | `[512, 1024, 2048]` | Frames per deposit call. |
+| `--repeats` | `10` | Timed batches per measurement. |
+| `--fft-sizes` | `False` | Round the canvas's pixels per field of view up to 2^a 3^b 5^c sizes. |
+| `--full-band` | `False` | Patches holding OBF's whole band (quantem's patch_margin=None) instead of the output grid's band (the default, 2-4x faster per frame). |
+
 ## `python scripts/compare_accumulate.py`
 
 | Parameter | Default | Description |
@@ -237,6 +250,9 @@ Live acquisition uses `python -m live4d --config pipeline.yaml`; see [the guide]
 | `--butterworth-order` | `12` | Steepness of the Butterworth low/high-pass edges. |
 | `--suppress-nyquist` | `auto` | Zero the Nyquist row/column of the output (auto: on when --upsampling > 1). |
 | `--band-limit` | `False` | Clamp the low-pass at the parallax band limit 2*alpha/lambda. |
+| `--precompute-obf-weights` | `False` | Build OBF's weights (its Gram: they depend on the probe, the bright-field pixels, the rotation and the output grid, not on the data) from the start and again after every retune, a step at a time beside the frames, so that choosing OBF in the viewer's channel list needs only a sweep of the frames held. The viewer's 'OBF weights' checkbox. |
+| `--compute-obf` | `False` | Reconstruct OBF from the start, as choosing it in the viewer's channel list does: the live channel `obf` and parallax_obf.npy, on the parallax output grid, for a run without a viewer. It follows the frames the store holds within --obf-share of the branch's time; slower than the frames, it lags and shows each position's newest frame. |
+| `--obf-share` | `0.4` | The share of the parallax branch's time OBF may take, on its stream: after each batch, this fraction of the time since the previous one (0.5-50 ms), saved up into steps of 8 ms, and of the live tick's period once no batch comes. Live, the share shrinks while the branch is busy. OBF keeps up with the frames when its rate times this share exceeds the frame rate. |
 
 ## `python scripts/session_report.py`
 

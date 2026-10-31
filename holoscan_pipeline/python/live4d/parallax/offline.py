@@ -9,6 +9,8 @@ import numpy as np
 from live4d.config import load_config
 from .runtime import ParallaxRuntime
 
+IDLE_BUDGET_S = 0.05     # OBF's device time per step while the viewer stays up after the replay
+
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="python -m live4d.parallax.offline", description=__doc__)
@@ -102,12 +104,14 @@ def main():
             replay(runtime, args.source, source_rate=args.source_rate)
         except KeyboardInterrupt:
             print("[parallax] replay interrupted", flush=True)
-        # An enabled viewer remains available for inspecting and tuning the final image.
+        # An enabled viewer remains available for inspecting and tuning the final image; OBF
+        # keeps following it (a retune rebuilds its weights and sweeps the frames held again).
         if runtime.viewer is not None:
             print("[parallax] replay finished; viewer remains available until Ctrl-C", flush=True)
             try:
                 while True:
-                    time.sleep(0.2)
+                    runtime.idle(IDLE_BUDGET_S)
+                    time.sleep(0.01)
             except KeyboardInterrupt:
                 pass
     finally:

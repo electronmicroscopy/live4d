@@ -117,3 +117,17 @@ class Algorithm(ABC):
     def tuned_flags(self, args: argparse.Namespace) -> list[str]:
         """The command-line flags that reproduce the current `live_params` values."""
         return []
+
+    def live_switches(self, args: argparse.Namespace, acc: Accumulator | None) -> list[dict]:
+        """On/off options a viewer may flip while running (parallax: precompute OBF's weights),
+        each a dict with `name`, `label`, `value` (now), `available` (in the current mode) and
+        `title`; `retune` receives {name: bool}. A snapshot's `<name>_state` metadata, when there
+        is one, says what it is doing. Default: none."""
+        return []
+
+    def live_channels(self, args: argparse.Namespace, acc: Accumulator | None) -> list[dict]:
+        """Channels computed only while a viewer shows them (parallax: OBF), each a dict with
+        `name`, `label`, `active` (computed now) and `available` (in the current mode). A viewer
+        lists them with the published channels; choosing one sends `retune` {name: True}, and
+        leaving it {name: False}. Default: none."""
+        return []

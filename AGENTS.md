@@ -14,8 +14,10 @@ radii remain configured in input-image pixels; they do not scale automatically.
 
 Read [README.md](README.md) and [the pipeline guide](docs/holoscan_basic_ingest.md)
 before changing the pipeline. Parallax numerical code lives in
-`holoscan_pipeline/python/live4d/algorithms/parallax/`; lifecycle, tuning, viewer,
-telemetry, recording tools, and offline replay live in `live4d/parallax/`.
+`holoscan_pipeline/python/live4d/algorithms/parallax/` and OBF's in `algorithms/obf/`; OBF's
+tracker (`live4d/parallax/obf.py`) has no thread and is stepped inside the parallax callbacks
+within `obf_share` of their time. Lifecycle, tuning, viewer, telemetry, recording tools, and offline replay
+live in `live4d/parallax/`.
 There is one live application (`python -m live4d`) and HSDK5 graph. Parallax is
 optional and disabled by default; never supply guessed acquisition physics.
 Offline replay (`python -m live4d.parallax.offline`) shares the YAML and numerical code.

@@ -4,6 +4,25 @@
   const fmt = (v, digits=1) => v == null ? 'N/A' : Number(v).toLocaleString(undefined,
     {minimumFractionDigits: digits, maximumFractionDigits: digits});
   const gib = v => v == null ? 'N/A' : `${fmt(v / 2**30, 2)} GiB`;
+  // A panel for debugging: shown while "live benchmarks" is ticked (remembered; ?benchmarks=1 opens
+  // it), and polled only then, once the first poll has said whether there is telemetry at all.
+  let wanted = false, known = false, available = false, timer = null;
+  try { wanted = localStorage.getItem('rs-benchmarks') === '1'; } catch (e) { /* no storage */ }
+  const asked = new URLSearchParams(location.search).get('benchmarks');
+  if (asked !== null) wanted = ['1', 'true'].includes(asked);
+  el('bench').checked = wanted;
+  function show() {
+    const open = wanted && available;
+    el('telemetry-panel').hidden = !open;
+    document.body.classList.toggle('has-telemetry', open);
+  }
+  el('bench').addEventListener('change', (e) => {
+    wanted = e.target.checked;
+    try { localStorage.setItem('rs-benchmarks', wanted ? '1' : '0'); } catch (err) { /* no storage */ }
+    show();
+    if (wanted && !timer) poll();
+    if (!wanted && timer) { clearTimeout(timer); timer = null; }
+  });
   function chart(history, target) {
     const canvas = el('telemetry-chart'), ctx = canvas.getContext('2d');
     const w = canvas.width, h = canvas.height;
@@ -28,8 +47,10 @@
     ctx.fillText(`FPS scale 0–${fmt(fpsMax/1000,0)}k · CPU 0–${fmt(cpuMax,0)}% · GPU 0–100%`, 8, 22);
   }
   function render(t) {
-    el('telemetry-panel').hidden = !t.available;
-    document.body.classList.toggle('has-telemetry', Boolean(t.available));
+    known = true;
+    available = Boolean(t.available);
+    el('benchrow').hidden = !available;
+    show();
     if (!t.available) { el('telemetry').hidden = true; return; }
     el('telemetry').hidden = false;
     el('telemetry-status').textContent = `Scan ${t.scan} · ${t.status}`;
@@ -78,6 +99,7 @@
     chart(t.history || [],t.target_fps);
   }
   async function poll() {
+    timer = null;
     try {
       const response = await fetch('telemetry', {cache: 'no-store', signal: AbortSignal.timeout(4000)});
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -85,7 +107,7 @@
     } catch (error) {
       el('telemetry-status').textContent = 'Telemetry disconnected — displayed values are stale';
       el('telemetry-status').style.color = 'var(--bad)';
-    } finally { setTimeout(poll,1000); }
+    } finally { if (!known || (wanted && available)) timer = setTimeout(poll, 1000); }
   }
   poll();
 })();

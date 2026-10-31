@@ -78,7 +78,8 @@ def image_message(image_id, value, shape=(96, 96), pixels=None):
 
 def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                processing_delay=0, queue_depth=4, defer_readback=False, expect_error=False,
-               appendices=None, placements=None, writer=None, pixels=None, encoder=None, parallax=None, batch_hook=None):
+               appendices=None, placements=None, writer=None, pixels=None, encoder=None, parallax=None, batch_hook=None,
+               after_series=None):
     observed, results, errors, starts, batch_shapes = [], [], [], [], []
     appendices = appendices or {}
     context = zmq.Context()
@@ -143,6 +144,8 @@ def run_series(series, *, batch_size=4, scan=(4, 2), service=False, delay=False,
                 if delay:
                     time.sleep(0.005)
             sender.send(cbor2.dumps(dict(type="end", series_id=sid)))
+        if after_series is not None:
+            after_series(app)
         thread.join(timeout=15)
         assert not thread.is_alive()
         if expect_error:
@@ -768,9 +771,9 @@ def test_parallax_shared_fanout_and_last_end(writing, encoding, slow_branch, tmp
     from types import SimpleNamespace
     if slow_branch == "parallax":
         original = BatchSink.feed
-        def slow(self, frames, ids):
+        def slow(self, frames, ids, **timing):
             time.sleep(.015)
-            return original(self, frames, ids)
+            return original(self, frames, ids, **timing)
         monkeypatch.setattr(BatchSink, "feed", slow)
 
     class EncoderSink:
@@ -853,6 +856,112 @@ def test_parallax_live_http_tuning_applies_on_runtime_callback(tmp_path):
     np.testing.assert_array_equal(np.load(tmp_path / "parallax_shifts.npy"), geo.shifts)
 
 
+_PARALLAX = dict(enabled=True, energy=300000, semiangle=4, angular_sampling=1, scan_sampling=2,
+                 defocus=-100, rotation=0, accumulate="latest")
+
+
+def _free_port():
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _post(port, changes):
+    from urllib.request import Request, urlopen
+    request = Request(f"http://127.0.0.1:{port}/params", data=json.dumps(changes).encode(),
+                      headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(request, timeout=5) as response:
+        return json.load(response)
+
+
+def _latest_reference(shape, scan, ids, c10=-100):
+    """An independent CPU `latest` accumulator of `series_pixels` frames of series 1, and OBF of
+    the frames it holds in one call (`reconstruct_once`)."""
+    from live4d.algorithms.obf.core import reconstruct_once
+    from live4d.algorithms.parallax.engine import ParallaxAccumulator, preprocess_geometry
+    geo = preprocess_geometry(shape, scan, (2, 2), 300000, 4, angular_sampling=(1, 1),
+                              aberration_coefs={"C10": c10}, rotation_angle=0)
+    acc = ParallaxAccumulator(geo, device="cpu", accumulate="latest", wrap_ids=True)
+    acc.process(np.stack([series_pixels(1, i, shape) for i in ids]), np.asarray(ids))
+    obf = reconstruct_once(acc._store, acc._visits, acc._store_kind, geo).numpy()
+    return acc.result(), obf
+
+
+def _rel(a, b):
+    return np.linalg.norm(np.asarray(a, np.float64) - b) / np.linalg.norm(b)
+
+
+@pytest.mark.parametrize("shape", [(96, 96), (192, 192)])
+def test_parallax_live_obf_is_that_of_the_frames_held(shape, tmp_path, capfd):
+    """OBF configured on (`compute_obf`), stepped after each batch on the runtime stream and
+    finished at END of the finite acquisition; batches of 5 over 36 positions end partial."""
+    pytest.importorskip("torch")
+    ids = list(range(36))
+    settings = dict(_PARALLAX, compute_obf=True, out_dir=str(tmp_path))
+    _, results, plan, _ = run_series([(1, ids, shape)], scan=(6, 6), batch_size=5, queue_depth=2,
+                                     parallax=settings, pixels=series_pixels)
+    assert plan.ok and [result["images"] for result in results] == [36]
+    assert "finishing the image of every frame held" in capfd.readouterr().out
+    recon, obf = _latest_reference(shape, (6, 6), ids)
+    np.testing.assert_allclose(np.load(tmp_path / "parallax_recon.npy"), recon, rtol=1e-6, atol=.001)
+    assert _rel(np.load(tmp_path / "parallax_obf.npy"), obf) < 1e-4
+
+
+def test_parallax_live_obf_chosen_mid_series_over_http(tmp_path):
+    """Choosing OBF in the viewer queues {"obf": true}; a parallax callback applies it, the
+    tracker attaches to the store already filling, and the finished image is that of every frame."""
+    pytest.importorskip("torch")
+    port, chosen = _free_port(), []
+
+    def choose(batch, positioned):
+        if len(batch.image_ids) and not chosen:
+            chosen.append(_post(port, {"obf": True}))
+
+    ids = list(range(36))
+    settings = dict(_PARALLAX, viewer_port=port, live_every=100, out_dir=str(tmp_path))
+    run_series([(1, ids, (96, 96))], scan=(6, 6), batch_size=5, queue_depth=2,
+               parallax=settings, pixels=series_pixels, batch_hook=choose)
+    assert chosen
+    _, obf = _latest_reference((96, 96), (6, 6), ids)
+    assert _rel(np.load(tmp_path / "parallax_obf.npy"), obf) < 1e-4
+
+
+def test_parallax_service_tick_applies_tuning_and_obf_between_scans(tmp_path):
+    """Service mode: after END no batch arrives, yet the branch's tick applies a queued C10
+    retune and OBF rebuilds its weights and sweeps the frames held again; the run's end saves
+    both (the retune re-renders `latest` exactly)."""
+    pytest.importorskip("torch")
+    port, applied = _free_port(), []
+
+    def retune(app):
+        runtime = app.parallax_runtime
+        deadline = time.monotonic() + 5
+        while (runtime.rounds < 1 or runtime.active) and time.monotonic() < deadline:
+            time.sleep(0.02)                          # the series has ended: no frames from here
+        assert runtime.rounds == 1 and not runtime.active
+        revision = runtime.control.revision
+        _post(port, {"c10": -50000})
+        while runtime.control.revision == revision and time.monotonic() < deadline:
+            time.sleep(0.02)
+        applied.append(runtime.control.revision > revision)
+        obf = runtime.control.acc.obf
+        while obf.state != "live" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        applied.append(obf.state == "live")
+
+    ids = list(range(36))
+    # OBF publishes at most every live_every: a long one would hold back the image after the retune
+    settings = dict(_PARALLAX, compute_obf=True, viewer_port=port, live_every=0.05,
+                    out_dir=str(tmp_path))
+    run_series([(1, ids, (96, 96))], scan=(6, 6), batch_size=5, queue_depth=2, service=True,
+               parallax=settings, pixels=series_pixels, after_series=retune)
+    assert applied == [True, True]
+    recon, obf = _latest_reference((96, 96), (6, 6), ids, c10=-50000)
+    np.testing.assert_allclose(np.load(tmp_path / "parallax_recon.npy"), recon, rtol=1e-6, atol=.001)
+    assert _rel(np.load(tmp_path / "parallax_obf.npy"), obf) < 1e-4
+
+
 def test_parallax_interruption_saves_partial_without_end(tmp_path, capfd):
     pytest.importorskip("torch")
     from live4d.algorithms.parallax.engine import ParallaxAccumulator, preprocess_geometry
@@ -907,8 +1016,8 @@ def test_parallax_compute_failure_saves_partial_and_closes_viewer(tmp_path, monk
     from urllib.request import urlopen
     from live4d.parallax.ingest.sink import BatchSink
     original = BatchSink.feed
-    def fail(self, frames, ids):
-        original(self, frames, ids)
+    def fail(self, frames, ids, **timing):
+        original(self, frames, ids, **timing)
         raise RuntimeError("injected parallax failure")
     monkeypatch.setattr(BatchSink, "feed", fail)
     with socket.socket() as sock:

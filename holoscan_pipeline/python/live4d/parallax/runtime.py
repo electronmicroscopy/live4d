@@ -1,6 +1,7 @@
 """Acquisition lifecycle shared by the live branch and offline replay."""
 from pathlib import Path
 import argparse
+import time
 
 from .algorithm import ParallaxAlgorithm
 from .control import LiveControl, QueuedLiveControl
@@ -26,6 +27,7 @@ class ParallaxRuntime:
         self._closed = False
         self.control = None
         self.saved_revision = 0
+        self.saved_obf = None
         self.rounds = 0
         self.active = False
 
@@ -83,11 +85,25 @@ class ParallaxRuntime:
             self.acc = acc
             self.sink = BatchSink(acc, live_publisher=self.publisher,
                                   live_every=self.settings["live_every"],
-                                  live_every_rows=self.settings["live_every_rows"])
+                                  live_every_rows=self.settings["live_every_rows"],
+                                  obf_share=self.settings["obf_share"])
             self.rounds += 1
             self.active = True
             if self.control is not None:
                 self.control.attach(acc, lambda: self.sink)
+
+    def idle(self, budget_s):
+        """Between batches (the live branch's tick, the offline replay after its last frame):
+        apply queued tuning and advance OBF by `budget_s` (none: tuning only), publishing when
+        its image changed."""
+        with ACC_LOCK:
+            if self.queued_control is not None:
+                self.queued_control.apply_pending()
+            acc = self.sink.acc if self.sink is not None else self.acc
+            obf = getattr(acc, "obf", None)
+            if obf is not None and budget_s > 0 and obf.step(budget_s) \
+                    and self.publisher is not None:
+                publish_snapshot(self.publisher, acc)
 
     def finish_series(self, *, interrupted=False):
         with ACC_LOCK:
@@ -98,6 +114,16 @@ class ParallaxRuntime:
                 self.acc.end_series()
             print(self.sink.summary(), flush=True)
             print(self.sink.completeness()[1], flush=True)
+            obf = getattr(self.acc, "obf", None)
+            if obf is not None and obf.enabled and not interrupted \
+                    and self.config.execute["mode"] == "finite":
+                # the last chance in a finite run; in service mode the next START may come at
+                # once, and the tick keeps refining the image between scans instead
+                print(f"[obf] finishing the image of every frame held ({100 * obf.coverage:.0f}% "
+                      f"covered at END) …", flush=True)
+                started = time.perf_counter()
+                obf.finalize()
+                print(f"[obf] finished in {time.perf_counter() - started:.2f} s", flush=True)
             if interrupted:
                 print("[parallax] interrupted acquisition; saving partial results", flush=True)
             self.algorithm.save(self.acc, self.args.out_dir, tag=f"scan{self.rounds:03d}")
@@ -106,7 +132,14 @@ class ParallaxRuntime:
                                  final=interrupted or self.args.accumulate == "scan"
                                  or self.config.execute["mode"] == "finite")
             self.saved_revision = self.control.revision if self.control else 0
+            self.saved_obf = self._obf_stamp()
             self.active = False
+
+    def _obf_stamp(self):
+        """When OBF's image was made (None without one): it may be refined after a save."""
+        acc = self.control.acc if self.control is not None else self.acc
+        obf = getattr(acc, "obf", None)
+        return obf._image_time if obf is not None and obf.image() is not None else None
 
     def close(self):
         if self._closed:
@@ -122,15 +155,26 @@ class ParallaxRuntime:
                 import torch
                 with torch.cuda.device(self.args.device):
                     torch.cuda.synchronize()
-            if self.control is not None and self.control.revision != self.saved_revision and not self.active:
+            tuned = self.control is not None and self.control.revision != self.saved_revision
+            # OBF refined after the last save (service mode's ticks, the offline viewer's idle loop)
+            refined = self.rounds and self._obf_stamp() != self.saved_obf
+            if (tuned or refined) and not self.active:
                 with ACC_LOCK:
-                    self.acc = self.control.acc
+                    if self.control is not None:
+                        self.acc = self.control.acc
                     self.algorithm.save(self.acc, self.args.out_dir, tag=f"scan{self.rounds:03d}")
-                    print("Tuned flags: " + " ".join(self.algorithm.tuned_flags(self.args)), flush=True)
-                    self.saved_revision = self.control.revision
+                    if tuned:
+                        print("Tuned flags: " + " ".join(self.algorithm.tuned_flags(self.args)),
+                              flush=True)
+                        self.saved_revision = self.control.revision
             if self.active:
                 with ACC_LOCK:
                     self.finish_series(interrupted=True)
+            with ACC_LOCK:
+                accs = (self.acc, self.control.acc if self.control is not None else None)
+                for acc in {id(a): a for a in accs if a is not None}.values():
+                    if hasattr(acc, "close"):
+                        acc.close()                  # what follows it (OBF) stops
         finally:
             if self.viewer is not None:
                 self.viewer.shutdown()

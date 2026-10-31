@@ -11,8 +11,8 @@ def _parsers():
                "tools.repeat_dstream", "tools.refocus_dstream", "tools.replay_to_zmq",
                "tools.record_dstream", "tools.npy_to_dstream", "tools.make_dstream", "tools.dstream",
                "tools.detector_setup", "streaming.web", "examples.viewer", "examples.probe",
-               "examples.plot_result", "scripts.bench_accumulator", "scripts.compare_accumulate",
-               "scripts.session_report"]
+               "examples.plot_result", "scripts.bench_accumulator", "scripts.bench_obf",
+               "scripts.compare_accumulate", "scripts.session_report"]
     return [(name, importlib.import_module("live4d.parallax." + name).build_parser()) for name in modules]
 
 

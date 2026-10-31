@@ -1,6 +1,6 @@
 """Place decoded GPU images in a raster scan and integrate virtual detectors."""
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import cbor2
 import json
 import time
@@ -316,6 +316,8 @@ class ParallaxOp(hs.Operator):
         self.consumer, self.finite, self.completion = consumer, finite, completion
         self.series = None
         self.received = 0
+        self.published_ns = None    # the previous batch's publish time (OBF's share of the gap)
+        self.last_batch = None      # when the last batch was folded in (monotonic s)
 
     def setup(self, spec):
         spec.input(self.inp)
@@ -323,23 +325,42 @@ class ParallaxOp(hs.Operator):
     def contract(self):
         return hs.Contract().trigger(hs.OnEach(self.inp))
 
-    def compute(self, ctx):
+    def _timing(self, ctx, sample):
+        """(the interval since the previous batch was published, how long this one waited), s;
+        None where the runtime's clocks do not say."""
+        meta, now = sample.metadata, ctx.activation_time
+        published = meta.publish_timestamp_ns
+        interval = None if self.published_ns is None else (published - self.published_ns) / 1e9
+        self.published_ns = published
+        same_clock = now.valid and now.clock_id == meta.publish_time.clock_id
+        return interval, (now.timestamp_ns - published) / 1e9 if same_clock else None
+
+    def _runtime_stream(self, ctx):
+        """This activation's runtime stream, and a context that makes it PyTorch's current one
+        (never kept beyond the activation)."""
         from contextlib import contextmanager
         import torch
-        from .parallax.ingest.sink import ACC_LOCK
-        sample = self.inp.receive()
-        batch = sample.data
         runtime_stream = ctx.stream()
         handle = runtime_stream.__cuda_stream__()[1]
         stream = torch.cuda.ExternalStream(int(handle), device=self.device_id)
 
         @contextmanager
         def execution_context():
-            with torch.cuda.device(self.device_id), torch.cuda.stream(stream):
+            with runtime_stream, torch.cuda.device(self.device_id), torch.cuda.stream(stream):
                 yield
 
+        return stream, execution_context
+
+    def compute(self, ctx):
+        import torch
+        from .parallax.ingest.sink import ACC_LOCK
+        sample = self.inp.receive()
+        batch = sample.data
+        interval, queued = self._timing(ctx, sample)
+        stream, execution_context = self._runtime_stream(ctx)
+
         try:
-            with ACC_LOCK, runtime_stream, execution_context():
+            with ACC_LOCK, execution_context():
                 if batch.pipeline_ready:
                     view = torch.from_dlpack(batch.frames)
                     # READY initializes PyTorch and exercises the runtime Tensor handoff.
@@ -370,8 +391,9 @@ class ParallaxOp(hs.Operator):
                 if count:
                     frames = torch.from_dlpack(batch.frames)[:count]
                     ids = np.asarray(batch.image_ids, dtype=np.int64)
-                    self.runtime.sink.feed(frames, ids)
+                    self.runtime.sink.feed(frames, ids, interval_s=interval, queued_s=queued)
                     self.received += count
+                    self.last_batch = time.monotonic()
                     del frames
                 if batch.end_of_series:
                     if int(batch.series_images) != self.received:
@@ -384,3 +406,49 @@ class ParallaxOp(hs.Operator):
         finally:
             if self.release is not None:
                 self.release(int(batch.batch_id), self.consumer)
+
+
+#: service mode's clock for the parallax branch (OBF takes `obf_share` of each period)
+PARALLAX_TICK = timedelta(milliseconds=50)
+
+
+class ParallaxTickOp(hs.Operator):
+    """Service mode's clock for the parallax branch, so that queued tuning and OBF go on between
+    scans, when no batch arrives."""
+    out = hs.Output("tick", hs.pyobject)
+
+    def setup(self, spec):
+        spec.output(self.out)
+
+    def contract(self):
+        return hs.Contract().trigger(hs.OnClock(period=PARALLAX_TICK))
+
+    def compute(self, ctx):
+        self.out.emit(0)
+
+
+class TickedParallaxOp(ParallaxOp):
+    """`ParallaxOp` that also runs on `ParallaxTickOp`'s ticks: then it applies queued tuning and,
+    once no batch has come for two ticks, advances OBF (`ParallaxRuntime.idle`) on the same
+    runtime stream, inside the callback; while batches come, OBF advances with them. Batches are
+    handled as `ParallaxOp` handles them; release and completion follow batches only."""
+    tick = hs.Input("tick", hs.pyobject)
+
+    def setup(self, spec):
+        super().setup(spec)
+        spec.input(self.tick)
+
+    def contract(self):
+        return hs.Contract().trigger(hs.OnAnyInput())
+
+    def compute(self, ctx):
+        if self.inp.selection().state == hs.InputState.SELECTED:
+            super().compute(ctx)
+        if self.tick.selection().state == hs.InputState.SELECTED:
+            self.tick.receive()
+            tick = PARALLAX_TICK.total_seconds()
+            idle = self.last_batch is None or time.monotonic() - self.last_batch > 2 * tick
+            _, execution_context = self._runtime_stream(ctx)
+            with execution_context():
+                share = self.runtime.settings["obf_share"]
+                self.runtime.idle(tick * share if idle else 0.0)

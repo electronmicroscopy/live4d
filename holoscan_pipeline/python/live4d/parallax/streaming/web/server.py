@@ -26,8 +26,10 @@ Endpoints (all GET):
                      /view; of a partly scanned image, only its finished rows (X-Rows: those used).
                      The page applies the filters itself (|H(q)|² on the spectrum it has)
     /npy             ?seq&ch: one channel at full resolution, as .npy
-    /params          GET the live control's state; POST {name: value, …, "mode": …} or
-                     {"reset": true} to change the running reconstruction (run.py --viewer-port)
+    /params          GET the live control's state; POST {name: value, …, "mode": …, name: bool}
+                     or {"reset": true} to change the running reconstruction (run.py
+                     --viewer-port); name: bool sets a switch (parallax: "obf_weights") or starts
+                     and stops a channel computed only while shown (parallax: "obf")
 """
 
 from __future__ import annotations
@@ -53,9 +55,16 @@ _PCT = (0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 95.0, 98.0, 99.0, 99.5, 99.9, 99.95)
 
 # ── the snapshots ──────────────────────────────────────────────────────────────
 
-def channel_stats(img: np.ndarray, samples: int = 1 << 20, bins: int = 256) -> dict:
-    """Percentiles and a histogram of one channel, from a strided sample of at most `samples`
-    pixels (enough for display limits, cheap at 4096²)."""
+def complete_rows(meta: dict, channel: str):
+    """[r0, r1) of a partly filled channel's finished rows: the snapshot's `complete_rows`, or a
+    channel's own `complete_rows_<channel>` (parallax's OBF while it covers the scan)."""
+    return meta.get(f"complete_rows_{channel}", meta.get("complete_rows"))
+
+
+def channel_stats(img: np.ndarray, samples: int = 1 << 16, bins: int = 256) -> dict:
+    """Percentiles and a histogram of one channel, from a strided sample of about `samples`
+    pixels: enough for display limits, and about 1 ms a channel, since an in-process viewer
+    computes them in the parallax callback that publishes the snapshot."""
     step = max(1, int(math.sqrt(img.size / samples)))
     s = img[::step, ::step]
     s = s[np.isfinite(s)]
@@ -104,10 +113,13 @@ class FrameStore:
             stack = stack[None] if stack.ndim == 2 else stack
             names = [f"channel {i}" for i in range(stack.shape[0])] if stack.shape[0] > 1 \
                 else ["reconstruction"]
-        rows = (header.get("meta") or {}).get("complete_rows")     # a partly scanned image:
-        part = stack[:, rows[0]:rows[1]] if rows and rows[1] > rows[0] else stack   # its finished rows
+        meta = header.get("meta") or {}
+        stats = []
+        for name, img in zip(names, stack):   # a partly scanned image: its finished rows
+            rows = complete_rows(meta, name)
+            stats.append(channel_stats(img[rows[0]:rows[1]] if rows and rows[1] > rows[0] else img))
         frame = Frame(seq=self._next, stack=stack, names=list(names), header=header,
-                      stats=[channel_stats(c) for c in part], received=time.time())
+                      stats=stats, received=time.time())
         with self._cond:
             self._frames.append(frame)
             self._next += 1
@@ -406,7 +418,7 @@ class _Handler(BaseHTTPRequestHandler):
         y0, x0, h, w, n, out = self._ints(q, "y0", "x0", "h", "w", "n", "out", default=0)
         hp, lp = (float(q[k][0]) if k in q else 0.0 for k in ("hp", "lp"))
         order = int(q["order"][0]) if "order" in q else ORDER
-        rows = (frame.header.get("meta") or {}).get("complete_rows")
+        rows = complete_rows(frame.header.get("meta") or {}, q["ch"][0] if "ch" in q else "")
         spec, (cy, cx, n), (ra, rb), b = power_spectrum(img, y0, x0, h or H, w or W, n or 2048,
                                                         rows, hp, lp, out or 1024, order)
         body, off, scale = encode(spec)
