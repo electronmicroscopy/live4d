@@ -74,7 +74,19 @@ def test_parallax_optional_and_requires_explicit_physics():
 @pytest.mark.parametrize("bad", [dict(energy=float("nan")), dict(rotation=float("inf")),
     dict(scan_sampling=0), dict(accumulate="bad"), dict(upsampling=True),
     dict(viewer_port=70000), dict(center=[1]), dict(unrecognized=2),
-    dict(pass_average=.3), dict(save_passes=True), dict(enabled=1)])
+    dict(pass_average=.3), dict(save_passes=True), dict(enabled=1),
+    dict(compute_obf=True), dict(precompute_obf_weights=True, accumulate="swap"),
+    dict(compute_obf=1, accumulate="latest"), dict(obf_share=0, accumulate="latest"),
+    dict(obf_share=1.5, accumulate="latest"), dict(obf_share=float("nan"), accumulate="latest")])
 def test_parallax_rejects_invalid_settings(bad):
     with pytest.raises(ValueError):
         PipelineConfig(parallax=dict(PARALLAX_PHYSICS, **bad))
+
+
+def test_parallax_obf_settings():
+    defaults = PipelineConfig(parallax=dict(enabled=True, **PARALLAX_PHYSICS)).parallax
+    assert not defaults["compute_obf"] and not defaults["precompute_obf_weights"]
+    config = PipelineConfig(parallax=dict(enabled=True, accumulate="latest", compute_obf=True,
+                                          precompute_obf_weights=True, obf_share=0.25,
+                                          **PARALLAX_PHYSICS))
+    assert config.parallax["compute_obf"] and config.parallax["obf_share"] == 0.25

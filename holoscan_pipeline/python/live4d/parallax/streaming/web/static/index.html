@@ -3,23 +3,26 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Live4D parallax</title>
+<title>Live4D</title>
 <style>
 :root { --bg:#101317; --side:#171b21; --fg:#d9dee4; --muted:#8b949f; --accent:#4fa3ff; --ok:#3fbf6f;
         --bad:#e5534b; --border:#29303a; --field:#0c0f13; }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
              font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; }
-body { display: grid; grid-template-columns: 300px minmax(0, 1fr); }
-body.has-telemetry { grid-template-columns: 300px minmax(0, 1fr) 360px; }
+body { display: grid; grid-template-columns: 320px minmax(0, 1fr); }
+body.has-telemetry { grid-template-columns: 320px minmax(0, 1fr) 360px; }
 #telemetry-panel { border-right: 0; border-left: 1px solid var(--border); min-width: 0; }
 #telemetry-values .row { align-items: baseline; justify-content: space-between; }
 #telemetry-values .row > label { color: var(--muted); }
 #telemetry-values .row > span { text-align: right; }
 @media (max-width: 1100px) {
-  body.has-telemetry { grid-template-columns: 240px minmax(180px, 1fr) 300px; }
+  body.has-telemetry { grid-template-columns: 280px minmax(180px, 1fr) 300px; }
 }
-aside { overflow-y: auto; border-right: 1px solid var(--border); padding: 8px 12px 16px; background: var(--side); }
+aside { overflow-y: auto; scrollbar-gutter: stable; border-right: 1px solid var(--border); padding: 8px 12px 16px;
+        background: var(--side); }
+#switches label, #tunenote { white-space: nowrap; }
+#tunenote { overflow: hidden; text-overflow: ellipsis; }
 aside summary { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
                 margin: 10px 0 4px; cursor: pointer; user-select: none; }
 aside summary:hover { color: var(--fg); }
@@ -39,6 +42,7 @@ label.off { color: var(--muted); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .muted { color: var(--muted); }
 #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); display: inline-block; flex: none; }
+.swdot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; background: transparent; }
 #progress { height: 6px; background: var(--field); border-radius: 3px; overflow: hidden; margin: 6px 0 2px; }
 #progress > div { height: 100%; background: var(--accent); width: 0; }
 #hist { width: 100%; height: 64px; background: var(--field); border: 1px solid var(--border); display: block;
@@ -71,7 +75,7 @@ body.recording #rec { border-color: var(--bad); color: var(--bad); }
 </head>
 <body>
 <aside>
-  <div class="row" id="head" style="margin-top:4px"><span id="dot"></span><b style="flex:1">Live4D parallax</b>
+  <div class="row" id="head" style="margin-top:4px"><span id="dot"></span><b style="flex:1">Live4D</b>
     <span id="rate" class="muted mono"></span></div>
   <div id="progress"><div></div></div>
   <div id="metaline" class="mono"></div>
@@ -79,25 +83,26 @@ body.recording #rec { border-color: var(--bad); color: var(--bad); }
 
   <details id="sec-tune" open hidden><summary title="The command line's values are the starting point (the target to meet with the microscope's knobs); fine-tune them here. With accumulate latest a change re-renders the frames held at once; the other modes restart their image.">Reconstruction</summary>
     <div id="tuneparams"></div>
-    <div class="row" id="moderow"><label>accumulate</label><select id="mode"></select></div>
-    <div class="row"><span id="c12polar" class="muted mono" style="flex:1"></span>
+    <div class="row" id="moderow"><label>accumulate</label><select id="mode"></select>
+      <span id="switches" class="row" style="margin:0"></span></div>
+    <div class="row"><span style="flex:1"></span>
       <button id="tunereset" title="back to the command line's values">reset</button>
       <button id="tuneflags" title="copy the run.py flags for these values">copy flags</button></div>
     <div id="tunenote" class="hint"></div>
   </details>
 
   <details id="sec-image" open><summary>Image</summary>
-    <div class="row" id="baserow"><label>channel</label><select id="base"></select></div>
+    <div class="row" id="baserow"><label>channel</label><span class="swdot" id="chdot"></span><select id="base"></select></div>
     <div class="row"><label class="row" style="margin:0" title="the visible square, at native pixels; a dashed outline marks it on the image">
       <input type="checkbox" id="fft"> Fourier transform</label>
       <button id="fit" title="fit the image (f, or double-click)">Fit</button><button id="one" title="native pixels (1)">1:1</button></div>
+    <div class="row" id="benchrow" hidden><label class="row" style="margin:0" title="the parallax branch's rate and timing and the host's resources, in a panel on the right (for debugging); ?benchmarks=1 opens it">
+      <input type="checkbox" id="bench"> live benchmarks</label></div>
   </details>
 
-  <details id="sec-filters" open><summary title="The Fourier transform shows the filters too. The phase flip only changes signs, so it leaves the power spectrum as it is.">Filters</summary>
-    <div class="row" id="fliprow"><label id="fliplabel" title="sign(sin χ(q)) on the parallax sum: the pipeline's phase_flipped channel">
-      <input type="checkbox" id="flip"> phase flip</label>
-      <label for="order" title="Butterworth order of the high- and low-pass: higher is sharper">order</label>
-      <select id="order" title="Butterworth order of the high- and low-pass: higher is sharper"><option>2</option><option>4</option><option>8</option><option selected>12</option><option>16</option></select></div>
+  <details id="sec-filters" open><summary title="The Fourier transform shows the filters too.">Filters</summary>
+    <div class="row"><label for="order" title="Butterworth order of the high- and low-pass: higher is sharper">order</label>
+      <select id="order" title="Butterworth order of the high- and low-pass: higher is sharper"><option>2</option><option>4</option><option>8</option><option selected>12</option><option>16</option><option>24</option><option>32</option></select></div>
     <div class="row" title="removes spacings coarser than this; logarithmic, from 2 Å to the field of view"><label>high-pass</label><input type="range" id="hp" min="0" max="100" step="1" value="0"><output id="hp_o"></output></div>
     <div class="row" title="removes spacings finer than this; logarithmic, from 0.3 Å to 50 Å"><label>low-pass</label><input type="range" id="lp" min="0" max="100" step="1" value="0"><output id="lp_o"></output></div>
   </details>
@@ -157,9 +162,11 @@ const $ = (id) => document.getElementById(id);
 
 // ── state ────────────────────────────────────────────────────────────────────
 const S = {
-  latest: null, shown: null, paused: false, base: null, flip: false, fft: false, cam: null,
+  latest: null, shown: null, paused: false, base: null, fft: false, cam: null,
+  fitted: false,                                  // the image's camera is still fitted: refit when its panel resizes
   cmode: "frame", pLo: 0.5, pHi: 99.5, mLo: 0, mHi: 1, gamma: 1, cmap: "gray", invert: false,
   hpA: 0, lpA: 0, order: 12, arrivals: [],
+  contrastBy: {},                                 // manual limits per channel (their scales differ)
 };
 let IMG = null, FFT = null;                       // the reconstruction panel and the Fourier transform's
 
@@ -201,8 +208,29 @@ function lutBytes(name) {
 
 // ── channels and filters ─────────────────────────────────────────────────────
 function sampling() { const s = S.shown && S.shown.meta && S.shown.meta.sampling_A; return s ? s[1] : null; }
-function canFlip() { return !!S.shown && S.shown.names.includes("phase_flipped") && S.base === "parallax"; }
-function chan() { return S.flip && canFlip() ? "phase_flipped" : S.base; }      // the channel shown
+function chan() {                    // the channel shown: the one chosen, once the stream carries it
+  const names = S.shown ? S.shown.names : [];
+  return !S.shown || names.includes(S.base) ? S.base : defaultChannel(names);
+}
+// channels computed only while shown (the live control's, e.g. OBF): {name: {label, active, available}}
+function onDemand() { return Object.fromEntries(((T.state && T.state.channels) || []).map((c) => [c.name, c])); }
+const CHANNEL_LABELS = {parallax: "parallax", phase_flipped: "parallax, phase-flipped", obf: "OBF",
+                        coverage: "coverage"};
+function chanLabel(n) { const c = onDemand()[n]; return c ? c.label : CHANNEL_LABELS[n] || n; }
+// the channel shown when none is chosen: the phase-flipped parallax image, where there is one
+// show channel `name`: manual contrast limits belong to the channel they were set on, since the
+// channels' values differ by orders of magnitude (parallax sums counts, OBF is in radians)
+function useChannel(name) {
+  if (name === S.base) return;
+  if (S.base) S.contrastBy[S.base] = S.cmode === "manual" ? [S.mLo, S.mHi] : null;
+  const saved = S.contrastBy[name];
+  if (saved) { [S.mLo, S.mHi] = saved; S.cmode = "manual"; } else if (S.cmode === "manual") S.cmode = "frame";
+  $("cmode").value = S.cmode;
+  S.base = name;
+}
+function defaultChannel(names) {
+  return names.includes("phase_flipped") ? "phase_flipped" : names.includes("parallax") ? "parallax" : names[0];
+}
 function filtered() { return S.hpA > 0 || S.lpA > 0; }
 // The high- and low-pass are the Butterworth filters of quantem and of the pipeline's readout,
 // order n (S.order), cutoff periods d_c (S.hpA, S.lpA, in Å), q_c = 1/d_c:
@@ -230,7 +258,6 @@ function positionOf(id, d) {
 }
 function filterText() {
   const u = sampling() ? "Å" : "px", bits = [];
-  if (S.flip && canFlip()) bits.push("phase-flipped");
   if (S.hpA > 0) bits.push(`high-pass ${S.hpA} ${u}`);
   if (S.lpA > 0) bits.push(`low-pass ${S.lpA} ${u}`);
   return bits;
@@ -284,18 +311,18 @@ class Panel {
   }
   title() {
     if (this.kind === "fft") return ["Fourier transform (power)", ...filterText()].join(" · ") + this.note;
-    return [S.base || "", ...filterText()].join(" · ");
+    return [chanLabel(S.base || ""), ...filterText()].join(" · ");
   }
   size() { return {cw: this.stage.clientWidth, ch: this.stage.clientHeight}; }
   resize() {
     const dpr = devicePixelRatio || 1, {cw, ch} = this.size();
     this.canvas.width = Math.max(1, Math.round(cw * dpr)); this.canvas.height = Math.max(1, Math.round(ch * dpr));
-    if (this.kind === "image" && !S.cam && S.shown) fitAll();
+    if (this.kind === "image" && (!S.cam || S.fitted) && S.shown) fitAll();   // e.g. the FFT panel opened
     if (this.kind === "fft" && this.t) this.cam = fitCam(this.t.shape[0], this.t.shape[1], cw, ch);
     this.draw(); schedule();
   }
   camera() { return this.kind === "fft" ? this.cam : S.cam; }
-  setCamera(c) { if (this.kind === "fft") this.cam = c; else { S.cam = c; S.movedAt = performance.now(); } }
+  setCamera(c) { if (this.kind === "fft") this.cam = c; else { S.cam = c; S.fitted = false; S.movedAt = performance.now(); } }
   toImage(px, py) {                     // CSS px in the stage → image px
     const c = this.camera(), {cw, ch} = this.size();
     return [(px - cw / 2) / c.zoom + c.cx, (py - ch / 2) / c.zoom + c.cy];
@@ -311,7 +338,7 @@ class Panel {
     return [histPct(st.stats[k], S.pLo), histPct(st.stats[k], S.pHi)];
   }
   limits() {
-    if (this.kind === "fft") return this.t ? sortedPct(this.t.sorted, 30, 99.95) : [0, 1];
+    if (this.kind === "fft") return this.t ? sortedPct(this.t.rawSorted, 30, 99.95) : [0, 1];
     return S.cmode === "manual" ? [S.mLo, S.mHi] : this.autoLimits(S.cmode);
   }
   draw() {
@@ -368,6 +395,12 @@ class Panel {
     for (let i = 0; i < u16.length; i++) raw[i] = HALF[u16[i]] * hdr.scale + hdr.off;
     this.t = {key, seq: hdr.seq, region: hdr.region, f: 1, shape: hdr.shape, off: 0, scale: 1, raw,
               n: hdr.n, bin: hdr.bin, source: hdr.source};
+    // the colour range comes from the spectrum before the display filters, so that what a filter
+    // removes falls to black: from the filtered one, the darkest colour would sit in the filter's own
+    // tail (most of the panel, past a low-pass) and the roll-off would span the colour scale
+    const step = Math.max(1, Math.floor(raw.length / 65536)), sample = [];
+    for (let i = 0; i < raw.length; i += step) sample.push(raw[i]);
+    this.t.rawSorted = sample.sort((a, b) => a - b);
     this.filterSpectrum();
   }
   filterSpectrum() {                    // log10 (P·|H|²) = log10 P + 2 log10 |H(q)|, H the display filters
@@ -492,9 +525,9 @@ function cutoffs(p, zoom, ox, oy) {
 function fitAll() {
   if (!IMG || !S.shown) return;
   const {cw, ch} = IMG.size(), [H, W] = S.shown.shape;
-  S.cam = fitCam(H, W, cw, ch); S.movedAt = performance.now();
+  S.cam = fitCam(H, W, cw, ch); S.fitted = true; S.movedAt = performance.now();
 }
-function oneToOne() { const c = S.cam; if (c) { S.cam = {...c, zoom: 1 / (devicePixelRatio || 1)}; S.movedAt = performance.now(); } }
+function oneToOne() { const c = S.cam; if (c) { S.cam = {...c, zoom: 1 / (devicePixelRatio || 1)}; S.fitted = false; S.movedAt = performance.now(); } }
 function layout() {
   if (!S.shown) return;
   if (!IMG) IMG = new Panel("image");
@@ -581,8 +614,9 @@ async function fetchInto(p, url, key) {
 function show(st) {
   const first = !S.shown, reshaped = S.shown && (S.shown.shape[0] !== st.shape[0] || S.shown.shape[1] !== st.shape[1]);
   S.shown = st;
-  const bases = st.names.filter((n) => n !== "phase_flipped");
-  if (!S.base || !st.names.includes(S.base)) S.base = bases.includes("parallax") ? "parallax" : bases[0];
+  const extra = Object.values(onDemand()).filter((c) => c.available && !st.names.includes(c.name));
+  const bases = [...st.names, ...extra.map((c) => c.name)];
+  if (!S.base || !bases.includes(S.base)) useChannel(defaultChannel(bases));
   buildImageUI(st, bases);
   layout();
   if (first || reshaped || !S.cam) requestAnimationFrame(() => {
@@ -613,6 +647,16 @@ function updateMeta() {
   $("metaline").textContent = metaText(); $("metaline").title = metaText(true);
   const prog = "progress" in m ? m.progress : ("coverage" in m ? m.coverage : 0);
   $("progress").firstElementChild.style.width = `${(100 * prog).toFixed(1)}%`;
+  // what a switch or an on-demand channel is doing (its `<name>_state`): a dot, the details on hover
+  const dots = [...document.querySelectorAll("[data-switch-state]")].map((el) => [el, el.dataset.switchState]);
+  dots.push([$("chdot"), S.base]);
+  for (const [el, n] of dots) {
+    const state = m[`${n}_state`], age = m[`${n}_age_s`], pend = m[`${n}_pending`];
+    el.style.background = state === "live" || state === "ready" ? "var(--ok)" : state === "error" ? "var(--bad)"
+      : state === undefined || state === "off" ? "transparent" : "var(--muted)";
+    el.title = state === undefined ? "" : [state, age >= 1 ? `image ${age.toFixed(0)} s old` : "",
+      pend ? `${pend.toLocaleString()} positions pending` : ""].filter(Boolean).join(" · ");
+  }
   const hist = S.latest ? S.latest.history : [];
   $("scrub").max = Math.max(0, hist.length - 1);
   $("scrub").value = S.paused && hist.includes(st.seq) ? hist.indexOf(st.seq) : $("scrub").max;
@@ -634,7 +678,8 @@ function onState(st) {
   showControl(st);
   if (!S.paused) show(st); else updateMeta();
 }
-// URL parameters preset the controls, e.g. ?flip=1&fft=1&hp=50&lp=1.5&order=12&cmap=inferno&view=1to1;
+// URL parameters preset the controls, e.g. ?ch=phase_flipped&fft=1&hp=50&lp=1.5&order=12&cmap=inferno&view=1to1
+// (?flip=1 is ?ch=phase_flipped);
 // ?snapshot[=seq] shows one snapshot without the live stream (for screenshots and for links)
 const URLP = new URLSearchParams(location.search);
 function applyParams() {
@@ -642,12 +687,13 @@ function applyParams() {
     else el.value = v; el.dispatchEvent(new Event(ev)); };
   for (const [k, id, ev] of [["cmap", "cmap"], ["cmode", "cmode"], ["invert", "invert"],
                              ["gamma", "gamma", "input"],
-                             ["plo", "plo", "input"], ["phi", "phi", "input"], ["flip", "flip"], ["fft", "fft"]])
+                             ["plo", "plo", "input"], ["phi", "phi", "input"], ["fft", "fft"]])
     if (URLP.has(k)) set(id, URLP.get(k), ev || "change");
   for (const k of ["hp", "lp"]) if (URLP.has(k)) S[`${k}A`] = +URLP.get(k);       // cutoff period, Å
   if (URLP.has("order")) set("order", URLP.get("order"));
   if (URLP.has("ch")) S.base = URLP.get("ch");
-  if ((URLP.get("channels") || "").includes("phase_flipped")) set("flip", "1");    // the old preset
+  if (["1", "true"].includes(URLP.get("flip")) || (URLP.get("channels") || "").includes("phase_flipped"))
+    S.base = "phase_flipped";                     // the old presets
 }
 function connect() {
   if (URLP.has("snapshot")) {
@@ -669,12 +715,10 @@ function buildImageUI(st, bases) {
   const sel = $("base"), have = [...sel.options].map((o) => o.value);
   if (have.join("|") !== bases.join("|")) {
     sel.innerHTML = "";
-    for (const n of bases) { const o = document.createElement("option"); o.value = o.textContent = n; sel.appendChild(o); }
+    for (const n of bases) { const o = document.createElement("option"); o.value = n; o.textContent = chanLabel(n); sel.appendChild(o); }
   }
   sel.value = S.base;
   $("baserow").style.display = bases.length > 1 ? "flex" : "none";
-  $("flip").disabled = !canFlip();
-  $("fliplabel").classList.toggle("off", !canFlip());
 }
 let HIST = null;                                  // the histogram as drawn: {lo, hi} in data units
 function histogram() {                            // {counts, lo, hi} of what the image shows
@@ -734,7 +778,7 @@ function composeView() {                          // the view as one canvas: pan
   g.fillStyle = "#101317"; g.fillRect(0, 0, W, H + head);
   g.font = `${Math.round(12 * dpr)}px system-ui, sans-serif`; g.textBaseline = "middle"; g.fillStyle = "#d9dee4";
   const cuts = FFT && S.fft ? cutoffs(FFT, 1, 0, 0).map((r) => r.label) : [];      // the circles' legend
-  g.fillText([`Live4D parallax · snapshot #${S.shown.seq}`, metaText(true), ...cuts].join(" · "), 6 * dpr, head / 2);
+  g.fillText([`Live4D · snapshot #${S.shown.seq}`, metaText(true), ...cuts].join(" · "), 6 * dpr, head / 2);
   let x = 0;
   for (const p of ps) {
     g.drawImage(p.canvas, x, head);
@@ -770,7 +814,7 @@ function download(blob, name) {
 }
 function exportPng() {
   const cv = composeView(); if (!cv) return;
-  cv.toBlob((b) => download(b, `realtime-stem_${S.shown.seq}_${chan()}${S.fft ? "_fft" : ""}.png`));
+  cv.toBlob((b) => download(b, `live4d_${S.shown.seq}_${chan()}${S.fft ? "_fft" : ""}.png`));
 }
 
 // ── recording: the whole page through the browser's tab capture, or the composition above at
@@ -876,7 +920,7 @@ async function startRecording() {
   const rec = REC.rec = new MediaRecorder(src.stream, {mimeType: fmt.type, videoBitsPerSecond: 8e6});
   REC.stream = src.stream;
   const d = new Date(), p2 = (n) => String(n).padStart(2, "0");
-  const take = {chunks: [], ms: 0, name: `realtime-stem_${what}_${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}_`
+  const take = {chunks: [], ms: 0, name: `live4d_${what}_${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}_`
     + `${p2(d.getHours())}-${p2(d.getMinutes())}-${p2(d.getSeconds())}.${fmt.ext}`};
   REC.take = take;
   rec.ondataavailable = (e) => { if (e.data.size) take.chunks.push(e.data); };
@@ -926,7 +970,16 @@ function buildTune() {
   }
   const sel = $("mode"); sel.innerHTML = "";
   for (const m of T.state.modes) { const o = document.createElement("option"); o.value = o.textContent = m; sel.appendChild(o); }
-  $("moderow").style.display = T.state.modes.length ? "flex" : "none";
+  const sw = $("switches"); sw.innerHTML = "";
+  for (const s of T.state.switches || []) {       // on/off options, e.g. parallax's OBF
+    const lab = document.createElement("label"); lab.className = "row"; lab.style.margin = "0"; lab.title = s.title || "";
+    lab.innerHTML = `<input type="checkbox" data-switch="${s.name}"> ${s.label}` +
+      ` <span class="swdot" data-switch-state="${s.name}"></span>`;
+    lab.querySelector("input").addEventListener("change", (e) => sendTune({[s.name]: e.target.checked}));
+    sw.appendChild(lab);
+  }
+  $("moderow").style.display = T.state.modes.length || sw.children.length ? "flex" : "none";
+  sel.style.display = T.state.modes.length ? "" : "none";
   refreshTune();
 }
 function refreshTune() {                          // show the values the pipeline now uses
@@ -936,10 +989,16 @@ function refreshTune() {                          // show the values the pipelin
     el.value = el.type === "number" ? (+prm.value).toFixed(DIGITS[prm.name] ?? 2) : prm.value;
   }
   if (st.modes.length) $("mode").value = st.mode;
-  const v = Object.fromEntries(st.params.map((p) => [p.name, p.value]));
-  $("c12polar").textContent = "c12a" in v ? `C12 ${Math.hypot(v.c12a, v.c12b).toFixed(1)} Å at ` +
-    `${(Math.atan2(v.c12b, v.c12a) * 90 / Math.PI).toFixed(1)}°` : "";
-  $("tunenote").textContent = st.note || "";
+  const demand = onDemand();                      // a channel switched off (reset, a mode) is not shown
+  if (demand[S.base] && !(demand[S.base].active && demand[S.base].available)) {
+    useChannel(defaultChannel(S.shown ? S.shown.names : [])); if (S.shown) show(S.shown);
+  }
+  for (const s of st.switches || []) {
+    const el = $("switches").querySelector(`input[data-switch="${s.name}"]`); if (!el) continue;
+    el.checked = s.value; el.disabled = !s.available;
+    el.parentElement.title = `${s.title || ""}${s.available ? "" : " (not in this mode)"}`;
+  }
+  $("tunenote").textContent = $("tunenote").title = st.note || "";
 }
 function sendTune(changes) {
   Object.assign(T.pending, changes);
@@ -950,6 +1009,9 @@ function sendTune(changes) {
       const r = await fetch("params", {method: "POST", body, headers: {"Content-Type": "application/json"}});
       const st = await r.json();
       if (r.ok) { T.state = st; refreshTune(); } else $("tunenote").textContent = st.error || "refused";
+      if (r.ok && (st.note || "").startsWith("Tuning queued"))     // applied by the next callback:
+        setTimeout(() => fetch("params").then((q) => q.json())        // then show what it did
+          .then((s) => { T.state = s; refreshTune(); }).catch(() => {}), 400);
     } catch (err) { $("tunenote").textContent = `${err}`; }
   }, 200);
 }
@@ -978,9 +1040,15 @@ function bind() {
   on("invert", "change", (e) => { S.invert = e.target.checked; redraw(); });
   on("fit", "click", () => { fitAll(); redraw(); schedule(); });
   on("one", "click", () => { oneToOne(); redraw(); schedule(); });
-  on("base", "change", (e) => { S.base = e.target.value; if (S.shown) buildImageUI(S.shown, [...$("base").options].map((o) => o.value)); redraw(); schedule(); });
+  on("base", "change", (e) => {
+    const was = S.base, demand = onDemand(); useChannel(e.target.value);
+    const ask = {};                               // an on-demand channel is computed while it is shown
+    if (demand[was] && was !== S.base) ask[was] = false;
+    if (demand[S.base] && !demand[S.base].active) ask[S.base] = true;
+    if (Object.keys(ask).length) sendTune(ask);
+    if (S.shown) buildImageUI(S.shown, [...$("base").options].map((o) => o.value)); updateMeta(); redraw(); schedule();
+  });
   on("fft", "change", (e) => { S.fft = e.target.checked; layout(); redraw(); schedule(); });
-  on("flip", "change", (e) => { S.flip = e.target.checked; redraw(); schedule(); });
   on("order", "change", (e) => { S.order = +e.target.value; if (FFT) FFT.filterSpectrum(); redraw(); schedule(); });
   for (const k of ["hp", "lp"]) on(k, "input", (e) => {
     S[`${k}A`] = cutoffOf(k, +e.target.value); updateMeta();

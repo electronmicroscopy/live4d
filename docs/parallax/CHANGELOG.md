@@ -6,6 +6,56 @@ Current setup and commands are in [GUIDE.md](GUIDE.md). Releases up to 2.2.0 are
 named below are there too, in [`sessions/`](https://github.com/kucukogluberk/EM_Realtime_Processing/tree/v2.2.0/sessions).
 3.0.0 and later are developed in this repository.
 
+## Unreleased
+
+Live optimum bright field (OBF) beside parallax, with `accumulate: latest`, brought over from
+EM_Realtime_Processing `obf-live` (`027d8ce`) and run inside the HSDK5 graph's rules. It adds the
+channel `obf` and saves `parallax_obf.npy`. See the [guide](GUIDE.md#optimum-bright-field-obf).
+
+- The method is the correlation route of quantem's `DirectPtychographyMontage`, ported to torch in
+  `live4d/algorithms/obf/` from `obf-live`, with a weights build that can be stepped
+  (`ObfSetup.build_steps`). On the Gd₂O₃ recordings it matches quantem to 2e-6 on identical
+  inputs. The offline replay of the binned recording gives `obf-live`'s parallax images exactly
+  and its OBF image to 6e-7.
+- A frame's contraction onto the patch grid is now one detector FFT and two matrix products
+  (`_PatchProducts`) instead of two detector FFTs, a spectrum per sub-lattice and their full
+  inverse transforms. It equals the FFT route to 2e-14 in float64 and 1e-6 in float32. On an A40
+  OBF deposits binned frames at 415 kHz at ×2 (131 kHz in `obf-live`) and unbinned ones at
+  85 kHz (32 kHz), so at ×2 it keeps up with the detector in both modes. OBF no longer runs on
+  Apple's `mps`, since it runs on CUDA live and on the CPU for development.
+- `obf-live`'s background follower thread is now a tracker without a thread
+  (`live4d/parallax/obf.py`, `ObfTracker`). The sink advances it after each batch by at most
+  `obf_share` of the time between batches, inside the parallax callback on its runtime stream, and builds
+  its weights a unit at a time. It reads the store's changes from the batches' host ids, so it
+  copies nothing back from the device to find them.
+- Service mode runs the parallax branch on a 20 Hz clock between batches (`ParallaxTickOp`,
+  `TickedParallaxOp`). Queued tuning now applies between scans and after the last one, and OBF
+  follows a retune. A finite run finishes OBF at END before saving.
+- OBF yields to the rest of the parallax branch. Its shares are saved up into steps of 8 ms and
+  skipped on the batch that publishes a snapshot, its share halves while the branch's batches
+  take more than 80% of their interval, and the clock advances it only once no batch has come for
+  two ticks. Its weights build in pieces of about 10 ms, and a deposit pads its batches to powers
+  of two so that cuFFT makes few plans. With these, daqsim streaming the binned Gd₂O₃ recording at
+  50 kHz to the viewer with OBF chosen drops no frame on an A40, where it dropped about a fifth.
+- Settings: `compute_obf`, `precompute_obf_weights`, `obf_share`. `obf-live`'s `--obf-chunk`
+  is gone, since the share sets the work per step.
+- Viewer: the channel list holds parallax, phase-flipped parallax (the default, in place of the
+  phase-flip filter) and the channels an algorithm computes on demand (`Algorithm.live_channels`).
+  The Reconstruction section shows the switches an algorithm declares (`Algorithm.live_switches`),
+  with dots for the state of OBF and of its weights. Manual contrast limits belong to the channel
+  they were set on, and the Fourier transform's colour range comes from the spectrum before the
+  display filters. The sidebar is wider, beside the telemetry panel. With the Fourier transform
+  open the reconstruction stays fitted to its narrower panel until it is zoomed or panned. The
+  page is titled Live4D, and its files are named `live4d_…`. The live benchmarks (telemetry) panel
+  is hidden until the "live benchmarks" checkbox is ticked or the address has `?benchmarks=1`, and
+  it is polled only while open.
+- The live control's reply to a queued request reports the state the request will leave, so the
+  viewer keeps a channel just chosen, OBF above all, instead of taking it for one switched off. The
+  page then reads the applied state once the parallax callback has applied it.
+- The in-process viewer computes a channel's percentiles and histogram from about 65 thousand
+  of its pixels, in the parallax callback that publishes the snapshot.
+- `python -m live4d.parallax.scripts.bench_obf` times OBF.
+
 ## 3.0.0
 
 The same reconstruction and viewer on **Holoscan SDK 5**, fed by this repository's shared

@@ -341,6 +341,9 @@ class ParallaxAccumulator:
         self._fill_min = torch.full((), _NO_ID, dtype=torch.long, device=self.device)
         self._store: torch.Tensor | None = None     # "latest": newest raw BF values per position
         self._store_kind: str | None = None
+        # OBF ("latest"): a tracker (live4d.parallax.obf) its owner steps reads the store; the hot
+        # path only hands it the batch's ids, on the host.
+        self.obf = None
 
         # Passes (one scan of the area each, in raster order): "reset" / "swap" restart the image
         # at each pass and keep the last completed one as the front (`_close_pass`);
@@ -483,6 +486,9 @@ class ParallaxAccumulator:
         if self.wrap_ids:
             idx = idx + self._id_offset
         self._max_id = torch.maximum(self._max_id, idx.max())
+        if self.obf is not None:              # OBF's marks, on the host (live ids arrive there)
+            host = ids.cpu().numpy() if isinstance(ids, torch.Tensor) else np.asarray(ids)
+            self.obf.mark(host.astype(np.int64) + (self._id_offset if self.wrap_ids else 0))
         return idx
 
     def _accumulate_into(self, f: torch.Tensor, ids) -> None:
@@ -597,6 +603,8 @@ class ParallaxAccumulator:
         self._row_source = self._rows_from(shifts)
         self._sources = self._sources_from(shifts)
         self._readout = None                                   # χ of the phase flip
+        if self.obf is not None:
+            self.obf.set_geometry(geometry)                    # rebuilt by its next steps
         self.out.zero_()
         if self.accumulate == "latest" and self._store is not None:
             held = torch.nonzero(self._visits > 0).squeeze(1)
@@ -782,14 +790,33 @@ class ParallaxAccumulator:
         if self._track:
             meta["passes_completed"] = self.passes_completed
             meta["late_frames"] = self.late_frames
+        if self.obf is not None:          # OBF's latest image, as it is (never waited for)
+            meta.update(self.obf.meta())
+            if self.obf.enabled:
+                # until OBF covers every frame held, the phase-flipped image stands in for the rest
+                standin = stack[names.index("phase_flipped" if "phase_flipped" in names
+                                            else "parallax")]
+                image, rows = self.obf.compose(standin)
+                stack = np.concatenate((stack, image[None]))
+                names.append("obf")
+                if rows is not None:
+                    meta["complete_rows_obf"] = rows
         return stack, names, meta
 
     def images(self) -> dict[str, np.ndarray]:
         """Every saved image as host arrays: the raw sum plus the readout channels (for "reset" /
-        "swap", of the last completed pass once there is one)."""
+        "swap", of the last completed pass once there is one), and OBF's latest image."""
         out = {"raw": self.result()}
         out.update({k: v.float().cpu().numpy() for k, v in self.completed_channels().items()})
+        image = self.obf.image() if self.obf is not None else None
+        if image is not None:
+            out["obf"] = image
         return out
+
+    def close(self) -> None:
+        """Stop what follows the accumulator (OBF) and free its buffers."""
+        if self.obf is not None:
+            self.obf.close()
 
     def perf_stats(self) -> dict | None:
         """Per-stage timing for the run, or None if measurement was off."""

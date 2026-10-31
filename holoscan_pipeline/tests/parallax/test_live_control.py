@@ -31,7 +31,7 @@ import pytest
 REPO = (Path(__file__).resolve().parents[2] / "python/live4d/parallax")
 
 from live4d.parallax.control import LiveControl  # noqa: E402
-from live4d.parallax.ingest.sink import BatchSink  # noqa: E402
+from live4d.parallax.ingest.sink import ACC_LOCK, BatchSink  # noqa: E402
 from live4d.parallax.algorithm import ParallaxAlgorithm  # noqa: E402
 from live4d.algorithms.parallax.engine import ParallaxAccumulator, preprocess_geometry  # noqa: E402
 from live4d.parallax.streaming.web.server import FrameStore, StorePublisher, make_server  # noqa: E402
@@ -157,6 +157,79 @@ def test_control_retunes_switches_modes_and_resets():
             control.update(bad)
 
 
+def _step_until(acc, cond, budget=0.05, timeout=60.0):
+    """Step OBF as the live tick does between batches, until `cond()`."""
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        with ACC_LOCK:
+            acc.obf.step(budget)
+    return cond()
+
+
+def test_control_obf_weights_and_channel():
+    """OBF from the viewer: the "OBF weights" switch builds the Gram for the geometry and again
+    after a retune, without reconstructing; the on-demand channel "obf" reconstructs while it is
+    shown; neither in a mode without a store; a mode switch stops the old tracker; reset restores
+    the configured values."""
+    from live4d.algorithms.obf.core import geometry_key
+
+    algo, args = _args("--accumulate", "latest")
+    for flag in ("--compute-obf", "--precompute-obf-weights"):
+        assert algo.check_args(_args(flag)[1]) == [f"{flag} needs --accumulate latest (OBF "
+                                                   "follows the frames its store holds)"]
+    pub = _Publisher()
+    control = LiveControl(algo, args, publisher=pub)
+    acc = algo.build(args)
+    sink = BatchSink(acc, live_publisher=pub, live_every=1e9)
+    control.attach(acc, lambda: sink)
+    frames = _frames(seed=8)
+    for s in range(0, _NPOS, 40):
+        sink.feed(frames[s:s + 40], np.arange(s, min(s + 40, _NPOS)))
+    state = control.state()
+    assert getattr(acc, "obf", None) is None
+    assert [(w["name"], w["value"]) for w in state["switches"]] == [("obf_weights", False)]
+    assert [(c["name"], c["active"]) for c in state["channels"]] == [("obf", False)]
+    try:
+        state = control.update({"obf_weights": True})            # the weights only
+        assert args.precompute_obf_weights and "--precompute-obf-weights" in state["flags"]
+        tracker = acc.obf
+        assert not tracker.enabled and tracker._held.all()       # attached to a full store
+        assert _step_until(acc, lambda: tracker.weights_state() == "ready")
+        assert tracker._shadow is None                           # nothing reconstructed
+        with ACC_LOCK:
+            _, names, meta = acc.snapshot()
+        assert "obf" not in names and meta["obf_weights_state"] == "ready"
+        control.update({"c10": -1.2e4})                          # a retune: the weights again
+        assert tracker.weights_state() == "building"
+        assert _step_until(acc, lambda: tracker._setup.key == geometry_key(acc.geometry))
+
+        state = control.update({"obf": True})                    # OBF chosen in the channel list
+        assert args.compute_obf and tracker.enabled and state["channels"][0]["active"]
+        assert pub.frames[-1][1]["channels"][-1] == "obf"         # there at once (the stand-in)
+        assert _step_until(acc, lambda: tracker.state == "live")
+        with ACC_LOCK:
+            assert acc.snapshot()[1][-1] == "obf"
+        control.update({"obf": False})                           # another channel chosen
+        assert not args.compute_obf and not tracker.enabled
+        with ACC_LOCK:
+            assert "obf" not in acc.snapshot()[1]
+        control.update({"mode": "swap"})                         # a new accumulator …
+        assert control.acc.accumulate == "swap"
+        assert tracker._closed and tracker._buffer is None       # … the old tracker stops
+        state = control.state()
+        assert not state["switches"][0]["available"] and not state["channels"][0]["available"]
+        for change in ({"obf": True}, {"obf_weights": True}):
+            with pytest.raises(ValueError, match="latest"):
+                control.update(change)
+    finally:
+        acc.close()
+        control.acc.close()
+    state = control.update({"reset": True})                      # the configured values: all off
+    assert state["mode"] == "latest" and not state["switches"][0]["value"]
+    assert not state["channels"][0]["active"] and not args.precompute_obf_weights
+    control.acc.close()
+
+
 def test_one_scan_has_no_mode_to_switch():
     algo, args = _args()                                  # --accumulate scan
     control = LiveControl(algo, args)
@@ -270,3 +343,22 @@ def test_live_http_tuning_is_bounded_and_runs_only_in_callbacks():
     control.closed = True
     with pytest.raises(ValueError, match="stopped"):
         control.update(dict(c10=-200))
+
+
+def test_queued_state_shows_what_was_asked():
+    """The reply to a queued request is the state it will leave: the viewer keeps a channel just
+    chosen (it drops one that reads as switched off) and a slider just moved."""
+    from live4d.parallax.control import QueuedLiveControl
+    algo, args = _args("--accumulate", "latest")
+    control = QueuedLiveControl(LiveControl(algo, args))
+    state = control.update({"obf": True, "c10": -1.2e4, "obf_weights": True})
+    assert state["note"] == "Tuning queued for the next parallax callback"
+    assert state["channels"][0]["active"] and state["switches"][0]["value"]
+    assert state["params"][0]["value"] == -1.2e4
+    assert not args.compute_obf and args.defocus != -1.2e4       # nothing applied yet
+    state = control.update({"reset": True})                      # queued after: the configured values
+    assert not state["channels"][0]["active"] and state["params"][0]["value"] == args.defocus
+    with ACC_LOCK:
+        control.apply_pending()
+    state = control.state()
+    assert not state["note"].startswith("Tuning queued") and not state["channels"][0]["active"]

@@ -13,7 +13,8 @@ import holoscan as hs
 from .config import PipelineConfig, load_config
 from .operators import (DecompressGpuOp, H5WriterOp, RdmaRxOp, ZmqRxOp, _CompletionLatch,
                         _PublicationWindow)
-from .processing import AnsEncoderOp, ParallaxOp, ScanTensorOp, VirtualDetectorOp
+from .processing import (AnsEncoderOp, ParallaxOp, ParallaxTickOp, ScanTensorOp,
+                         TickedParallaxOp, VirtualDetectorOp)
 
 
 class _Readiness:
@@ -119,7 +120,11 @@ class PipelineApp:
         if parallax:
             runtime = self.parallax_runtime
 
-            class BoundParallax(ParallaxOp):
+            # Service mode keeps the graph across scans: a clock lets queued tuning and OBF go on
+            # between them. A finite run ends at END, so it needs none.
+            ticked = not finite
+
+            class BoundParallax(TickedParallaxOp if ticked else ParallaxOp):
                 def __init__(self):
                     super().__init__(runtime=runtime, ready=ready, release=release,
                                      consumer=1 + writing + encoding,
@@ -127,7 +132,13 @@ class PipelineApp:
 
             reconstruct = graph.op(BoundParallax, "parallax", device_id=config.device)
             graph.add_flow(decoded.output, reconstruct.input, queue_depth=config.queue_depth)
-            graph.partition("parallax").add(reconstruct)
+            members = [reconstruct]
+            if ticked:
+                clock = graph.op(ParallaxTickOp, "parallax_tick")
+                graph.add_flow(clock.tick, reconstruct.tick, queue_depth=1,
+                               queue_policy=hs.QueuePolicy.DROP_OLDEST)
+                members.append(clock)
+            graph.partition("parallax").add(*members)
         deployment = hs.execution.DeploymentBinding()
         deployment.bind_tensor_output_device(
             operator_path="decompress_gpu" if config.transport == "zmq" else "rdma_rx",

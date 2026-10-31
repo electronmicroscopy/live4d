@@ -9,7 +9,8 @@ DEFAULTS = dict(
     lowpass=None, highpass=None, butterworth_order=12, suppress_nyquist="auto", band_limit=False,
     accumulate="scan", pass_average=1.0, save_passes=False, save_passes_dtype="float32",
     out_dir="out", live_endpoint="", live_every=0.2, live_every_rows=0,
-    viewer_port=0, viewer_host="127.0.0.1")
+    viewer_port=0, viewer_host="127.0.0.1",
+    compute_obf=False, precompute_obf_weights=False, obf_share=0.4)
 
 
 def validate(settings):
@@ -17,7 +18,8 @@ def validate(settings):
         raise ValueError("Invalid parallax settings")
     values = DEFAULTS | settings
     for key in ("enabled", "flip_cols", "subtract_frame_mean", "phase_flip", "dc_correct",
-                "normalize", "coverage", "band_limit", "save_passes"):
+                "normalize", "coverage", "band_limit", "save_passes", "compute_obf",
+                "precompute_obf_weights"):
         if type(values[key]) is not bool:
             raise ValueError(f"parallax.{key} must be true or false")
     required = ("energy", "semiangle", "angular_sampling", "scan_sampling", "defocus", "rotation")
@@ -46,6 +48,11 @@ def validate(settings):
         raise ValueError("parallax.pass_average requires accumulate: swap")
     if values["save_passes"] and values["accumulate"] == "scan":
         raise ValueError("parallax.save_passes requires repeated accumulation")
+    share = values["obf_share"]
+    if type(share) not in (int, float) or not 0 < share <= 1:
+        raise ValueError("parallax.obf_share must be in (0, 1]")
+    if (values["compute_obf"] or values["precompute_obf_weights"]) and values["accumulate"] != "latest":
+        raise ValueError("parallax OBF requires accumulate: latest")
     if values["save_passes_dtype"] not in ("float32", "float16"):
         raise ValueError("Invalid parallax.save_passes_dtype")
     if values["suppress_nyquist"] not in ("auto", "on", "off"):
